@@ -93,7 +93,14 @@ fn onConfigChanged() void {
     const allocator = app.g.allocator orelse return;
     const cfg_ptr = app.g.config orelse return;
 
-    const new_cfg = Config.load(allocator) catch return;
+    // FSEvents may fire mid-rename when an atomic-write editor saves
+    // (vim, VS Code, Helix). Retry a few times with a short sleep so
+    // transient ENOENT / partial-read doesn't push a default Config{}
+    // into the running app + clobber user settings.
+    const new_cfg = loadConfigWithRetry(allocator) orelse {
+        std.debug.print("warning: config reload failed (3 retries); keeping previous config\n", .{});
+        return;
+    };
 
     if (parseKeybinding(new_cfg.hotkey.toggle)) |kb| {
         if (app.g.hotkey) |hk| hk.setBinding(kb.keycode, kb.modifiers);
@@ -125,6 +132,21 @@ fn onConfigChanged() void {
 
     cfg_ptr.* = new_cfg;
     view_mod.reloadTheme();
+}
+
+/// Reload the djinn config from disk with three short retries.
+/// Atomic-write editors (vim, VS Code, Helix) rename a tmp file over
+/// the target on save; FSEvents fires in the gap and an open here can
+/// hit ENOENT. Returns null if every attempt fails — caller treats
+/// that as "skip the reload, keep the previous config" instead of
+/// substituting defaults.
+fn loadConfigWithRetry(allocator: std.mem.Allocator) ?Config {
+    var attempt: u8 = 0;
+    while (attempt < 3) : (attempt += 1) {
+        if (attempt > 0) std.Thread.sleep(20 * std.time.ns_per_ms);
+        if (Config.load(allocator)) |cfg| return cfg else |_| {}
+    }
+    return null;
 }
 
 fn isShell(cmd: []const u8) bool {
@@ -425,7 +447,13 @@ pub fn main() !void {
     const keybinding_override = parsed_args.keybinding_override;
     const provider_override = parsed_args.provider_override;
 
-    var config = Config.load(allocator) catch Config{};
+    // Startup: missing file is fine (use defaults); any other error
+    // surfaces so the user sees what's wrong instead of running with
+    // mystery defaults.
+    var config = Config.loadOrDefault(allocator) catch |err| {
+        std.debug.print("error: config load failed: {}\n", .{err});
+        std.process.exit(1);
+    };
     const keybinding = keybinding_override orelse config.hotkey.toggle;
 
     const binding = parseKeybinding(keybinding) catch {

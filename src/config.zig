@@ -171,17 +171,35 @@ pub const Config = struct {
 
     /// Load config from ~/.config/djinn/config (ghostty key=value format),
     /// falling back to defaults.
+    /// Read + parse the config file. Errors propagate so callers can
+    /// distinguish "no config, use defaults" from "transient read
+    /// failure, keep the previous config." Atomic-write editors (vim,
+    /// VS Code, Helix) save by renaming a tmp file over the target;
+    /// FSEvents fires during the gap and an open here hits ENOENT.
+    /// Swallowing that as a default `Config{}` (the previous behavior)
+    /// silently clobbered every user setting on every save.
     pub fn load(allocator: std.mem.Allocator) !Config {
         const path = try defaultConfigPath(allocator);
         defer allocator.free(path);
 
-        const file = std.fs.openFileAbsolute(path, .{}) catch return Config{};
+        const file = try std.fs.openFileAbsolute(path, .{});
         defer file.close();
 
-        const contents = file.readToEndAlloc(allocator, 64 * 1024) catch return Config{};
+        const contents = try file.readToEndAlloc(allocator, 64 * 1024);
         defer allocator.free(contents);
 
         return parse(allocator, contents);
+    }
+
+    /// First-launch convenience: load the config or fall back to
+    /// hardcoded defaults when the file is missing entirely. Anything
+    /// other than `FileNotFound` propagates so startup fails loud
+    /// instead of running with mystery defaults.
+    pub fn loadOrDefault(allocator: std.mem.Allocator) !Config {
+        return load(allocator) catch |err| switch (err) {
+            error.FileNotFound => Config{},
+            else => err,
+        };
     }
 
     /// Parse config in ghostty's `key = value` format. Comments start with
