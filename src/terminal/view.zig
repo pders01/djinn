@@ -727,6 +727,7 @@ fn registerClass() void {
     _ = cls.addMethod("acceptsFirstResponder", acceptsFirstResponderImpl);
     _ = cls.addMethod("becomeFirstResponder", becomeFirstResponderImpl);
     _ = cls.addMethod("resignFirstResponder", resignFirstResponderImpl);
+    _ = cls.addMethod("flagsChanged:", flagsChangedImpl);
     _ = cls.addMethod("keyDown:", keyDownImpl);
     _ = cls.addMethod("tick:", tickImpl);
     _ = cls.addMethod("mouseDown:", mouseDownImpl);
@@ -1076,6 +1077,74 @@ fn tickImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
 
 fn acceptsFirstResponderImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
     return true;
+}
+
+/// AppKit fires `flagsChanged:` when a modifier key is pressed or
+/// released without an accompanying character key — bare Cmd hold,
+/// Shift release, etc. ghostty needs these to drive Cmd-hover link
+/// detection and any binding triggered by a modifier-only chord.
+///
+/// Logic mirrors ghostty.app's `flagsChanged` (SurfaceView_AppKit.swift):
+/// look up which modifier the keycode owns, check if that modifier is
+/// currently held in `modifierFlags`, then send PRESS or RELEASE.
+/// Side-specific keycodes (right-shift etc.) further check the
+/// device-specific bit so left + right shift don't masquerade as the
+/// same key.
+fn flagsChangedImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    const surf_ptr = app.g.ghostty_surface orelse return;
+    const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
+    const event = objc.Object.fromId(event_id);
+    const ghostty_input = @import("../ghostty/input.zig");
+
+    const keycode: u16 = event.msgSend(c_ushort, "keyCode", .{});
+    const flags: u64 = @intCast(event.msgSend(c_ulong, "modifierFlags", .{}));
+    const C = ghostty_runtime.c;
+
+    // kVK_* modifier keycodes → ghostty modifier bit.
+    const mod_bit: c_uint = switch (keycode) {
+        0x39 => @intCast(C.GHOSTTY_MODS_CAPS),
+        0x38, 0x3C => @intCast(C.GHOSTTY_MODS_SHIFT),
+        0x3B, 0x3E => @intCast(C.GHOSTTY_MODS_CTRL),
+        0x3A, 0x3D => @intCast(C.GHOSTTY_MODS_ALT),
+        0x37, 0x36 => @intCast(C.GHOSTTY_MODS_SUPER),
+        else => return,
+    };
+
+    if (g_preedit_len > 0) return; // mid-IME composition; modifier flicks aren't ours
+
+    const mods_g = ghostty_input.modsFromNS(flags);
+
+    // Right-side variant keycodes also need the device-specific bit
+    // set in the raw flags, otherwise releasing right-shift while
+    // left-shift is held would still register as a press.
+    // NX_DEVICER*KEYMASK bits (from IOKit hidsystem/ev_keymap.h):
+    const NX_DEVICERSHIFT: u64 = 0x0004;
+    const NX_DEVICERCTL: u64 = 0x2000;
+    const NX_DEVICERALT: u64 = 0x0040;
+    const NX_DEVICERCMD: u64 = 0x0010;
+
+    var action: c_uint = @intCast(C.GHOSTTY_ACTION_RELEASE);
+    if ((@as(c_uint, @intCast(mods_g)) & mod_bit) != 0) {
+        const side_held = switch (keycode) {
+            0x3C => (flags & NX_DEVICERSHIFT) != 0,
+            0x3E => (flags & NX_DEVICERCTL) != 0,
+            0x3D => (flags & NX_DEVICERALT) != 0,
+            0x36 => (flags & NX_DEVICERCMD) != 0,
+            else => true,
+        };
+        if (side_held) action = @intCast(C.GHOSTTY_ACTION_PRESS);
+    }
+
+    const key_event = C.ghostty_input_key_s{
+        .action = action,
+        .mods = mods_g,
+        .consumed_mods = 0,
+        .keycode = keycode,
+        .text = null,
+        .unshifted_codepoint = 0,
+        .composing = false,
+    };
+    _ = C.ghostty_surface_key(surf, key_event);
 }
 
 /// Push focus state into the ghostty surface. Without this, ghostty
