@@ -29,7 +29,7 @@ fn canBecomeKeyImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
 fn didResignKeyImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
     if (!app_state.g.hide_on_blur) return;
     const p = app_state.g.panel orelse return;
-    if (p.visible) p.hide();
+    if (p.visible) p.hideForBlur();
 }
 
 fn didEndLiveResizeImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
@@ -243,6 +243,20 @@ pub const Panel = struct {
     }
 
     pub fn hide(self: *Panel) void {
+        self.hideKind(true);
+    }
+
+    /// Hide variant for blur-driven dismissal (panel lost key state
+    /// because the user Cmd+Tab'd or clicked into another app).
+    /// Skips the prev-app reactivation: the system already handed
+    /// focus to whichever window the user picked, and clobbering
+    /// that with our captured `prev_app_pid` would yank them back to
+    /// the app they had open *before* summoning djinn.
+    pub fn hideForBlur(self: *Panel) void {
+        self.hideKind(false);
+    }
+
+    fn hideKind(self: *Panel, restore_prev: bool) void {
         const frame = self.ns_panel.msgSend(NSRect, "frame", .{});
 
         // Anchor restore Y to current (possibly-resized) height so next show
@@ -287,10 +301,15 @@ pub const Panel = struct {
         // editor/browser does NOT regain its menu bar — keystrokes go to
         // a hidden window. Quake-style toggles are expected to be invisible
         // in both directions.
-        if (self.prev_app_pid != 0) {
+        //
+        // Skipped on the blur path: user already Cmd+Tab'd / clicked into
+        // another app, and that app has focus now. Re-activating
+        // `prev_app_pid` here would override their choice. We still clear
+        // the slot so the next show() captures a fresh prev frontmost.
+        if (restore_prev and self.prev_app_pid != 0) {
             activateAppByPid(self.prev_app_pid);
-            self.prev_app_pid = 0;
         }
+        self.prev_app_pid = 0;
         self.visible = false;
 
         // Step 5: ghostty surface yields focus when the panel is hidden.
