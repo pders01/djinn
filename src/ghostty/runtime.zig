@@ -80,6 +80,19 @@ pub fn reloadConfigFromDisk() void {
     const app_handle = host_storage.app_handle orelse return;
     const new_cfg = c.ghostty_config_new() orelse return;
     c.ghostty_config_load_default_files(new_cfg);
+    // Re-apply the dual-theme appearance override before finalize.
+    // Same rationale as App.init: ghostty's `loadTheme` picks the
+    // LIGHT variant of `theme = light:X,dark:Y` at finalize, so on
+    // reload we'd revert to LIGHT regardless of the system
+    // appearance unless we layer the override on top.
+    if (writeAppearanceThemeOverride()) |tmp_path| {
+        defer std.heap.page_allocator.free(tmp_path);
+        if (std.heap.page_allocator.allocSentinel(u8, tmp_path.len, 0)) |z| {
+            defer std.heap.page_allocator.free(z);
+            @memcpy(z[0..tmp_path.len], tmp_path);
+            c.ghostty_config_load_file(new_cfg, z.ptr);
+        } else |_| {}
+    }
     c.ghostty_config_finalize(new_cfg);
     c.ghostty_app_update_config(app_handle, new_cfg);
     if (host_storage.app_state.ghostty_surface) |surf_ptr| {
