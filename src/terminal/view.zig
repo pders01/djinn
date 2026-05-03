@@ -754,6 +754,8 @@ fn registerClass() void {
     _ = cls.addMethod("mouseExited:", mouseExitedImpl);
     _ = cls.addMethod("updateTrackingAreas", updateTrackingAreasImpl);
     _ = cls.addMethod("scrollWheel:", scrollWheelImpl);
+    _ = cls.addMethod("keyUp:", keyUpImpl);
+    _ = cls.addMethod("pressureChange:", pressureChangeImpl);
     _ = cls.addMethod("viewDidEndLiveResize", viewDidEndLiveResizeImpl);
     _ = cls.addMethod("viewDidChangeBackingProperties", viewDidChangeBackingPropertiesImpl);
     _ = cls.addMethod("viewDidMoveToWindow", viewDidMoveToWindowImpl);
@@ -1514,6 +1516,43 @@ fn keyDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(
         _ = ghostty_runtime.c.ghostty_surface_key(surf, key_event);
         return;
     }
+}
+
+/// keyUp companion to keyDownImpl. Only meaningful for terminals
+/// running the Kitty Keyboard Protocol in full mode (CSI u with key
+/// release reporting); regular VT terminals don't observe key
+/// releases. Cheap to forward unconditionally — ghostty's key encoder
+/// drops the event when the surface isn't in keyboard-protocol mode.
+fn keyUpImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    const surf_ptr = app.g.ghostty_surface orelse return;
+    const event = objc.Object.fromId(event_id);
+    const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
+    const ghostty_input = @import("../ghostty/input.zig");
+    const flags: u64 = @intCast(event.msgSend(c_ulong, "modifierFlags", .{}));
+    const keycode: u16 = event.msgSend(c_ushort, "keyCode", .{});
+    const key_event = ghostty_runtime.c.ghostty_input_key_s{
+        .action = ghostty_runtime.c.GHOSTTY_ACTION_RELEASE,
+        .mods = ghostty_input.modsFromNS(flags),
+        .consumed_mods = 0,
+        .keycode = keycode,
+        .text = null,
+        .unshifted_codepoint = 0,
+        .composing = false,
+    };
+    _ = ghostty_runtime.c.ghostty_surface_key(surf, key_event);
+}
+
+/// Force-touch pressure events. ghostty uses these for stage detection
+/// (force-click → quicklook trigger) + apps that want raw pressure
+/// data. We forward the raw values; quicklook itself is unimplemented
+/// host-side, so stage-2 force clicks are no-ops for now.
+fn pressureChangeImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    const surf_ptr = app.g.ghostty_surface orelse return;
+    const event = objc.Object.fromId(event_id);
+    const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
+    const stage: c_long = event.msgSend(c_long, "stage", .{});
+    const pressure: f64 = event.msgSend(f64, "pressure", .{});
+    ghostty_runtime.c.ghostty_surface_mouse_pressure(surf, @intCast(stage), pressure);
 }
 
 // (Glyph caches + drawRectImpl + drawPreedit were retired in step 10
