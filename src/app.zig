@@ -134,6 +134,18 @@ pub const AppState = struct {
     /// they can call `ghostty_config_get` without going back through
     /// main(). Same opacity rationale as `ghostty_surface`.
     ghostty_config: ?*anyopaque = null,
+
+    // Sessions -------------------------------------------------------
+    /// Multi-profile session manager. Holds one Session per declared
+    /// profile (or a single synthesized "default" for legacy configs).
+    /// Switching tabs flips `active_idx` + setHidden on each session's
+    /// surface_host. Action handlers in view.zig reach this through
+    /// app.g + call back into main.zig for the spawn / focus glue.
+    session_manager: ?*@import("session/manager.zig").SessionManager = null,
+    /// Stable pointer to the ghostty App so the lazy-spawn path in the
+    /// session switcher can call `ga.newSurface` without re-importing
+    /// the runtime module from inside view.zig.
+    ghostty_app: ?*@import("ghostty/runtime.zig").App = null,
 };
 
 /// Global handle. Code paths that need app state read this directly.

@@ -187,6 +187,10 @@ Tools update djinn's internal `AgentState`; the menubar polls at ~4Hz, the log p
 | Special keys         | Arrows, home/end/pgup/pgdn, escape, return, tab, backspace |
 | Ctrl + letter        | Sent as C0 control byte (Ctrl+L = 0x0c, etc.)              |
 | Alt + key            | ESC-prefixed (xterm convention used by readline / zsh)     |
+| Switch profile       | `cmd+1` … `cmd+9` (jump by index)    |
+| Cycle profile        | `cmd+shift+]` next, `cmd+shift+[` prev |
+| Find on page         | `cmd+F` open, `cmd+G` next, `cmd+shift+G` prev |
+| Toggle log pane      | `cmd+/`                              |
 | Quit                 | `cmd+Q` (from the menubar menu)      |
 
 The menubar dropdown also exposes show/hide, copy MCP config, and quit.
@@ -238,6 +242,19 @@ hotkey = ctrl+grave
 # gemini / opencode. Anything else falls back to /bin/zsh.
 provider = generic
 # provider-command = /opt/bin/my-claude
+
+# Profiles — each named profile is one provider session. Cmd+1..9
+# jumps to a specific profile by index; Cmd+Shift+] / Cmd+Shift+[
+# cycle. Lazy-spawned: a profile's child process only starts on the
+# first activate.
+#
+# default-profile = main
+# profile.main.provider  = claude
+# profile.main.cwd       = ~/projects/main
+# profile.main.title     = main repo
+# profile.codex.provider = codex
+# profile.codex.command  = /opt/bin/codex
+# profile.codex.cwd      = ~/projects/side
 
 # Theme — falls through to ghostty's resolved config when
 # inherit-ghostty=true (default). Overrides only listed below.

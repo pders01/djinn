@@ -200,6 +200,7 @@ pub const App = struct {
         nsview: ?*anyopaque,
         scale: f64,
         command: ?[*:0]const u8,
+        working_directory: ?[*:0]const u8,
     ) ?c.ghostty_surface_t {
         var opts = c.ghostty_surface_config_new();
         opts.platform_tag = c.GHOSTTY_PLATFORM_MACOS;
@@ -212,14 +213,14 @@ pub const App = struct {
         // any key to close" and wait — wrong UX for a Quake-drop that
         // the user just dropped. Our close_surface_cb hides the panel.
         opts.wait_after_command = false;
-        // Same HostContext pointer the app uses. Single-surface today;
-        // when tabs/splits land each surface gets its own context.
+        // Same HostContext pointer the app uses across every surface;
+        // each session shares the host event channel + action dispatch.
         if (host_inited) opts.userdata = @ptrCast(&host_storage);
         // Provider command (claude, codex, …). Null → ghostty spawns
-        // user's default shell in $HOME.
+        // user's default shell. Working directory null → ghostty's
+        // own fallback ($HOME).
         if (command) |cmd| opts.command = cmd;
-        // Defaults for everything else: font_size=0 → ghostty uses
-        // its config; null working_directory → $HOME.
+        if (working_directory) |wd| opts.working_directory = wd;
 
         const surf = c.ghostty_surface_new(self.handle, &opts) orelse {
             std.debug.print("ghostty_surface: surface_new returned null\n", .{});

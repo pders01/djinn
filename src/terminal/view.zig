@@ -657,11 +657,21 @@ fn applyLogLayout(container: objc.Object, term_w: f64, log_w: f64, height: f64) 
             .size = .{ .width = log_w, .height = height },
         }});
     }
-    if (app.g.surface_host_id) |sid| {
-        objc.Object.fromId(sid).msgSend(void, "setFrame:", .{NSRect{
-            .origin = .{ .x = 0, .y = 0 },
-            .size = .{ .width = term_w, .height = height },
-        }});
+    // Reflow every session's surface_host so inactive sessions stay
+    // sized identically to the active one (autoresizingMask covers
+    // window resize; this covers term/log split changes from
+    // setLogPaneHidden + drag-to-resize). main() guarantees the
+    // session_manager pointer is set before any caller of
+    // applyLogLayout fires; no fallback path needed.
+    if (app.g.session_manager) |sm| {
+        for (sm.sessions) |sess| {
+            if (sess.surface_host) |sid| {
+                objc.Object.fromId(sid).msgSend(void, "setFrame:", .{NSRect{
+                    .origin = .{ .x = 0, .y = 0 },
+                    .size = .{ .width = term_w, .height = height },
+                }});
+            }
+        }
     }
     checkResize(term_view);
     container.msgSend(void, "setNeedsLayout:", .{@as(c_int, 1)});
@@ -1339,6 +1349,21 @@ var actions = [_]Action{
     .{ .name = "find_open", .mods = mod_cmd, .keycode = 3, .handler = actionFindOpen }, // Cmd+F
     .{ .name = "find_next", .mods = mod_cmd, .keycode = 5, .handler = actionFindNext }, // Cmd+G
     .{ .name = "find_prev", .mods = mod_cmd | mod_shift, .keycode = 5, .handler = actionFindPrev }, // Cmd+Shift+G
+    // Tab switching across profile sessions. Cmd+1..9 jump by index;
+    // Cmd+Shift+]/[ cycle. No-ops when the index is out of range or
+    // only a single profile is configured, so binding all 9 keys
+    // eagerly is safe.
+    .{ .name = "tab_1", .mods = mod_cmd, .keycode = 18, .handler = actionTab1 },
+    .{ .name = "tab_2", .mods = mod_cmd, .keycode = 19, .handler = actionTab2 },
+    .{ .name = "tab_3", .mods = mod_cmd, .keycode = 20, .handler = actionTab3 },
+    .{ .name = "tab_4", .mods = mod_cmd, .keycode = 21, .handler = actionTab4 },
+    .{ .name = "tab_5", .mods = mod_cmd, .keycode = 23, .handler = actionTab5 },
+    .{ .name = "tab_6", .mods = mod_cmd, .keycode = 22, .handler = actionTab6 },
+    .{ .name = "tab_7", .mods = mod_cmd, .keycode = 26, .handler = actionTab7 },
+    .{ .name = "tab_8", .mods = mod_cmd, .keycode = 28, .handler = actionTab8 },
+    .{ .name = "tab_9", .mods = mod_cmd, .keycode = 25, .handler = actionTab9 },
+    .{ .name = "next_tab", .mods = mod_cmd | mod_shift, .keycode = 30, .handler = actionNextTab },
+    .{ .name = "prev_tab", .mods = mod_cmd | mod_shift, .keycode = 33, .handler = actionPrevTab },
 };
 
 /// Override an entry's binding by name. Called from main() during
@@ -1563,6 +1588,32 @@ fn actionFindNext() void {
 
 fn actionFindPrev() void {
     forwardBindingAction("navigate_search:previous");
+}
+
+// Tab switching — thin wrappers around `main.activateSession(idx)`.
+// Generated explicitly (no `comptime` lambda) so each handler has a
+// distinct function pointer the action table can dispatch through.
+fn activateSessionByIndex(idx: usize) void {
+    _ = @import("../main.zig").activateSession(idx);
+}
+fn actionTab1() void { activateSessionByIndex(0); }
+fn actionTab2() void { activateSessionByIndex(1); }
+fn actionTab3() void { activateSessionByIndex(2); }
+fn actionTab4() void { activateSessionByIndex(3); }
+fn actionTab5() void { activateSessionByIndex(4); }
+fn actionTab6() void { activateSessionByIndex(5); }
+fn actionTab7() void { activateSessionByIndex(6); }
+fn actionTab8() void { activateSessionByIndex(7); }
+fn actionTab9() void { activateSessionByIndex(8); }
+fn actionNextTab() void {
+    const sm = app.g.session_manager orelse return;
+    const idx = sm.peekNext() orelse return;
+    activateSessionByIndex(idx);
+}
+fn actionPrevTab() void {
+    const sm = app.g.session_manager orelse return;
+    const idx = sm.peekPrev() orelse return;
+    activateSessionByIndex(idx);
 }
 
 /// Rebuild the font at a new size, refresh cell metrics + glyph caches,

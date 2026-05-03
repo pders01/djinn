@@ -13,6 +13,7 @@ pub const Config = struct {
     system: SystemConfig = .{},
     bell: BellConfig = .{},
     keymap: KeymapConfig = .{},
+    profiles: ProfilesConfig = .{},
 
     pub const WindowConfig = struct {
         width: u32 = 800,
@@ -59,6 +60,28 @@ pub const Config = struct {
         name: []const u8 = "generic",
         command: ?[]const u8 = null,
         args: []const []const u8 = &.{},
+    };
+
+    /// One named profile = one provider instance. The session layer
+    /// (`src/session/manager.zig`) consumes these and binds each to a
+    /// ghostty surface; UI layers (keybind switcher today, tab strip
+    /// or palette later) sit above the session manager and don't see
+    /// this struct directly.
+    pub const ProfileEntry = struct {
+        name: []const u8,
+        provider: ?[]const u8 = null,
+        command: ?[]const u8 = null,
+        cwd: ?[]const u8 = null,
+        title: ?[]const u8 = null,
+    };
+
+    pub const ProfilesConfig = struct {
+        /// Name of the profile that's active at startup. Falls back to
+        /// the first parsed profile if unset; falls back to a synthesized
+        /// "default" profile (built from flat `provider` / `provider-
+        /// command`) if no profile lines were configured.
+        default: ?[]const u8 = null,
+        entries: []const ProfileEntry = &.{},
     };
 
     pub const McpConfig = struct {
@@ -164,6 +187,8 @@ pub const Config = struct {
         var config = Config{};
         var keymap_list = std.ArrayList(KeymapEntry){};
         defer keymap_list.deinit(allocator);
+        var profile_list = std.ArrayList(ProfileEntry){};
+        defer profile_list.deinit(allocator);
 
         var lines = std.mem.splitScalar(u8, contents, '\n');
         var line_no: u32 = 0;
@@ -179,22 +204,57 @@ pub const Config = struct {
             const key = std.mem.trim(u8, line[0..eq_idx], " \t");
             const val = unquote(std.mem.trim(u8, line[eq_idx + 1 ..], " \t"));
 
-            applyKey(&config, &keymap_list, allocator, key, val) catch |err| {
+            applyKey(&config, &keymap_list, &profile_list, allocator, key, val) catch |err| {
                 std.debug.print("warning: config:{d}: '{s}' = '{s}' ({})\n", .{ line_no, key, val, err });
             };
         }
 
-        config.keymap.entries = keymap_list.toOwnedSlice(allocator) catch &.{};
+        // toOwnedSlice can OOM. On failure, free the per-item duped
+        // strings so we don't leak them when we drop to an empty slice.
+        // The list itself is `defer .deinit`'d; this loop just covers
+        // the strings each entry holds.
+        config.keymap.entries = keymap_list.toOwnedSlice(allocator) catch blk: {
+            for (keymap_list.items) |e| {
+                allocator.free(e.name);
+                allocator.free(e.binding);
+            }
+            break :blk &.{};
+        };
+        config.profiles.entries = profile_list.toOwnedSlice(allocator) catch blk: {
+            for (profile_list.items) |e| {
+                allocator.free(e.name);
+                if (e.provider) |s| allocator.free(s);
+                if (e.command) |s| allocator.free(s);
+                if (e.cwd) |s| allocator.free(s);
+                if (e.title) |s| allocator.free(s);
+            }
+            break :blk &.{};
+        };
         return config;
     }
 
     fn applyKey(
         config: *Config,
         keymap_list: *std.ArrayList(KeymapEntry),
+        profile_list: *std.ArrayList(ProfileEntry),
         allocator: std.mem.Allocator,
         key: []const u8,
         val: []const u8,
     ) !void {
+        // Profiles --------------------------------------------------------
+        // `default-profile = name` selects which profile is active at
+        // startup. `profile.<name>.<field> = value` defines per-profile
+        // overrides. Both come BEFORE the flat-key fallthrough so the
+        // dotted path wins over any later collision.
+        if (eq(key, "default-profile")) {
+            config.profiles.default = try allocator.dupe(u8, val);
+            return;
+        }
+        if (std.mem.startsWith(u8, key, "profile.")) {
+            try applyProfileKey(profile_list, allocator, key["profile.".len..], val);
+            return;
+        }
+
         // Window ----------------------------------------------------------
         if (eq(key, "window-width")) {
             config.window.width = try std.fmt.parseInt(u32, val, 10);
@@ -298,6 +358,50 @@ pub const Config = struct {
             });
         } else {
             std.debug.print("warning: config: unknown key '{s}'\n", .{key});
+        }
+    }
+
+    /// Parse a `profile.<name>.<field>` line. The leading `profile.` has
+    /// already been stripped; `tail` is `<name>.<field>`. Mutates the
+    /// profile list in place — appends a new entry the first time we see
+    /// a name, then writes the field on subsequent lines for that name.
+    fn applyProfileKey(
+        profile_list: *std.ArrayList(ProfileEntry),
+        allocator: std.mem.Allocator,
+        tail: []const u8,
+        val: []const u8,
+    ) !void {
+        const dot = std.mem.indexOfScalar(u8, tail, '.') orelse return error.MalformedProfileKey;
+        const name = tail[0..dot];
+        const field = tail[dot + 1 ..];
+        if (name.len == 0 or field.len == 0) return error.MalformedProfileKey;
+
+        // Find or insert the named entry.
+        var idx: ?usize = null;
+        for (profile_list.items, 0..) |e, i| {
+            if (std.mem.eql(u8, e.name, name)) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx == null) {
+            try profile_list.append(allocator, .{ .name = try allocator.dupe(u8, name) });
+            idx = profile_list.items.len - 1;
+        }
+
+        const entry = &profile_list.items[idx.?];
+        const dup = try allocator.dupe(u8, val);
+        if (eq(field, "provider")) {
+            entry.provider = dup;
+        } else if (eq(field, "command")) {
+            entry.command = dup;
+        } else if (eq(field, "cwd")) {
+            entry.cwd = dup;
+        } else if (eq(field, "title")) {
+            entry.title = dup;
+        } else {
+            allocator.free(dup);
+            return error.UnknownProfileField;
         }
     }
 
@@ -524,6 +628,54 @@ test "Config: malformed keybind warns but parse succeeds" {
     const config = try Config.parse(arena.allocator(), src);
     try std.testing.expectEqual(@as(usize, 0), config.keymap.entries.len);
     try std.testing.expectEqualStrings("ctrl+space", config.hotkey.toggle);
+}
+
+test "Config: parse profile entries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\default-profile = main
+        \\profile.main.provider = claude
+        \\profile.main.cwd = ~/projects/main
+        \\profile.main.title = main repo
+        \\profile.codex.provider = codex
+        \\profile.codex.command = /opt/bin/codex
+    ;
+    const config = try Config.parse(arena.allocator(), src);
+    try std.testing.expectEqualStrings("main", config.profiles.default.?);
+    try std.testing.expectEqual(@as(usize, 2), config.profiles.entries.len);
+    try std.testing.expectEqualStrings("main", config.profiles.entries[0].name);
+    try std.testing.expectEqualStrings("claude", config.profiles.entries[0].provider.?);
+    try std.testing.expectEqualStrings("~/projects/main", config.profiles.entries[0].cwd.?);
+    try std.testing.expectEqualStrings("main repo", config.profiles.entries[0].title.?);
+    try std.testing.expectEqualStrings("codex", config.profiles.entries[1].name);
+    try std.testing.expectEqualStrings("/opt/bin/codex", config.profiles.entries[1].command.?);
+}
+
+test "Config: malformed profile key warns + skips" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\profile.no_field = whatever
+        \\profile..provider = bogus
+        \\profile.good.provider = claude
+    ;
+    const config = try Config.parse(arena.allocator(), src);
+    try std.testing.expectEqual(@as(usize, 1), config.profiles.entries.len);
+    try std.testing.expectEqualStrings("good", config.profiles.entries[0].name);
+}
+
+test "Config: unknown profile field warns + skips" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\profile.main.provider = claude
+        \\profile.main.bogus_field = nope
+    ;
+    const config = try Config.parse(arena.allocator(), src);
+    // The "bogus_field" warning fires but the provider field stuck.
+    try std.testing.expectEqual(@as(usize, 1), config.profiles.entries.len);
+    try std.testing.expectEqualStrings("claude", config.profiles.entries[0].provider.?);
 }
 
 test "Config: parseBool variants" {
