@@ -142,6 +142,23 @@ pub const AppState = struct {
     /// surface_host. Action handlers in view.zig reach this through
     /// app.g + call back into main.zig for the spawn / focus glue.
     session_manager: ?*@import("session/manager.zig").SessionManager = null,
+    // Palette switcher (Cmd+Shift+P) ---------------------------------
+    /// True while the palette overlay is up. Routes printable keys
+    /// from `keyDownImpl` into the palette's filter buffer instead of
+    /// the ghostty surface (same idiom as `find_mode`).
+    palette_mode: bool = false,
+    /// Live filter buffer + length. Indexed against
+    /// `session_manager.sessions[*].profile.label()` to derive the
+    /// shown rows.
+    palette_query_buf: [128]u8 = [_]u8{0} ** 128,
+    palette_query_len: usize = 0,
+    /// Selected row in the *filtered* list. Up/Down move it; Return
+    /// activates the underlying session.
+    palette_selected: usize = 0,
+    /// Overlay NSView. Stashed so close() can pull it from the view
+    /// tree without indexing into `container.subviews`.
+    palette_view_id: ?objc.c.id = null,
+
     /// Optional NSView pointer for the multi-profile tab strip.
     /// Present only when `session_manager.sessions.len >= 2`; null
     /// otherwise. Action handlers + applyLogLayout consult this to

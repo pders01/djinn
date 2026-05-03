@@ -153,7 +153,9 @@ pub const Config = struct {
         /// overrides the default binding for that action at startup.
         /// Action names match Action.name in view.zig (copy, paste,
         /// scroll_page_up, scroll_page_down, font_inc, font_dec,
-        /// font_reset, clear_scrollback, open_settings, etc.).
+        /// font_reset, clear_scrollback, open_settings,
+        /// toggle_log_pane, palette_open, tab_1..tab_9, next_tab,
+        /// prev_tab, etc.).
         /// Bindings parse via hotkey.parseKeybinding ("cmd+k", etc.).
         entries: []const KeymapEntry = &.{},
     };

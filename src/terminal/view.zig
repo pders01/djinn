@@ -1419,6 +1419,13 @@ fn keyDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(
         return;
     }
 
+    // Palette mode is modal too — same Cmd/Ctrl fall-through as
+    // find_mode so Cmd+Shift+P toggling stays reachable.
+    if (app.g.palette_mode and (flags & (mod_cmd | mod_control)) == 0) {
+        @import("../session/palette.zig").handleKey(event, keycode);
+        return;
+    }
+
     // IME slow path. When the input source is non-Latin (Kotoeri,
     // Pinyin, Hangul …) or we're already mid-composition, route the
     // event through AppKit's text input pipeline so insertText /
@@ -1575,6 +1582,8 @@ var actions = [_]Action{
     .{ .name = "tab_9", .mods = mod_cmd, .keycode = 25, .handler = actionTab9 },
     .{ .name = "next_tab", .mods = mod_cmd | mod_shift, .keycode = 30, .handler = actionNextTab },
     .{ .name = "prev_tab", .mods = mod_cmd | mod_shift, .keycode = 33, .handler = actionPrevTab },
+    // Palette switcher — Cmd+Shift+P (kVK_ANSI_P = 35).
+    .{ .name = "palette_open", .mods = mod_cmd | mod_shift, .keycode = 35, .handler = actionPaletteOpen },
 };
 
 /// Override an entry's binding by name. Called from main() during
@@ -1825,6 +1834,10 @@ fn actionPrevTab() void {
     const sm = app.g.session_manager orelse return;
     const idx = sm.peekPrev() orelse return;
     activateSessionByIndex(idx);
+}
+
+fn actionPaletteOpen() void {
+    @import("../session/palette.zig").open();
 }
 
 // ─── NSTextInputClient (IME) ────────────────────────────────────────
