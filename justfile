@@ -61,6 +61,13 @@ tcc-reset:
 # Smoke loop: build + test in one shot.
 check: build test
 
+# One-shot deploy: reset TCC grants (cdhash about to change), build +
+# sign + rsync the bundle, launch via `open` so LaunchServices brings
+# the menubar item up. macOS will re-prompt for Accessibility on the
+# first hotkey press — grant and re-launch.
+deploy: tcc-reset install-app
+    open ~/Applications/Djinn.app
+
 # Print the active toolchain wrapper (`bash -c` vs `nix develop ... bash -c`).
 which-toolchain:
     @echo "{{nix}}"
