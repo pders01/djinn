@@ -138,7 +138,10 @@ fn writeAppearanceThemeOverride() ?[]const u8 {
     // file persists until exit (small text file, ~30 bytes — not worth
     // a cleanup hook).
     const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
-    const tmp_path = std.fmt.allocPrint(allocator, "{s}/djinn-theme-override-{d}.conf", .{ tmpdir, std.os.linux.getpid() }) catch return null;
+    // Fixed filename + truncate-write; no pid suffix needed (and
+    // `std.os.linux.getpid` is the wrong namespace for darwin — its
+    // value isn't a real macOS pid). Each launch overwrites.
+    const tmp_path = std.fmt.allocPrint(allocator, "{s}/djinn-theme-override.conf", .{tmpdir}) catch return null;
     const out = std.fs.createFileAbsolute(tmp_path, .{ .truncate = true }) catch {
         allocator.free(tmp_path);
         return null;
