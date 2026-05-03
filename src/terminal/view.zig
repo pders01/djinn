@@ -740,6 +740,9 @@ fn registerClass() void {
     _ = cls.addMethod("otherMouseDown:", otherMouseDownImpl);
     _ = cls.addMethod("otherMouseDragged:", otherMouseDraggedImpl);
     _ = cls.addMethod("otherMouseUp:", otherMouseUpImpl);
+    _ = cls.addMethod("mouseEntered:", mouseEnteredImpl);
+    _ = cls.addMethod("mouseExited:", mouseExitedImpl);
+    _ = cls.addMethod("updateTrackingAreas", updateTrackingAreasImpl);
     _ = cls.addMethod("scrollWheel:", scrollWheelImpl);
     _ = cls.addMethod("viewDidEndLiveResize", viewDidEndLiveResizeImpl);
     _ = cls.addMethod("viewDidChangeBackingProperties", viewDidChangeBackingPropertiesImpl);
@@ -1252,6 +1255,65 @@ fn otherMouseUpImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.
 
 fn otherMouseDraggedImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
     forwardMousePos(self_id, event_id);
+}
+
+fn mouseEnteredImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    // On enter, push the actual cursor position so ghostty's hover/link
+    // state recovers from the (-1, -1) we sent on exit.
+    forwardMousePos(self_id, event_id);
+}
+
+fn mouseExitedImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    const surf_ptr = app.g.ghostty_surface orelse return;
+    const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
+    const event = objc.Object.fromId(event_id);
+
+    // Mid-drag: dragging out of bounds still emits drag events with
+    // real coords; don't blank the cursor on exit or hover state thrashes.
+    const NSEvent = objc.getClass("NSEvent") orelse return;
+    const pressed: c_ulong = NSEvent.msgSend(c_ulong, "pressedMouseButtons", .{});
+    if (pressed != 0) return;
+
+    const ghostty_input = @import("../ghostty/input.zig");
+    const flags: u64 = @intCast(event.msgSend(c_ulong, "modifierFlags", .{}));
+    // Negative coords are ghostty's "cursor left viewport" sentinel.
+    ghostty_runtime.c.ghostty_surface_mouse_pos(surf, -1, -1, ghostty_input.modsFromNS(flags));
+}
+
+/// Rebuild the tracking area on every layout change. NSTrackingArea
+/// with `.inVisibleRect` makes its frame track the view automatically;
+/// `.activeAlways` keeps mouse events flowing even when the panel
+/// isn't key (we still want hover state). `.mouseMoved` is what makes
+/// `mouseMoved:` actually fire — without a tracking area, AppKit only
+/// sends mouse moves while a button is held.
+fn updateTrackingAreasImpl(self_id: objc.c.id, _: objc.c.SEL) callconv(.c) void {
+    const view = objc.Object.fromId(self_id);
+
+    // Drop existing areas before adding the new one.
+    const areas = view.msgSend(objc.Object, "trackingAreas", .{});
+    if (areas.value != null) {
+        const count: c_ulong = areas.msgSend(c_ulong, "count", .{});
+        var i: c_ulong = 0;
+        while (i < count) : (i += 1) {
+            const area = areas.msgSend(objc.Object, "objectAtIndex:", .{i});
+            view.msgSend(void, "removeTrackingArea:", .{area});
+        }
+    }
+
+    const NSTrackingArea = objc.getClass("NSTrackingArea") orelse return;
+    const area_alloc = NSTrackingArea.msgSend(objc.Object, "alloc", .{});
+    const frame = view.msgSend(NSRect, "frame", .{});
+    // Options: NSTrackingMouseEnteredAndExited(0x01) | NSTrackingMouseMoved(0x02)
+    //        | NSTrackingActiveAlways(0x80) | NSTrackingInVisibleRect(0x200).
+    const opts: c_ulong = 0x01 | 0x02 | 0x80 | 0x200;
+    const area = area_alloc.msgSend(objc.Object, "initWithRect:options:owner:userInfo:", .{
+        frame,
+        opts,
+        view.value,
+        @as(?*anyopaque, null),
+    });
+    if (area.value == null) return;
+    view.msgSend(void, "addTrackingArea:", .{area});
 }
 
 // Trackpad scroll deltas arrive as fine-grained pixels. ghostty owns
