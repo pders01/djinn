@@ -139,12 +139,15 @@ fn isShell(cmd: []const u8) bool {
 /// off-screen on a 13" laptop. Falls back to config defaults; floors at
 /// 200×100 so a corrupt state.json doesn't crash AppKit.
 fn restoreWindowSize(allocator: std.mem.Allocator, cfg: *const Config) struct { w: u32, h: u32 } {
-    var width_i: u32 = cfg.window.width;
-    var height_i: u32 = cfg.window.height;
-    if (persist.load(allocator)) |st| {
-        width_i = st.width;
-        height_i = st.height;
-    }
+    // Priority: explicit config dim → state.json → hardcoded default.
+    // Explicit config wins so a user editing `window-width = 2000`
+    // sees their change immediately, even when state.json holds an
+    // older size from a previous launch. state.json fills in only when
+    // the user hasn't pinned the dim in config (their resize lives on
+    // across restarts).
+    const persisted = persist.load(allocator);
+    var width_i: u32 = cfg.window.width orelse if (persisted) |st| st.width else 800;
+    var height_i: u32 = cfg.window.height orelse if (persisted) |st| st.height else 400;
 
     if (objc.getClass("NSScreen")) |sc| {
         const screen = panel_mod.currentScreen() orelse sc.msgSend(objc.Object, "mainScreen", .{});

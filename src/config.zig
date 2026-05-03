@@ -16,8 +16,13 @@ pub const Config = struct {
     profiles: ProfilesConfig = .{},
 
     pub const WindowConfig = struct {
-        width: u32 = 800,
-        height: u32 = 400,
+        /// Optional so the runtime can tell "user set this explicitly"
+        /// from "fall through to state.json or default". Set in
+        /// applyKey when the user writes `window-width = N`. When null,
+        /// `restoreWindowSize` uses state.json (if present) else the
+        /// hardcoded default.
+        width: ?u32 = null,
+        height: ?u32 = null,
         position: Position = .top_center,
         // Legacy: kept for backward compat. Prefer `theme.opacity`.
         opacity: f64 = 0.95,
@@ -411,7 +416,10 @@ pub const Config = struct {
 
         // Default commands per provider name. Each shortcut maps to the
         // exact CLI binary name shipped by that project; anything else
-        // falls through to /bin/zsh.
+        // falls through to /bin/zsh. Match is case-insensitive so
+        // `provider = Claude` resolves to `claude`, matching user
+        // intuition (config keys themselves are lowercase + hyphenated
+        // but provider VALUES are user-typed names).
         const map = .{
             .{ "claude", "claude" },
             .{ "codex", "codex" },
@@ -422,7 +430,7 @@ pub const Config = struct {
             .{ "pi", "pi" }, // Pi AI CLI
         };
         inline for (map) |entry| {
-            if (std.mem.eql(u8, self.provider.name, entry[0])) return entry[1];
+            if (eqIgnoreCase(self.provider.name, entry[0])) return entry[1];
         }
 
         // Generic: prefer macOS system zsh over $SHELL.
@@ -444,6 +452,14 @@ pub const Config = struct {
 
 fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
+}
+
+fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
+    }
+    return true;
 }
 
 fn parseBool(val: []const u8) !bool {
@@ -479,8 +495,8 @@ fn dashToUnder(s: []const u8) []const u8 {
 // Tests
 test "Config: parse defaults from empty input" {
     const config = try Config.parse(std.testing.allocator, "");
-    try std.testing.expectEqual(@as(u32, 800), config.window.width);
-    try std.testing.expectEqual(@as(u32, 400), config.window.height);
+    try std.testing.expect(config.window.width == null);
+    try std.testing.expect(config.window.height == null);
     try std.testing.expectEqualStrings("ctrl+space", config.hotkey.toggle);
     try std.testing.expectEqualStrings("generic", config.provider.name);
 }
@@ -493,8 +509,8 @@ test "Config: parse window settings" {
         \\window-font-size = 16
     ;
     const config = try Config.parse(std.testing.allocator, src);
-    try std.testing.expectEqual(@as(u32, 1024), config.window.width);
-    try std.testing.expectEqual(@as(u32, 600), config.window.height);
+    try std.testing.expectEqual(@as(u32, 1024), config.window.width.?);
+    try std.testing.expectEqual(@as(u32, 600), config.window.height.?);
     try std.testing.expect(config.window.opacity < 0.91 and config.window.opacity > 0.89);
 }
 
@@ -547,6 +563,16 @@ test "Config: getProviderCommand default mapping" {
     var config = Config{};
     config.provider.name = "claude";
     try std.testing.expectEqualStrings("claude", config.getProviderCommand());
+}
+
+test "Config: getProviderCommand case-insensitive" {
+    var c = Config{};
+    c.provider.name = "Claude";
+    try std.testing.expectEqualStrings("claude", c.getProviderCommand());
+    c.provider.name = "CRUSH";
+    try std.testing.expectEqualStrings("crush", c.getProviderCommand());
+    c.provider.name = "Pi";
+    try std.testing.expectEqualStrings("pi", c.getProviderCommand());
 }
 
 test "Config: getProviderCommand explicit override" {

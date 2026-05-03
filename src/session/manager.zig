@@ -175,12 +175,20 @@ fn providerCommand(name: []const u8) []const u8 {
         .{ "pi", "pi" }, // Pi AI CLI
     };
     inline for (map) |entry| {
-        if (std.mem.eql(u8, name, entry[0])) return entry[1];
+        if (eqIgnoreCase(name, entry[0])) return entry[1];
     }
     // Same fallback rationale as Config.getProviderCommand: prefer
     // /bin/zsh over $SHELL; nix dev shells set $SHELL to a sandboxed
     // bash with broken terminfo.
     return "/bin/zsh";
+}
+
+fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |ca, cb| {
+        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
+    }
+    return true;
 }
 
 // Tests --------------------------------------------------------------
