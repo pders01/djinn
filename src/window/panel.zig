@@ -6,6 +6,7 @@ const app_state = @import("../app.zig");
 // so it stays module-private. Auto-hide + resize wiring goes through
 // app.g (panel ref, hide_on_blur, resize_handler).
 var g_class_registered: bool = false;
+var g_blur_observer_registered: bool = false;
 
 /// Subclass NSPanel so we can override `canBecomeKeyWindow:` — borderless
 /// panels return NO by default, which prevents the contentView from ever
@@ -369,11 +370,16 @@ pub const Panel = struct {
     }
 
     /// Enable auto-hide when the panel loses key status. Idempotent: registers
-    /// the NSNotificationCenter observer on first call only.
+    /// the NSNotificationCenter observer on first call only. Without the
+    /// guard, every config reload (FSEvent fan-in via `onConfigChanged`)
+    /// would re-add the observer, and `didResignKeyImpl` would fire N
+    /// times per resign after N reloads.
     pub fn setHideOnBlur(self: *Panel, enabled: bool) void {
         app_state.g.hide_on_blur = enabled;
         app_state.g.panel = self;
         if (!enabled) return;
+        if (g_blur_observer_registered) return;
+        g_blur_observer_registered = true;
 
         const NSNotificationCenter = objc.getClass("NSNotificationCenter") orelse return;
         const center = NSNotificationCenter.msgSend(objc.Object, "defaultCenter", .{});
