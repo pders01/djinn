@@ -280,6 +280,8 @@ pub fn activateSession(idx: usize) bool {
             mb.updateState(@enumFromInt(@intFromEnum(snap.state)), snap.message);
         }
     }
+    // Tab strip highlights the active idx; redraw to follow.
+    @import("session/tab_strip.zig").refresh();
     return true;
 }
 
@@ -364,6 +366,16 @@ fn buildContainer(
     const divider_w: f64 = view_mod.divider_width;
     const term_w = @max(1.0, width - log_width - divider_w);
 
+    // Multi-profile tab strip: built when more than one profile is
+    // declared. Eats `tab_strip.tab_h` off the top of the container;
+    // every below-strip frame uses `term_h = height - tab_h`.
+    const tab_strip = @import("session/tab_strip.zig");
+    var tab_h: f64 = 0;
+    if (app.g.session_manager) |sm| {
+        if (sm.sessions.len > 1) tab_h = tab_strip.tab_h;
+    }
+    const term_h = @max(1.0, height - tab_h);
+
     // Tier-5 surface host: sibling of `terminal` at the same frame.
     // Added FIRST (z-bottom) so TerminalView sits in front and
     // continues to capture key/mouse events even in surface mode.
@@ -372,7 +384,7 @@ fn buildContainer(
     // show through.
     surface_host.msgSend(void, "setFrame:", .{NSRect{
         .origin = .{ .x = 0, .y = 0 },
-        .size = .{ .width = term_w, .height = height },
+        .size = .{ .width = term_w, .height = term_h },
     }});
     surface_host.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, (1 << 1) | (1 << 4))});
     surface_host.msgSend(void, "setHidden:", .{@as(c_int, 1)});
@@ -380,7 +392,7 @@ fn buildContainer(
 
     terminal.msgSend(void, "setFrame:", .{NSRect{
         .origin = .{ .x = 0, .y = 0 },
-        .size = .{ .width = term_w, .height = height },
+        .size = .{ .width = term_w, .height = term_h },
     }});
     // WidthSizable | HeightSizable — terminal absorbs most of the extra space.
     terminal.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, (1 << 1) | (1 << 4))});
@@ -391,18 +403,24 @@ fn buildContainer(
     // handlers (drag-to-resize) and a resize cursor rect. Width = 4px
     // is wide enough to grab reliably; the visible alpha is kept low
     // so the line still reads as a hairline.
-    const divider = view_mod.createDivider(term_w, height);
+    const divider = view_mod.createDivider(term_w, term_h);
     container.msgSend(void, "addSubview:", .{divider});
     app.g.divider_view_id = divider.value;
 
     log.msgSend(void, "setFrame:", .{NSRect{
         .origin = .{ .x = term_w + divider_w, .y = 0 },
-        .size = .{ .width = log_width, .height = height },
+        .size = .{ .width = log_width, .height = term_h },
     }});
     // MinXMargin | HeightSizable — log stays anchored to the right
     // edge with fixed width. Width changes only via the toggle path.
     log.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, (1 << 0) | (1 << 4))});
     container.msgSend(void, "addSubview:", .{log});
+
+    if (tab_h > 0) {
+        const strip = tab_strip.create(width, height);
+        container.msgSend(void, "addSubview:", .{strip});
+        app.g.tab_strip_id = strip.value;
+    }
 
     return container;
 }

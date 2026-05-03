@@ -142,6 +142,11 @@ pub const AppState = struct {
     /// surface_host. Action handlers in view.zig reach this through
     /// app.g + call back into main.zig for the spawn / focus glue.
     session_manager: ?*@import("session/manager.zig").SessionManager = null,
+    /// Optional NSView pointer for the multi-profile tab strip.
+    /// Present only when `session_manager.sessions.len >= 2`; null
+    /// otherwise. Action handlers + applyLogLayout consult this to
+    /// decide whether to reserve `tab_strip.tab_h` at the top.
+    tab_strip_id: ?objc.c.id = null,
     /// Stable pointer to the ghostty App so the lazy-spawn path in the
     /// session switcher can call `ga.newSurface` without re-importing
     /// the runtime module from inside view.zig.

@@ -635,25 +635,35 @@ fn dividerResetCursorRectsImpl(self: objc.c.id, _: objc.c.SEL) callconv(.c) void
 
 /// Reflow terminal + divider + log + surface_host frames to a new
 /// split. Shared between drag-to-resize + log-pane toggle so the
-/// layout invariants live in one place.
+/// layout invariants live in one place. Reserves `tab_strip.tab_h`
+/// at the top when the multi-profile tab strip is present.
 fn applyLogLayout(container: objc.Object, term_w: f64, log_w: f64, height: f64) void {
+    const tab_strip = @import("../session/tab_strip.zig");
+    const tab_h: f64 = if (app.g.tab_strip_id != null) tab_strip.tab_h else 0;
+    const term_h = @max(1.0, height - tab_h);
     const view_id = app.g.view_id orelse return;
     const term_view = objc.Object.fromId(view_id);
     term_view.msgSend(void, "setFrame:", .{NSRect{
         .origin = .{ .x = 0, .y = 0 },
-        .size = .{ .width = term_w, .height = height },
+        .size = .{ .width = term_w, .height = term_h },
     }});
     if (app.g.divider_view_id) |did| {
         objc.Object.fromId(did).msgSend(void, "setFrame:", .{NSRect{
             .origin = .{ .x = term_w, .y = 0 },
-            .size = .{ .width = if (log_w > 0) divider_width else 0, .height = height },
+            .size = .{ .width = if (log_w > 0) divider_width else 0, .height = term_h },
         }});
     }
     if (app.g.log_view) |lv| {
         const div_w: f64 = if (log_w > 0) divider_width else 0;
         lv.view.msgSend(void, "setFrame:", .{NSRect{
             .origin = .{ .x = term_w + div_w, .y = 0 },
-            .size = .{ .width = log_w, .height = height },
+            .size = .{ .width = log_w, .height = term_h },
+        }});
+    }
+    if (app.g.tab_strip_id) |tid| {
+        objc.Object.fromId(tid).msgSend(void, "setFrame:", .{NSRect{
+            .origin = .{ .x = 0, .y = term_h },
+            .size = .{ .width = container.msgSend(NSRect, "bounds", .{}).size.width, .height = tab_h },
         }});
     }
     // Reflow every session's surface_host so inactive sessions stay
@@ -667,7 +677,7 @@ fn applyLogLayout(container: objc.Object, term_w: f64, log_w: f64, height: f64) 
             if (sess.surface_host) |sid| {
                 objc.Object.fromId(sid).msgSend(void, "setFrame:", .{NSRect{
                     .origin = .{ .x = 0, .y = 0 },
-                    .size = .{ .width = term_w, .height = height },
+                    .size = .{ .width = term_w, .height = term_h },
                 }});
             }
         }
