@@ -53,16 +53,7 @@ fn deferredHideForBlur(_: ?*anyopaque) callconv(.c) void {
     const is_key: bool = p.ns_panel.msgSend(bool, "isKeyWindow", .{});
     if (is_key) return;
 
-    // Capture the app the user actually switched to (Cmd+Tab pick or
-    // click target). By now the runloop has resolved the focus event
-    // so `frontmostApplication` reads the user's choice, not djinn.
-    // We re-activate it after orderOut to defeat macOS's
-    // "Accessory app deactivates → restore previous regular app"
-    // heuristic, which on hide_on_blur paths would otherwise yank
-    // focus back to whatever was frontmost *before* djinn appeared.
-    const new_front = currentFrontmostPid();
     p.hideForBlur();
-    if (new_front != 0) activateAppByPid(new_front);
 }
 
 extern "c" fn dispatch_async_f(
@@ -332,25 +323,31 @@ pub const Panel = struct {
             .size = frame.size,
         };
         self.ns_panel.msgSend(void, "setFrame:display:animate:", .{ offscreen, @as(c_int, 1), @as(c_int, 1) });
-        self.ns_panel.msgSend(void, "orderOut:", .{@as(?*anyopaque, null)});
-        const restore = NSRect{
-            .origin = .{ .x = target_x, .y = visible_y },
-            .size = frame.size,
-        };
-        self.ns_panel.msgSend(void, "setFrame:display:", .{ restore, @as(c_int, 0) });
 
-        // Hand focus back to whatever was frontmost before we activated.
-        // Without this, djinn stays frontmost (just hidden) and the user's
-        // editor/browser does NOT regain its menu bar — keystrokes go to
-        // a hidden window. Quake-style toggles are expected to be invisible
-        // in both directions.
+        // Explicit toggle path: orderOut removes the panel from the
+        // window list, which lets macOS deactivate djinn cleanly so
+        // the menu bar returns to the previously-frontmost regular
+        // app. We also re-activate `prev_app_pid` explicitly because
+        // macOS 14+ throttles cross-app activation and won't always
+        // restore focus on its own.
         //
-        // Skipped on the blur path: user already Cmd+Tab'd / clicked into
-        // another app, and that app has focus now. Re-activating
-        // `prev_app_pid` here would override their choice. We still clear
-        // the slot so the next show() captures a fresh prev frontmost.
-        if (restore_prev and self.prev_app_pid != 0) {
-            activateAppByPid(self.prev_app_pid);
+        // Blur path (Cmd+Tab / click-away): SKIP orderOut. djinn is
+        // an Accessory app; once orderOut removes the last visible
+        // window, macOS triggers a deactivation cascade that picks
+        // "previous regular app" — which is whatever was frontmost
+        // BEFORE the user summoned djinn, not the app they just
+        // Cmd+Tab'd to. `activateAppByPid` can't override this on
+        // macOS 14+ (cross-app activate is gated on user gesture).
+        // Leaving the panel in the window list at offscreen Y stops
+        // the cascade entirely; the user's pick stays frontmost.
+        if (restore_prev) {
+            self.ns_panel.msgSend(void, "orderOut:", .{@as(?*anyopaque, null)});
+            const restore = NSRect{
+                .origin = .{ .x = target_x, .y = visible_y },
+                .size = frame.size,
+            };
+            self.ns_panel.msgSend(void, "setFrame:display:", .{ restore, @as(c_int, 0) });
+            if (self.prev_app_pid != 0) activateAppByPid(self.prev_app_pid);
         }
         self.prev_app_pid = 0;
         self.visible = false;
