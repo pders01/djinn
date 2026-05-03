@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Cancel in-progress runs when a new commit lands on the same ref —
+# avoids stacking PR builds.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Apple-silicon runner. The test path links only ghostty-vt-static
+    # (no Metal compile) so this works on stock GitHub macOS images
+    # without downloading the Metal Toolchain.
+    runs-on: macos-15
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      # Cache the global zig package cache (ghostty fetch is the slow
+      # part on a cold runner — minutes vs seconds).
+      - name: Cache zig packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Run unit suite
+        run: ./scripts/build.sh test
+
+      - name: Build debug exe (smoke)
+        # Catches link-time regressions the test suite can't see, since
+        # the test build links ghostty-vt-static while the real exe
+        # pulls the full libghostty.
+        run: ./scripts/build.sh
+
+      - name: Run djinn --version
+        run: ./zig-out/bin/djinn --version

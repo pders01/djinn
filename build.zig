@@ -1,5 +1,10 @@
 const std = @import("std");
 
+/// Mirrors `src/version.zig` — kept here so the Info.plist template can
+/// interpolate at build time without `@import`. Bump together when
+/// cutting a release.
+const djinn_version = "0.1.0-alpha.1";
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -122,7 +127,11 @@ pub fn build(b: *std.Build) void {
     fix_rpath.step.dependOn(&bundle_dylib.step);
 
     const wf = b.addWriteFiles();
-    const plist_path = wf.add("Info.plist", info_plist);
+    // Interpolate djinn_version into the bundle's CFBundleVersion +
+    // CFBundleShortVersionString slots so the .app's metadata matches
+    // src/version.zig without a hand-edit on every release.
+    const plist_rendered = std.fmt.allocPrint(b.allocator, info_plist, .{ djinn_version, djinn_version }) catch @panic("OOM rendering Info.plist");
+    const plist_path = wf.add("Info.plist", plist_rendered);
     const bundle_plist = b.addInstallFile(plist_path, "Djinn.app/Contents/Info.plist");
     bundle_plist.step.dependOn(&wf.step);
 
@@ -246,9 +255,9 @@ const info_plist =
     \\    <key>CFBundleIdentifier</key>
     \\    <string>com.pders01.djinn</string>
     \\    <key>CFBundleVersion</key>
-    \\    <string>0.1.0</string>
+    \\    <string>{s}</string>
     \\    <key>CFBundleShortVersionString</key>
-    \\    <string>0.1.0</string>
+    \\    <string>{s}</string>
     \\    <key>CFBundleExecutable</key>
     \\    <string>djinn</string>
     \\    <key>CFBundlePackageType</key>

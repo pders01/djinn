@@ -101,9 +101,7 @@ const flags = [_]Flag{
         .help = "Print version and exit",
         .handler = struct {
             fn h(_: *Ctx) ParseResult {
-                // Mirrors Info.plist CFBundleShortVersionString. Bumped manually
-                // on release; CI is not yet driving it.
-                std.debug.print("djinn 0.1.0\n", .{});
+                std.debug.print("djinn {s}\n", .{@import("version.zig").string});
                 return .exit_ok;
             }
         }.h,

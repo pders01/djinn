@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to publish (e.g. v0.1.0-alpha.1)'
+        required: true
+
+permissions:
+  contents: write  # GitHub Releases write access
+
+jobs:
+  build-bundle:
+    # Apple-silicon runner with Xcode preinstalled. The Metal Toolchain
+    # may need a one-time download per runner image — `xcodebuild
+    # -downloadComponent` is idempotent.
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      - name: Install Metal Toolchain
+        # ghostty's renderer compiles `.metal` shaders via xcrun ->
+        # metal. The Metal Toolchain isn't part of the base Xcode
+        # install on the runner image; download it explicitly.
+        run: sudo xcodebuild -downloadComponent MetalToolchain
+
+      - name: Cache zig packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build signed Djinn.app (ad-hoc)
+        # `bundle-sign` step in build.zig:
+        #   - copies libghostty.dylib into the bundle
+        #   - install_name_tool rewrites rpath to @loader_path
+        #   - codesign --force --sign - --deep
+        # ReleaseFast is pinned for the bundle path regardless of
+        # -Doptimize, so the distributed artifact never carries
+        # libghostty's verifyIntegrity overhead.
+        run: ./scripts/build.sh bundle-sign
+
+      - name: Verify bundle metadata
+        run: |
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+            zig-out/Djinn.app/Contents/Info.plist
+          codesign --verify --verbose=2 zig-out/Djinn.app
+
+      - name: Zip bundle for release
+        run: |
+          cd zig-out
+          zip -r -y Djinn-${{ steps.tag.outputs.name }}-${{ runner.arch }}.zip Djinn.app
+          shasum -a 256 Djinn-${{ steps.tag.outputs.name }}-${{ runner.arch }}.zip > \
+            Djinn-${{ steps.tag.outputs.name }}-${{ runner.arch }}.zip.sha256
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          # Mark non-stable tags as prereleases — alpha / beta / rc.
+          prerelease: ${{ contains(steps.tag.outputs.name, '-') }}
+          generate_release_notes: true
+          files: |
+            zig-out/Djinn-${{ steps.tag.outputs.name }}-${{ runner.arch }}.zip
+            zig-out/Djinn-${{ steps.tag.outputs.name }}-${{ runner.arch }}.zip.sha256

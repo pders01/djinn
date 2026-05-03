@@ -39,8 +39,8 @@ pub const Dispatcher = struct {
         if (std.mem.eql(u8, method, "initialize")) {
             const result = std.fmt.allocPrint(
                 allocator,
-                "{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"djinn\",\"version\":\"0.1.0\"}}}}",
-                .{},
+                "{{\"protocolVersion\":\"2024-11-05\",\"capabilities\":{{\"tools\":{{}}}},\"serverInfo\":{{\"name\":\"djinn\",\"version\":\"{s}\"}}}}",
+                .{@import("../version.zig").string},
             ) catch return errorResult(-32603, "internal");
             return .{ .result = result };
         }
