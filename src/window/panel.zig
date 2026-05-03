@@ -30,8 +30,40 @@ fn canBecomeKeyImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
 fn didResignKeyImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
     if (!app_state.g.hide_on_blur) return;
     const p = app_state.g.panel orelse return;
-    if (p.visible) p.hideForBlur();
+    if (!p.visible) return;
+    // Defer to the next runloop turn. didResignKey fires synchronously
+    // when the Cmd+Tab picker opens (before the user has even chosen
+    // their target). If we run hideForBlur right now, the panel's
+    // 250ms `setFrame:animate:YES` blocks while macOS is still
+    // resolving the picker; by the time the animation ends and we
+    // call `orderOut:`, our deactivation can race the user's pick and
+    // macOS picks the wrong frontmost. Async-on-main lets Cmd+Tab
+    // resolve first, then we hide cleanly.
+    const main_queue = c_dispatch.dispatch_get_main_queue();
+    dispatch_async_f(@ptrCast(main_queue), null, &deferredHideForBlur);
 }
+
+fn deferredHideForBlur(_: ?*anyopaque) callconv(.c) void {
+    if (!app_state.g.hide_on_blur) return;
+    const p = app_state.g.panel orelse return;
+    if (!p.visible) return;
+    // Re-check key status: if djinn re-acquired focus before this
+    // runloop turn (rare but possible — system focus thrash on app
+    // switches with overlapping panels), skip the hide.
+    const is_key: bool = p.ns_panel.msgSend(bool, "isKeyWindow", .{});
+    if (is_key) return;
+    p.hideForBlur();
+}
+
+extern "c" fn dispatch_async_f(
+    queue: ?*anyopaque,
+    ctx: ?*anyopaque,
+    work: *const fn (?*anyopaque) callconv(.c) void,
+) void;
+
+const c_dispatch = @cImport({
+    @cInclude("dispatch/dispatch.h");
+});
 
 fn didEndLiveResizeImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
     const handler = app_state.g.resize_handler orelse return;
