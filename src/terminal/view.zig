@@ -238,7 +238,6 @@ pub const TerminalView = struct {
         app.g.view_id = view.value;
         app.g.font_family = font_name;
         app.g.font_size = font_size;
-        app.g.font_size_default = font_size;
         app.g.cell_w = metrics.cell_w;
         app.g.cell_h = metrics.cell_h;
         app.g.baseline = metrics.baseline;
@@ -1409,15 +1408,15 @@ fn scrollByPage(direction: i32) void {
 }
 
 fn actionFontInc() void {
-    applyFontSize(app.g.font_size + 1);
+    forwardBindingAction("increase_font_size:1");
 }
 
 fn actionFontDec() void {
-    applyFontSize(app.g.font_size - 1);
+    forwardBindingAction("decrease_font_size:1");
 }
 
 fn actionFontReset() void {
-    applyFontSize(app.g.font_size_default);
+    forwardBindingAction("reset_font_size");
 }
 
 fn actionOpenSettings() void {
@@ -1614,27 +1613,6 @@ fn actionPrevTab() void {
     const sm = app.g.session_manager orelse return;
     const idx = sm.peekPrev() orelse return;
     activateSessionByIndex(idx);
-}
-
-/// Rebuild the font at a new size, refresh cell metrics + glyph caches,
-/// reflow the terminal grid + PTY, and trigger a redraw. No-op if the
-/// requested size already matches the current size.
-fn applyFontSize(new_size: f64) void {
-    const min_size: f64 = 6;
-    const max_size: f64 = 96;
-    const clamped = @max(min_size, @min(max_size, new_size));
-    if (clamped == app.g.font_size) return;
-    if (app.g.font_family.len == 0) return; // not initialized yet
-
-    const metrics = buildFont(app.g.font_family, clamped) catch return;
-
-    if (app.g.font) |old| cg.CFRelease(old);
-    app.g.font = @ptrCast(metrics.font);
-    app.g.font_size = clamped;
-    app.g.cell_w = metrics.cell_w;
-    app.g.cell_h = metrics.cell_h;
-    app.g.baseline = metrics.baseline;
-    // Surface owns its own font + grid reflow; no host push required.
 }
 
 // ─── NSTextInputClient (IME) ────────────────────────────────────────

@@ -33,10 +33,10 @@ pub const AppState = struct {
     /// Family name slice, lifetime owned by config (lives for app duration).
     /// Empty default; set in TerminalView.init so font-resize can rebuild.
     font_family: []const u8 = "",
-    /// Current point size. Cmd+/- mutates this; Cmd+0 resets to font_size_default.
+    /// Initial size from config. Surface owns runtime mutation via
+    /// `increase_font_size`/`decrease_font_size` actions; this stays
+    /// frozen at boot value (used only for chrome metric fallback).
     font_size: f64 = 13,
-    /// Original size from config — Cmd+0 reset target.
-    font_size_default: f64 = 13,
     cell_w: f64 = 8,
     cell_h: f64 = 16,
     baseline: f64 = 4,
