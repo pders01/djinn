@@ -731,6 +731,12 @@ fn registerClass() void {
     _ = cls.addMethod("mouseDragged:", mouseDraggedImpl);
     _ = cls.addMethod("mouseUp:", mouseUpImpl);
     _ = cls.addMethod("mouseMoved:", mouseMovedImpl);
+    _ = cls.addMethod("rightMouseDown:", rightMouseDownImpl);
+    _ = cls.addMethod("rightMouseDragged:", rightMouseDraggedImpl);
+    _ = cls.addMethod("rightMouseUp:", rightMouseUpImpl);
+    _ = cls.addMethod("otherMouseDown:", otherMouseDownImpl);
+    _ = cls.addMethod("otherMouseDragged:", otherMouseDraggedImpl);
+    _ = cls.addMethod("otherMouseUp:", otherMouseUpImpl);
     _ = cls.addMethod("scrollWheel:", scrollWheelImpl);
     _ = cls.addMethod("viewDidEndLiveResize", viewDidEndLiveResizeImpl);
     _ = cls.addMethod("viewDidChangeBackingProperties", viewDidChangeBackingPropertiesImpl);
@@ -1085,7 +1091,11 @@ fn eventToCell(view: objc.Object, event: objc.Object) struct { col: i32, row: i3
     return .{ .col = col, .row = row };
 }
 
-fn mouseMovedImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+/// Shared body for mouseMoved/mouseDragged + rightMouseDragged +
+/// otherMouseDragged. Position events all funnel through one
+/// `ghostty_surface_mouse_pos` call — ghostty tracks button state
+/// independently, so the same body handles every drag variant.
+fn forwardMousePos(self_id: objc.c.id, event_id: objc.c.id) void {
     const surf_ptr = app.g.ghostty_surface orelse return;
     const view = objc.Object.fromId(self_id);
     const event = objc.Object.fromId(event_id);
@@ -1095,37 +1105,61 @@ fn mouseMovedImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callco
     const local = view.msgSend(NSPoint, "convertPoint:fromView:", .{ loc, @as(?*anyopaque, null) });
     const frame = view.msgSend(NSRect, "frame", .{});
     const flags: u64 = @intCast(event.msgSend(c_ulong, "modifierFlags", .{}));
-    // ghostty wants top-down Y; NSView origin is bottom-left.
     ghostty_runtime.c.ghostty_surface_mouse_pos(surf, local.x, frame.size.height - local.y, ghostty_input.modsFromNS(flags));
 }
 
-
-fn mouseDownImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+/// Shared body for mouseDown/Up + rightMouse* + otherMouse* handlers.
+/// AppKit splits button events across three method families (left,
+/// right, "other" = middle/4/5+); ghostty's `mouse_button` API takes
+/// a single button enum, so the handlers all funnel through here.
+fn forwardMouseButton(event: objc.Object, state: ghostty_runtime.c.ghostty_input_mouse_state_e) void {
     const surf_ptr = app.g.ghostty_surface orelse return;
-    const event = objc.Object.fromId(event_id);
     const ghostty_input = @import("../ghostty/input.zig");
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     const button_num: c_long = event.msgSend(c_long, "buttonNumber", .{});
     const flags: u64 = @intCast(event.msgSend(c_ulong, "modifierFlags", .{}));
     _ = ghostty_runtime.c.ghostty_surface_mouse_button(
         surf,
-        ghostty_runtime.c.GHOSTTY_MOUSE_PRESS,
+        state,
         ghostty_input.mouseButtonFromNS(button_num),
         ghostty_input.modsFromNS(flags),
     );
 }
 
+fn mouseMovedImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    forwardMousePos(self_id, event_id);
+}
+
+fn mouseDownImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    forwardMouseButton(objc.Object.fromId(event_id), ghostty_runtime.c.GHOSTTY_MOUSE_PRESS);
+}
+
 fn mouseDraggedImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
-    const surf_ptr = app.g.ghostty_surface orelse return;
-    const view = objc.Object.fromId(self_id);
-    const event = objc.Object.fromId(event_id);
-    const ghostty_input = @import("../ghostty/input.zig");
-    const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
-    const loc = event.msgSend(NSPoint, "locationInWindow", .{});
-    const local = view.msgSend(NSPoint, "convertPoint:fromView:", .{ loc, @as(?*anyopaque, null) });
-    const frame = view.msgSend(NSRect, "frame", .{});
-    const flags: u64 = @intCast(event.msgSend(c_ulong, "modifierFlags", .{}));
-    ghostty_runtime.c.ghostty_surface_mouse_pos(surf, local.x, frame.size.height - local.y, ghostty_input.modsFromNS(flags));
+    forwardMousePos(self_id, event_id);
+}
+
+fn rightMouseDownImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    forwardMouseButton(objc.Object.fromId(event_id), ghostty_runtime.c.GHOSTTY_MOUSE_PRESS);
+}
+
+fn rightMouseUpImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    forwardMouseButton(objc.Object.fromId(event_id), ghostty_runtime.c.GHOSTTY_MOUSE_RELEASE);
+}
+
+fn rightMouseDraggedImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    forwardMousePos(self_id, event_id);
+}
+
+fn otherMouseDownImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    forwardMouseButton(objc.Object.fromId(event_id), ghostty_runtime.c.GHOSTTY_MOUSE_PRESS);
+}
+
+fn otherMouseUpImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    forwardMouseButton(objc.Object.fromId(event_id), ghostty_runtime.c.GHOSTTY_MOUSE_RELEASE);
+}
+
+fn otherMouseDraggedImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    forwardMousePos(self_id, event_id);
 }
 
 // Trackpad scroll deltas arrive as fine-grained pixels. ghostty owns
@@ -1172,24 +1206,8 @@ fn scrollMods(precision: bool, phase: c_ulong) c_int {
     return v;
 }
 
-fn mouseUpImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
-    const event = objc.Object.fromId(event_id);
-
-    if (app.g.ghostty_surface) |surf_ptr| {
-        const ghostty_input = @import("../ghostty/input.zig");
-        const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
-        const button_num: c_long = event.msgSend(c_long, "buttonNumber", .{});
-        const flags: u64 = @intCast(event.msgSend(c_ulong, "modifierFlags", .{}));
-        _ = ghostty_runtime.c.ghostty_surface_mouse_button(
-            surf,
-            ghostty_runtime.c.GHOSTTY_MOUSE_RELEASE,
-            ghostty_input.mouseButtonFromNS(button_num),
-            ghostty_input.modsFromNS(flags),
-        );
-        return;
-    }
-
-    _ = self_id;
+fn mouseUpImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    forwardMouseButton(objc.Object.fromId(event_id), ghostty_runtime.c.GHOSTTY_MOUSE_RELEASE);
 }
 
 /// Cmd+V: read pasteboard string + forward raw to ghostty surface.
