@@ -360,3 +360,33 @@ flowchart LR
     Style --> FC["find chip<br/>bg = chip.bg,<br/>border-less, 4px round,<br/>centered via DjinnChipCell"]
     Style --> Future["…future panels"]
 ```
+
+## Acknowledgements
+
+djinn stands almost entirely on top of work that other people did:
+
+- **[ghostty](https://github.com/ghostty-org/ghostty)** (Mitchell
+  Hashimoto + ghostty contributors) — the visible terminal area is
+  ghostty's `libghostty` surface, end-to-end. djinn's config grammar
+  (`key = value`, `keybind = action=trigger`, `theme = light:X,dark:Y`)
+  is also lifted from ghostty so users with an existing ghostty
+  config drop straight in. MIT-licensed.
+- **[zig-objc](https://github.com/mitchellh/zig-objc)** (Mitchell
+  Hashimoto) — the `objc.msgSend` primitives every host-side Cocoa
+  call goes through. MIT-licensed.
+- **Apple** — SF Symbols (menubar state glyphs) and the macOS SDK
+  frameworks (AppKit, Metal, CoreText, …).
+- **[Anthropic](https://modelcontextprotocol.io)** — Model Context
+  Protocol spec.
+- **The Quake-drop terminal lineage** — Quake's tilde console →
+  Tilda → Yakuake → Visor → iTerm2's hotkey window → ghostty's
+  `quick-terminal`. djinn is one more entry in that line.
+
+See [`NOTICES.md`](NOTICES.md) for full third-party attribution
+including the libraries ghostty itself pulls in (libxev, vaxis,
+simdutf, harfbuzz, freetype, …) — they ride along inside the
+redistributed `libghostty.dylib`.
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).
