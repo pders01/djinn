@@ -1,5 +1,6 @@
 const std = @import("std");
 const objc = @import("objc");
+const app_state = @import("../app.zig");
 
 pub const NSSize = extern struct { width: f64, height: f64 };
 pub const NSPoint = extern struct { x: f64, y: f64 };
@@ -72,11 +73,21 @@ pub const Menubar = struct {
 
         if (self.state_menu_item) |mi| {
             const NSString = objc.getClass("NSString") orelse return;
+            // Suffix the active profile label only when more than one
+            // profile is configured — the indicator is the only
+            // visual feedback for which session is up front, so it
+            // matters under multi-profile and is noise otherwise.
+            var profile_label: []const u8 = "";
+            if (app_state.g.session_manager) |sm| {
+                if (sm.sessions.len > 1) profile_label = sm.active().profile.label();
+            }
             var buf: [256]u8 = undefined;
-            const txt = std.fmt.bufPrintZ(&buf, "{s}{s}{s}", .{
+            const txt = std.fmt.bufPrintZ(&buf, "{s}{s}{s}{s}{s}", .{
                 stateLabel(state),
                 if (message.len > 0) " — " else "",
                 message,
+                if (profile_label.len > 0) " · " else "",
+                profile_label,
             }) catch return;
             const title = NSString.msgSend(
                 objc.Object,
