@@ -163,13 +163,16 @@ fn applyFromGhostty(t: *Theme, cfg: ghostty_runtime.c.ghostty_config_t, allocato
             t.owned_font_family = true;
         }
     }
-    if (ghostty_runtime.configFloat(cfg, "font-size")) |v| {
-        if (v > 0) t.font_size = v;
+    // Type-strict reads: ghostty stores `font-size` as f32,
+    // `background-opacity` as f64. `window-padding-x/y` are a
+    // `WindowPadding` struct in ghostty (not a scalar) — the previous
+    // configFloat read returned false silently, so padding overrides
+    // never actually applied. Until we wire up the struct path, leave
+    // the defaults from the djinn-config layer untouched.
+    if (ghostty_runtime.configF32(cfg, "font-size")) |v| {
+        if (v > 0) t.font_size = @floatCast(v);
     }
-    if (ghostty_runtime.configFloat(cfg, "background-opacity")) |v| t.opacity = v;
-    if (ghostty_runtime.configFloat(cfg, "background-blur-radius")) |v| t.blur_radius = v;
-    if (ghostty_runtime.configFloat(cfg, "window-padding-x")) |v| t.padding_x = v;
-    if (ghostty_runtime.configFloat(cfg, "window-padding-y")) |v| t.padding_y = v;
+    if (ghostty_runtime.configF64(cfg, "background-opacity")) |v| t.opacity = v;
     if (ghostty_runtime.configColor(cfg, "background")) |c| {
         t.background = .{ .r = c.r, .g = c.g, .b = c.b };
     }

@@ -92,6 +92,100 @@ pub fn reloadConfigFromDisk() void {
     host_storage.app_state.ghostty_config = @ptrCast(new_cfg);
 }
 
+/// Peek the user's `~/.config/ghostty/config`, find the `theme = ...`
+/// line, and (when it's a `light:X,dark:Y` split) write a tmp file
+/// containing the variant matching the host's system appearance.
+/// Returns the tmp path on success (caller frees + loads via
+/// `ghostty_config_load_file` BEFORE `ghostty_config_finalize`); null
+/// when there's nothing to override (no theme line, or single-variant
+/// theme that ghostty handles correctly already).
+fn writeAppearanceThemeOverride() ?[]const u8 {
+    const allocator = std.heap.page_allocator;
+    const home = std.posix.getenv("HOME") orelse return null;
+    const cfg_path = std.fmt.allocPrint(allocator, "{s}/.config/ghostty/config", .{home}) catch return null;
+    defer allocator.free(cfg_path);
+
+    const file = std.fs.openFileAbsolute(cfg_path, .{}) catch return null;
+    defer file.close();
+    const contents = file.readToEndAlloc(allocator, 256 * 1024) catch return null;
+    defer allocator.free(contents);
+
+    // Find the last `theme = ...` line (last-one-wins matches ghostty's
+    // own load order — later assignments override earlier ones).
+    var theme_spec: ?[]const u8 = null;
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        const eq = std.mem.indexOfScalar(u8, line, '=') orelse continue;
+        const k = std.mem.trim(u8, line[0..eq], " \t");
+        if (!std.mem.eql(u8, k, "theme")) continue;
+        theme_spec = std.mem.trim(u8, line[eq + 1 ..], " \t");
+    }
+    const spec = theme_spec orelse return null;
+
+    // Only intervene for split-variant specs. Plain `theme = X` is
+    // handled correctly by ghostty already.
+    if (std.mem.indexOfScalar(u8, spec, ',') == null) return null;
+
+    // Detect appearance via NSAppearance and pick the matching variant.
+    // Inline lookup so this module stays free of theme.zig deps (theme
+    // imports runtime.zig already; circular import otherwise).
+    const dark = detectDarkAppearance();
+    const picked = pickThemeVariant(spec, dark) orelse return null;
+
+    // Write the override to a tmp file. Path is process-lifetime; the
+    // file persists until exit (small text file, ~30 bytes — not worth
+    // a cleanup hook).
+    const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
+    const tmp_path = std.fmt.allocPrint(allocator, "{s}/djinn-theme-override-{d}.conf", .{ tmpdir, std.os.linux.getpid() }) catch return null;
+    const out = std.fs.createFileAbsolute(tmp_path, .{ .truncate = true }) catch {
+        allocator.free(tmp_path);
+        return null;
+    };
+    defer out.close();
+    var buf: [256]u8 = undefined;
+    const line = std.fmt.bufPrint(&buf, "theme = {s}\n", .{picked}) catch {
+        allocator.free(tmp_path);
+        return null;
+    };
+    out.writeAll(line) catch {
+        allocator.free(tmp_path);
+        return null;
+    };
+    return tmp_path;
+}
+
+fn pickThemeVariant(spec: []const u8, dark: bool) ?[]const u8 {
+    const target_prefix: []const u8 = if (dark) "dark:" else "light:";
+    var it = std.mem.splitScalar(u8, spec, ',');
+    while (it.next()) |part| {
+        const trimmed = std.mem.trim(u8, part, " \t");
+        if (std.mem.startsWith(u8, trimmed, target_prefix)) {
+            return std.mem.trim(u8, trimmed[target_prefix.len..], " \t");
+        }
+    }
+    return null;
+}
+
+fn detectDarkAppearance() bool {
+    // NSAppearance lookup. Same logic as theme.detectSystemAppearance,
+    // duplicated here to avoid a circular import (theme imports this
+    // module already). Falls back to dark on lookup failure (most
+    // terminal users prefer dark; matches theme.zig's tie-break).
+    const objc = @import("objc");
+    const NSApplication = objc.getClass("NSApplication") orelse return true;
+    const app_obj = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
+    const appearance = app_obj.msgSend(objc.Object, "effectiveAppearance", .{});
+    if (appearance.value == null) return true;
+    const name = appearance.msgSend(objc.Object, "name", .{});
+    if (name.value == null) return true;
+    const utf8 = name.msgSend([*c]const u8, "UTF8String", .{});
+    if (utf8 == null) return true;
+    const str = std.mem.sliceTo(utf8, 0);
+    return std.mem.indexOf(u8, str, "Dark") != null;
+}
+
 /// Initialize ghostty's global state. Must be called before any
 /// `ghostty_app_new` / `ghostty_surface_new` call. Sets `std.os.argv`
 /// inside ghostty + spins up its allocator/logging/state.
@@ -139,6 +233,23 @@ pub const App = struct {
         // ghostty proper. Failure here is non-fatal in upstream's C
         // API (returns void) — config stays at built-in defaults.
         c.ghostty_config_load_default_files(cfg);
+
+        // ghostty's `loadTheme` picks the LIGHT variant of a
+        // `theme = light:X,dark:Y` pair as the default conditional
+        // state during finalize. There's no public C API to set the
+        // conditional state on a config object before finalize, so
+        // peek the user's config ourselves, pick the right variant
+        // for the system appearance, and write `theme = <picked>` as
+        // a tmp file that overrides the original line. Loaded BEFORE
+        // finalize so the right theme file gets merged in.
+        if (writeAppearanceThemeOverride()) |tmp_path| {
+            defer std.heap.page_allocator.free(tmp_path);
+            const z = std.heap.page_allocator.allocSentinel(u8, tmp_path.len, 0) catch return null;
+            defer std.heap.page_allocator.free(z);
+            @memcpy(z[0..tmp_path.len], tmp_path);
+            c.ghostty_config_load_file(cfg, z.ptr);
+        }
+
         c.ghostty_config_finalize(cfg);
 
         // userdata channel: every callback that takes `userdata` (wakeup,
@@ -255,7 +366,23 @@ pub fn configPalette(cfg: c.ghostty_config_t) ?c.ghostty_config_palette_s {
     return out;
 }
 
-pub fn configFloat(cfg: c.ghostty_config_t, key: []const u8) ?f64 {
+/// Read a 32-bit float config key. ghostty's `c_get` branches on the
+/// SOURCE field's type and `@alignCast`s the caller's slot to that
+/// type, so the slot's storage size must match exactly — passing an
+/// `f64*` for an `f32` field corrupts the upper half (writes only 4
+/// bytes), and passing an `f32*` for an `f64` field panics on
+/// alignment. Use this helper for fields ghostty declares as `f32`
+/// (e.g. `font-size`).
+pub fn configF32(cfg: c.ghostty_config_t, key: []const u8) ?f32 {
+    var out: f32 = 0;
+    if (!c.ghostty_config_get(cfg, &out, key.ptr, key.len)) return null;
+    return out;
+}
+
+/// Read a 64-bit float config key. Use for fields ghostty declares as
+/// `f64` (e.g. `background-opacity`). See `configF32` for the
+/// rationale behind the type-strict split.
+pub fn configF64(cfg: c.ghostty_config_t, key: []const u8) ?f64 {
     var out: f64 = 0;
     if (!c.ghostty_config_get(cfg, &out, key.ptr, key.len)) return null;
     return out;
