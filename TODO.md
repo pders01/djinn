@@ -9,26 +9,16 @@ Tier-5 surface migration is **complete**: djinn is a libghostty-surface
 host. ghostty owns the visible terminal area end-to-end (PTY, render,
 scrollback, selection, hyperlink hover, search, IME). djinn keeps panel
 chrome, MCP server, agent state surface, hotkey, menubar, log pane,
-drag-drop, find-overlay UI, an action keymap, and now a SessionManager
-on top.
+drag-drop, find-overlay UI, an action keymap, a SessionManager, and a
+multi-profile tab strip + Cmd+Shift+P palette switcher on top.
+
+The post-alpha **input bridge audit** is also done: every NSResponder
+method djinn needs is now overridden + forwarded to ghostty (right /
+middle / hover / focus / modifier-only / Y-flip / scroll precision).
+What's left in this area is documented under "Lower-priority NSResponder
+gaps" below — none are user-blocking.
 
 ## Open work — pick from here
-
-### Visible profile UI *(natural follow-up)*
-
-`SessionManager` is generic; today's UI is keybind-only (`Cmd+1..9`,
-`Cmd+Shift+]/[`). Two surfaces would slot in over the same data:
-
-- **Tab strip** — thin top-of-panel row of profile names (chip.bg,
-  active in fg, inactive in dim). Click to switch. Reads
-  `sm.sessions` for names, `sm.active_idx` for highlight, calls
-  `activateSession(idx)` on click.
-- **Palette switcher** — `Cmd+Shift+P` overlay listing profile
-  names, type-to-filter, Enter to switch. Same data, modal UI.
-
-Active-profile indicator on the menubar dropdown subtitle is the
-cheapest start (one new line in the dropdown title format) — adds
-visual feedback without new chrome.
 
 ### Per-profile env vars *(deferred from v1 spec)*
 
@@ -46,6 +36,25 @@ Spawn path: pass through to ghostty via `surface_config_s.env_*`
 (check ghostty.h for the exact slot — there's a `_count` + `_pairs`
 pattern for repeating fields).
 
+### Runtime appearance change *(half-done)*
+
+`reapplyTheme` in view.zig now fires on `viewDidChangeEffectiveAppearance`
+and re-skins the chrome (log pane, find overlay, palette, panel bg).
+`reloadConfigFromDisk` correctly re-applies the dual-theme override
+since `58dfa95`. What's still missing: the ghostty side never gets
+told the system flipped, so its conditional state is stuck at boot.
+
+To finish:
+
+1. From `reapplyTheme`, call
+   `ghostty_app_set_color_scheme(app_handle, .light|.dark)` based on
+   `current_appearance`.
+2. Call `reloadConfigFromDisk()` so the override file is re-read for
+   the new variant.
+
+Both calls are one-liners now that `surfaceSetFocus` / `surfaceSetOcclusion`
+already establish the wrapper pattern in runtime.zig.
+
 ### Dynamic profile creation *(deferred — needs config writeback)*
 
 Currently profiles are file-defined. A `Cmd+Shift+N → New profile`
@@ -58,22 +67,26 @@ comments / formatting. Either:
 2. Build a structure-preserving editor — read line-by-line, find the
    profile section, insert in place.
 
-Pick (1) for v1 if this lands.
+Pick (1) for v1 if this lands. The palette-switcher UX from `ab9b18e`
+is the natural place to surface a "+ New profile…" affordance.
 
-### Runtime appearance change *(today only at startup)*
+### Lower-priority NSResponder gaps *(audit residue)*
 
-`writeAppearanceThemeOverride` runs once in `App.init`. If the user
-flips light/dark mode while djinn is running, ghostty's conditional
-state isn't updated. Fix:
+Surfaced by the post-alpha input bridge audit; left out of the first
+pass because each affects a narrow feature.
 
-1. Listen for
-   `NSDistributedNotificationCenter` `AppleInterfaceThemeChangedNotification`.
-2. On fire: regenerate the override file, call
-   `ghostty_app_set_color_scheme(app, .dark|.light)`, then
-   `reloadConfigFromDisk` (which re-applies the override).
-
-`view.zig::reapplyTheme` already partially handles this for chrome
-colors — wire the ghostty side alongside.
+- `magnify:` — pinch-to-zoom font size. Forward to ghostty as
+  `increase_font_size:1` / `decrease_font_size:1` based on
+  `event.magnification` sign + threshold.
+- `pressureChange:` — force-touch pressure events; ghostty exposes
+  `ghostty_surface_mouse_pressure(surf, stage, pressure)`. Affects
+  force-touch context menus + pressure-sensitive vt apps.
+- `quickLook:` — three-finger-tap dictionary lookup over selection.
+  ghostty has `ghostty_surface_quicklook_font` for the IME-style
+  popover.
+- `keyUp:` — only matters for Kitty Keyboard Protocol full mode
+  (CSI u with key release). Forward via `ghostty_surface_key` with
+  `GHOSTTY_ACTION_RELEASE`.
 
 ### Per-call log expansion *(deferred — speculative)*
 
@@ -129,92 +142,56 @@ re-litigates.
 
 ## Recently shipped — this session
 
-### Alpha release prep
-- `0.1.0-alpha.1` version stamp via `src/version.zig` (single source;
-  cli, MCP `initialize` response, Info.plist all derive).
-- `.github/workflows/ci.yml` — push + PR. Cached `~/.cache/zig`,
-  `./scripts/build.sh test` + bare exe + `--version` smoke.
-- `.github/workflows/release.yml` — fires on `v*` tags. Downloads
-  Metal Toolchain, builds + signs Djinn.app, zips with sha256,
-  publishes via `softprops/action-gh-release@v2` (prerelease=true
-  when tag contains `-`).
-- `assets/Djinn.icns` from `scripts/generate-icon.{swift,sh}` —
-  Arabic brand glyph "جن" on Big Sur+ rounded-square gradient.
-  Bundled via `CFBundleIconFile`.
-- `LICENSE` (MIT, plain copyright), `NOTICES.md` (third-party survey
-  for ghostty + transitive deps + zig-objc + Apple SF Symbols + MCP
-  spec). README "Acknowledgements" + "License" sections at the end.
+### Visible profile UI
+- **Tab strip** (`9752269`) — DjinnTabStrip subclass paints one chip
+  per profile inline, no per-tab NSView; click maps x → idx →
+  `activateSession(idx)`. Auto-hides for single-profile setups.
+- **Palette switcher** (`ab9b18e`) — Cmd+Shift+P modal overlay,
+  type-to-filter, Up/Down to move, Return to switch, Esc to dismiss.
+  Owns input via `app.g.palette_mode` (same idiom as `find_mode`).
+- **Active-profile indicator** (`94bdc63`) — dropdown subtitle
+  appends " · {profile.label}" when more than one profile exists;
+  refreshes on every `activateSession`.
 
-### Multi-profile sessions
-- `default-profile = name` + repeating `profile.<name>.<field>` keys
-  (`provider`, `command`, `cwd`, `title`).
-- `Cmd+1..9` jump by index, `Cmd+Shift+]/[` cycle. 11 new actions
-  rebindable via `keybind = action=trigger`.
-- `src/session/manager.zig` — pure SessionManager. `peekNext` /
-  `peekPrev` non-mutating helpers so view-layer math doesn't
-  duplicate the wrap arithmetic.
-- One surface_host NSView per session, all siblings, all hidden
-  except active. Lazy spawn — only the active-at-startup session
-  binds a surface during boot; secondaries spawn on first activate.
-- `ghostty_runtime.App.newSurface` gains a `working_directory` arg
-  so `profile.<name>.cwd` flows through `surface_config_s` instead
-  of a process-wide chdir.
-- `applyLogLayout` reflows every session's surface_host on resize +
-  drag + log-pane toggle.
-- Backwards compat: configs without `profile.*` keys synthesize a
-  single "default" session from flat `provider` / `provider-command`
-  — existing setups run unchanged.
+### Input bridge — Tier-5 audit fixes
+- **Font zoom** (`ed8ae89`) — Cmd++ / Cmd+- / Cmd+0 forward to
+  ghostty as `increase_font_size:1` etc.; previously mutated only
+  host-side `app.g.font_size` so the surface kept boot size.
+- **Mouse Y-flip + scroll mods** (`d6adf03`) — `mouse_pos` now
+  sends `frame.height - local.y` (ghostty wants top-down);
+  `scroll_mods` byte encodes precision + momentum so trackpad
+  pixel deltas don't get treated as line counts.
+- **Right + middle mouse** (`bee065b`) — register `rightMouse*`
+  + `otherMouse*`, factor through `forwardMouseButton` /
+  `forwardMousePos` helpers. Mouse-tracking apps (tmux, vim, htop)
+  see secondary buttons.
+- **Focus state** (`6a474f5`) — override `becomeFirstResponder` /
+  `resignFirstResponder` to call `surfaceSetFocus`. Affects cursor
+  blink + focus-event reports (`\e[I` / `\e[O`).
+- **flagsChanged** (`1c660d9`) — modifier-only press/release
+  forwarded via `ghostty_surface_key`; required for Cmd-hover
+  hyperlink detection. Mirrors ghostty.app's side-specific
+  NX_DEVICER*KEYMASK logic.
+- **Hover** (`0e93bf2`) — NSTrackingArea registered with
+  `.mouseEnteredAndExited | .mouseMoved | .inVisibleRect |
+  .activeAlways`. `mouseEntered` re-pushes pos; `mouseExited`
+  sends (-1, -1) only when no button is held.
+- **Occlusion** (`1f26a27`) — Panel.show/hide call
+  `surfaceSetOcclusion(true/false)` so the surface throttles
+  CADisplayLink while the panel is offscreen.
 
-### Bug fixes (post-alpha install regressions)
-- `ghostty_config_get` slot-size match: split `configFloat` into
-  `configF32` + `configF64`. ghostty `@alignCast`s the caller's
-  pointer to the source field's type, so passing `f64*` for an
-  `f32 font_size` left the upper half zero — values landed near 0.0,
-  cell metrics collapsed to 1×1, mouse-click row/col went off by
-  ~1000×.
-- Theme inheritance for `light:X,dark:Y` specs: ghostty's `loadTheme`
-  picks LIGHT as the default conditional state at finalize and
-  there's no public C API to set it pre-finalize. Workaround: peek
-  `~/.config/ghostty/config` for the `theme = ...` line, pick the
-  variant matching `NSAppearance`, write `theme = <picked>` to a tmp
-  file loaded via `ghostty_config_load_file` BEFORE finalize.
-- `std.os.linux.getpid` is the linux-namespace syscall; on darwin it
-  returns junk. ReleaseFast inlined the bogus value differently than
-  Debug, so the override filename string the writer built diverged
-  from the path `ghostty_config_load_file` later read from. Dropped
-  the pid suffix; fixed filename, truncate-write per launch.
-- Config window dims now optional (`?u32`). Priority: explicit config
-  → state.json → hardcoded default. Editing `window-width = 2000`
-  beats a state.json with a stale older size.
-- Provider shortcut lookup case-insensitive in both
-  `Config.getProviderCommand` and `SessionManager.providerCommand`.
-  `provider = Claude` resolves to `claude` (was falling through to
-  `/bin/zsh`).
-- `Config.load` no longer swallows open / read errors as a default
-  `Config{}`. Atomic-write editors (vim, VS Code, Helix) rename a
-  tmp file over the target on save; FSEvents fires in the gap, open
-  hits ENOENT. The default-on-error behavior was clobbering every
-  user setting on every save. Errors propagate now;
-  `loadOrDefault` for the startup path; `onConfigChanged` retries 3×
-  with 20ms sleep before giving up + keeping previous config.
-- `crush` (charmbracelet/crush) + `pi` (Pi AI) added to the provider
-  shortcut table.
-
-### Dev tooling
-- `just deploy` chains `tcc-reset` + `install-app` + `open` for the
-  full post-rebuild ritual.
-- `just which-toolchain` reports active build wrapper (host `bash -c`
-  vs `nix develop --command`).
-- `justfile` `nix` variable now probes host zig at parse time via
-  `printf '0.15.2\n%s\n' $(zig version) | sort -V -C`.
-- README "Picking a hotkey that won't fight macOS" section, config
-  block rewritten to ghostty `key=value`, "Install via Nix flake"
-  section.
-- `scripts/build.sh` + `scripts/install-app.sh` + `scripts/profile.sh`
-  + `scripts/apply-ghostty-patch.sh` + `scripts/generate-icon.{sh,swift}`.
-- `flake.nix` exposes `apps.{default,bundle,install,test}` +
-  `checks.tests` + `devShells.default`. Tests build hermetically in
-  the sandbox (no Metal); apps delegate to host build.
+### Panel UX fixes
+- **Blur-driven hide preserves user choice** (`c51587b`) — split
+  hide() into hide() (explicit toggle restores prev_app_pid) +
+  hideForBlur() (system already moved focus, leave it). Prevents
+  Cmd+Tab away yanking focus back to the app open before djinn.
+- **NSNotificationCenter observer guarded** (`ff92da9`) — comment
+  claimed setHideOnBlur was idempotent but every config reload
+  re-added the observer. Add `g_blur_observer_registered` flag.
+- **Theme override survives reload** (`58dfa95`) — `App.init`
+  layered `writeAppearanceThemeOverride` before finalize but
+  `reloadConfigFromDisk` skipped it; dual-theme users reverted to
+  LIGHT on every config save. Mirror init's path.
 
 ## Tier-5 ship notes (kept for context)
 
@@ -277,15 +254,17 @@ nix's Apple SDK env vars.
   they're handling — recurse to stack overflow.
 - **Borderless NSPanel + NSTextField + ghostty surface** doesn't
   compose into a working field editor. Use host-owned input via
-  keyDownImpl + a host buffer instead.
+  keyDownImpl + a host buffer instead. Find overlay + palette
+  switcher both use this idiom.
 - **CALayer-backed views with custom layouts** don't reliably honor
   `setHidden` for visibility toggling when ghostty's CAMetalLayer
   drives its own CADisplayLink. Use frame-to-zero for full hide;
   setHidden works for the surface_host swap (no layout recompute).
 - **Stash key NSView pointers on AppState** instead of indexing
   `container.subviews[idx]`. Slots: `surface_host_id`,
-  `divider_view_id`, `search_field_id`. Per-session surface_host
-  pointers live on `Session.surface_host` (`?*anyopaque`).
+  `divider_view_id`, `search_field_id`, `tab_strip_id`,
+  `palette_view_id`. Per-session surface_host pointers live on
+  `Session.surface_host` (`?*anyopaque`).
 - **NSTextFieldCell does not vertically center.** Subclass + override
   `drawInteriorWithFrame:inView:` (see `DjinnChipCell` in view.zig).
 - **`acceptsFirstMouse:` YES on borderless-panel drag controls.**
@@ -300,13 +279,33 @@ nix's Apple SDK env vars.
 - **State.json complements config dims**, doesn't override. Optional
   fields on `WindowConfig` track "user pinned this explicitly" vs
   "fall through to state.json or default."
-- **ghostty's `theme = light:X,dark:Y` resolution** uses `_conditional_state`
-  inside ghostty. No public C API to set it pre-finalize, so djinn
-  peeks the user's ghostty config + writes a tmp `theme = <variant>`
-  loaded before finalize to override.
+- **ghostty's `theme = light:X,dark:Y` resolution** uses
+  `_conditional_state` inside ghostty. No public C API to set it
+  pre-finalize, so djinn peeks the user's ghostty config + writes
+  a tmp `theme = <variant>` loaded before finalize to override.
+  **Both `App.init` and `reloadConfigFromDisk` apply this** —
+  diverging breaks dual-theme users on every config save.
 - **Provider shortcut match is case-insensitive.** Config values are
   user-typed (`provider = Claude` works); config KEYS are still
   strict-lowercase.
+- **NSResponder method coverage matters.** Each missing override on
+  TerminalView = one silently-dropped terminal feature (right-click
+  in tmux, Cmd-hover hyperlinks, focus reports, etc.). Audit
+  against ghostty.app's `SurfaceView_AppKit.swift` when adding new
+  input paths.
+- **Mouse Y is bottom-up in NSView, top-down in ghostty.** Convert
+  at the boundary via `frame.size.height - local.y`. Same fix
+  pattern as `firstRectForCharacterRange:`.
+- **`ghostty_input_scroll_mods_t` is a packed byte.** ghostty.h
+  calls it `int` because C can't express the layout; bit 0 =
+  precision, bits 1-3 = momentum enum. Passing 0 means "non-precise
+  scroll, no momentum" → trackpad pixel deltas treated as line
+  counts.
+- **Idempotency comments are review fuel.** When a comment promises
+  "registers on first call only" but the code unconditionally
+  registers, the bug stays latent until something triggers the path
+  more than once. Look for the second trigger (FSEvent reload here)
+  to estimate severity.
 
 ## Memory bank
 
