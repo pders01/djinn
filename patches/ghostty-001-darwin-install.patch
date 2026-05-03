@@ -1,0 +1,76 @@
+Removes the darwin install guard around `libghostty` install steps and
+registers the shared lib in the artifact registry so downstream
+`dep.artifact("ghostty")` lookups resolve on macOS.
+
+Upstream `build.zig` only registers `b.addInstallLibFile` for non-darwin
+targets, even though `GhosttyLib.initShared` / `initStatic` build the
+library fine on darwin too. Without the install step, the artifact never
+gets exposed via `dep.artifact("ghostty")` to downstream consumers like
+djinn that want to embed the full surface API instead of the bare VT
+parser.
+
+A second issue surfaced once the guard was removed in the spike:
+upstream's `lib_shared.install(name)` only adds an `addInstallLibFile`
+step (a file install), but `Dependency.artifact()` walks the
+`InstallArtifact` step registry — populated only by `b.installArtifact`.
+This patch additionally calls `b.installArtifact(<*Compile>)`, recovering
+the underlying `*Compile` via `step.cast` so neither `GhosttyLib`'s
+struct nor its install method need to change.
+
+Upstream comment on the original guard ("we shouldn't have this guard
+but we don't currently build on macOS this way ironically so we need to
+fix that") confirms the gating is unintentional. PR'ing this fix
+upstream needs domain understanding (xcframework + Xcode build path
+interaction, plus whether `installArtifact` belongs in `GhosttyLib` or
+the consumer side) the djinn maintainer hasn't acquired yet — apply
+locally for now.
+
+Patch rev / pinned ghostty: 1.3.2-dev fdb6e3d2c8543e2e756b7e07f44372efbc0fba4b
+Re-verify the patch context if the pin moves; the slice we're rewriting
+is small enough that fuzz match should still apply, but the surrounding
+`else if (!config.emit_lib_vt)` block could shift.
+
+--- a/build.zig
++++ b/build.zig
+@@ -170,18 +170,30 @@
+         const lib_shared = try buildpkg.GhosttyLib.initShared(b, &deps);
+         const lib_static = try buildpkg.GhosttyLib.initStatic(b, &deps);
+
+-        // We shouldn't have this guard but we don't currently
+-        // build on macOS this way ironically so we need to fix that.
+-        if (!config.target.result.os.tag.isDarwin()) {
+-            lib_shared.installHeader(); // Only need one header
+-            if (config.target.result.os.tag == .windows) {
+-                lib_shared.install("ghostty.dll");
+-                lib_static.install("ghostty-static.lib");
+-            } else {
+-                lib_shared.install("libghostty.so");
+-                lib_static.install("libghostty.a");
+-            }
++        // djinn local patch: drop the darwin install guard and also
++        // register the shared lib via `b.installArtifact` so that
++        // downstream consumers can resolve it via `dep.artifact()`.
++        // Upstream's `lib_shared.install(name)` only adds an
++        // `addInstallLibFile` step (file install), which doesn't
++        // populate the `InstallArtifact` registry that
++        // `Dependency.artifact()` walks. Calling `installArtifact`
++        // on the underlying `*Compile` (recovered via `step.cast`)
++        // adds the missing registry entry without changing any of
++        // the existing install paths.
++        lib_shared.installHeader(); // Only need one header
++        if (config.target.result.os.tag == .windows) {
++            lib_shared.install("ghostty.dll");
++            lib_static.install("ghostty-static.lib");
++        } else if (config.target.result.os.tag.isDarwin()) {
++            lib_shared.install("libghostty.dylib");
++            lib_static.install("libghostty.a");
++        } else {
++            lib_shared.install("libghostty.so");
++            lib_static.install("libghostty.a");
+         }
++        if (lib_shared.step.cast(std.Build.Step.Compile)) |c| {
++            b.installArtifact(c);
++        }
+     }
+
+     // macOS only artifacts. These will error if they're initialized for

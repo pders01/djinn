@@ -1,0 +1,22 @@
+{
+  "window": {
+    "width": 800,
+    "height": 400,
+    "position": "top_center",
+    "opacity": 0.95,
+    "font_size": 14
+  },
+  "hotkey": {
+    "toggle": "ctrl+space"
+  },
+  "provider": {
+    "name": "generic"
+  },
+  "mcp": {
+    "enabled": true
+  },
+  "notifications": {
+    "system_notifications": true,
+    "menubar_icon": true
+  }
+}
