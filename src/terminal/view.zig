@@ -2080,4 +2080,11 @@ fn reapplyTheme() void {
         const bg_b = @as(f64, @floatFromInt(new_theme.background.b)) / 255.0;
         p.setBackgroundColor(bg_r, bg_g, bg_b, new_theme.opacity);
     }
+
+    // Push the new appearance to ghostty so the surface re-resolves
+    // its conditional state (`theme = light:X,dark:Y`). Without this,
+    // chrome flips with the system but the terminal palette stays on
+    // whichever variant ghostty picked at boot.
+    ghostty_runtime.appSetColorScheme(current_appearance == .dark);
+    ghostty_runtime.reloadConfigFromDisk();
 }

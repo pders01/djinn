@@ -454,6 +454,17 @@ pub fn surfaceRefresh(surface: c.ghostty_surface_t) void {
     c.ghostty_surface_refresh(surface);
 }
 
+/// Push the system color scheme to ghostty so its conditional state
+/// (`theme = light:X,dark:Y`) re-resolves. Pair with
+/// `reloadConfigFromDisk` to re-apply the appearance override file
+/// when the system flips light↔dark at runtime.
+pub fn appSetColorScheme(dark: bool) void {
+    if (!host_inited) return;
+    const handle = host_storage.app_handle orelse return;
+    const scheme: c.ghostty_color_scheme_e = if (dark) c.GHOSTTY_COLOR_SCHEME_DARK else c.GHOSTTY_COLOR_SCHEME_LIGHT;
+    c.ghostty_app_set_color_scheme(handle, scheme);
+}
+
 // Stub callbacks. None of these do anything yet; ghostty calls them
 // when the surface wants to talk to the host runtime. Surface API
 // isn't wired in step 2, so the only invocations would be from
