@@ -71,7 +71,8 @@ pub const SessionManager = struct {
                 // profile sets `command`, use it verbatim. Else map
                 // `provider` through the same shortcut table the flat
                 // path uses (claude / codex / aider / gemini /
-                // opencode → exact name; anything else → /bin/zsh).
+                // opencode / crush / pi → exact name; anything else
+                // → /bin/zsh).
                 const cmd = if (e.command) |c| c else providerCommand(e.provider orelse "generic");
                 try sessions.append(allocator, .{
                     .profile = .{
@@ -170,6 +171,8 @@ fn providerCommand(name: []const u8) []const u8 {
         .{ "aider", "aider" },
         .{ "gemini", "gemini" },
         .{ "opencode", "opencode" },
+        .{ "crush", "crush" }, // charmbracelet/crush
+        .{ "pi", "pi" }, // Pi AI CLI
     };
     inline for (map) |entry| {
         if (std.mem.eql(u8, name, entry[0])) return entry[1];

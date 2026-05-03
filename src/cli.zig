@@ -45,7 +45,7 @@ const flags = [_]Flag{
     .{
         .name = "--provider",
         .arg_label = "<name>",
-        .help = "Provider: claude/codex/aider/gemini/generic",
+        .help = "Provider: claude/codex/aider/gemini/opencode/crush/pi/generic",
         .handler = struct {
             fn h(ctx: *Ctx) ParseResult {
                 ctx.parsed.provider_override = ctx.args.next();

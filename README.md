@@ -239,7 +239,8 @@ hide-on-blur = false
 hotkey = ctrl+grave
 
 # Provider — child program. Shortcuts: claude / codex / aider /
-# gemini / opencode. Anything else falls back to /bin/zsh.
+# gemini / opencode / crush / pi. Anything else falls back to
+# /bin/zsh.
 provider = generic
 # provider-command = /opt/bin/my-claude
 
@@ -294,7 +295,7 @@ scrollback-size = 10000
 # keybind = copy=cmd+c
 ```
 
-`provider` selects the default command to spawn in the terminal. Known shortcuts: `claude`, `codex`, `aider`, `gemini`, `opencode`. Anything else uses `/bin/zsh` (macOS's default since 10.15). Override with `--provider <name>` or by setting `provider-command` directly.
+`provider` selects the default command to spawn in the terminal. Known shortcuts: `claude`, `codex`, `aider`, `gemini`, `opencode`, `crush` (charmbracelet/crush), `pi` (Pi AI). Anything else uses `/bin/zsh` (macOS's default since 10.15). Override with `--provider <name>` or by setting `provider-command` directly.
 
 > **Why /bin/zsh and not $SHELL?** djinn is normally launched from a dev shell (`nix develop`, devbox, etc.) which sets `$SHELL` to a sandboxed bash with broken terminfo lookup. `/bin/zsh` always has working terminfo so readline arrow keys / Ctrl bindings work without surprises.
 

@@ -409,13 +409,17 @@ pub const Config = struct {
     pub fn getProviderCommand(self: *const Config) []const u8 {
         if (self.provider.command) |cmd| return cmd;
 
-        // Default commands per provider name
+        // Default commands per provider name. Each shortcut maps to the
+        // exact CLI binary name shipped by that project; anything else
+        // falls through to /bin/zsh.
         const map = .{
             .{ "claude", "claude" },
             .{ "codex", "codex" },
             .{ "aider", "aider" },
             .{ "gemini", "gemini" },
             .{ "opencode", "opencode" },
+            .{ "crush", "crush" }, // charmbracelet/crush
+            .{ "pi", "pi" }, // Pi AI CLI
         };
         inline for (map) |entry| {
             if (std.mem.eql(u8, self.provider.name, entry[0])) return entry[1];
