@@ -278,9 +278,9 @@ pub const App = struct {
             .supports_selection_clipboard = false,
             .wakeup_cb = wakeupStub,
             .action_cb = actionDispatch,
-            .read_clipboard_cb = readClipboardStub,
+            .read_clipboard_cb = readClipboardImpl,
             .confirm_read_clipboard_cb = confirmReadClipboardStub,
-            .write_clipboard_cb = writeClipboardStub,
+            .write_clipboard_cb = writeClipboardImpl,
             .close_surface_cb = closeSurfaceStub,
         };
 
@@ -838,15 +838,33 @@ const action_table = [_]ActionEntry{
     .{ .tag = c.GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD, .name = "copy_title_to_clipboard", .handler = stub("copy_title_to_clipboard") },
 };
 
-fn readClipboardStub(
+/// Surface fired `paste_from_clipboard` (or OSC 52 read). Pull the
+/// general pasteboard's text and hand it back via
+/// `ghostty_surface_complete_clipboard_request`. Cmd+V on the host
+/// short-circuits this path (pasteFromClipboard in view.zig writes
+/// directly to the surface), but ghostty-side bindings + OSC 52 reads
+/// still come through here.
+fn readClipboardImpl(
     userdata: ?*anyopaque,
     clipboard: c.ghostty_clipboard_e,
     state: ?*anyopaque,
 ) callconv(.c) bool {
-    _ = userdata;
     _ = clipboard;
-    _ = state;
-    return false;
+    const surf_ptr = host_storage.app_state.ghostty_surface orelse return false;
+    _ = userdata;
+    const surf: c.ghostty_surface_t = @ptrCast(surf_ptr);
+
+    const objc = @import("objc");
+    const NSPasteboard = objc.getClass("NSPasteboard") orelse return false;
+    const NSString = objc.getClass("NSString") orelse return false;
+    const pb = NSPasteboard.msgSend(objc.Object, "generalPasteboard", .{});
+    const type_str = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "public.utf8-plain-text")});
+    const ns_str = pb.msgSend(objc.Object, "stringForType:", .{type_str});
+    if (ns_str.value == null) return false;
+    const utf8 = ns_str.msgSend([*c]const u8, "UTF8String", .{});
+    if (utf8 == null) return false;
+    c.ghostty_surface_complete_clipboard_request(surf, utf8, state, true);
+    return true;
 }
 
 fn confirmReadClipboardStub(
@@ -861,7 +879,14 @@ fn confirmReadClipboardStub(
     _ = request;
 }
 
-fn writeClipboardStub(
+/// Surface fired `copy_to_clipboard` (or OSC 52 write). Iterate the
+/// content array and push each `text/plain` entry to the macOS general
+/// pasteboard. ghostty.app additionally gates OSC 52 writes behind a
+/// confirmation dialog when `confirm=true`; we just write through for
+/// now — Quake-drop UX, single user, no shared X11-style selection
+/// pasteboard to worry about. `clipboard=SELECTION` (Linux primary
+/// selection) collapses onto the general pasteboard on macOS.
+fn writeClipboardImpl(
     userdata: ?*anyopaque,
     clipboard: c.ghostty_clipboard_e,
     contents: [*c]const c.ghostty_clipboard_content_s,
@@ -870,9 +895,31 @@ fn writeClipboardStub(
 ) callconv(.c) void {
     _ = userdata;
     _ = clipboard;
-    _ = contents;
-    _ = contents_len;
     _ = confirm;
+    if (contents_len == 0) return;
+
+    const objc = @import("objc");
+    const NSPasteboard = objc.getClass("NSPasteboard") orelse return;
+    const NSString = objc.getClass("NSString") orelse return;
+    const pb = NSPasteboard.msgSend(objc.Object, "generalPasteboard", .{});
+    _ = pb.msgSend(c_long, "clearContents", .{});
+
+    var wrote_any = false;
+    var i: usize = 0;
+    while (i < contents_len) : (i += 1) {
+        const entry = contents[i];
+        if (entry.mime == null or entry.data == null) continue;
+        const mime = std.mem.sliceTo(entry.mime, 0);
+        // text/plain → NSPasteboardTypeString. Other mime types (HTML,
+        // image) ghostty doesn't currently emit; ignore until needed.
+        if (!std.mem.eql(u8, mime, "text/plain")) continue;
+
+        const data_str = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{entry.data});
+        const type_str = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "public.utf8-plain-text")});
+        _ = pb.msgSend(c_long, "setString:forType:", .{ data_str, type_str });
+        wrote_any = true;
+    }
+    if (!wrote_any) return;
 }
 
 fn closeSurfaceStub(userdata: ?*anyopaque, _: bool) callconv(.c) void {
