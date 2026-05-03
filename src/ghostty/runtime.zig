@@ -426,6 +426,13 @@ pub fn surfaceSetFocus(surface: c.ghostty_surface_t, focused: bool) void {
     c.ghostty_surface_set_focus(surface, focused);
 }
 
+/// Tell the surface whether it's currently visible. ghostty uses this
+/// to throttle CADisplayLink + skip cursor blink work when the surface
+/// is fully occluded — e.g. while the Quake panel is slid offscreen.
+pub fn surfaceSetOcclusion(surface: c.ghostty_surface_t, visible: bool) void {
+    c.ghostty_surface_set_occlusion(surface, visible);
+}
+
 /// Tell the surface to schedule a redraw. ghostty drives its own
 /// CADisplayLink — refresh is a hint that something host-side changed
 /// (theme, font) and the grid should repaint without waiting for the

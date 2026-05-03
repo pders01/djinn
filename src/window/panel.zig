@@ -232,10 +232,12 @@ pub const Panel = struct {
         // Step 5: ghostty surface focus follows panel visibility.
         // Quake-drop UX = the panel is the only UI; if it's visible
         // it owns input. setFocus(true) wakes the surface's renderer
-        // out of low-frequency idle.
+        // out of low-frequency idle. set_occlusion(true) tells the
+        // surface it's visible so CADisplayLink runs at full cadence.
         if (app_state.g.ghostty_surface) |surf_ptr| {
             const ghostty_runtime = @import("../ghostty/runtime.zig");
             const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
+            ghostty_runtime.surfaceSetOcclusion(surf, true);
             ghostty_runtime.surfaceSetFocus(surf, true);
         }
     }
@@ -293,11 +295,14 @@ pub const Panel = struct {
 
         // Step 5: ghostty surface yields focus when the panel is hidden.
         // Lets ghostty drop to its idle render cadence + clear cursor
-        // blink state.
+        // blink state. set_occlusion(false) tells the surface it's
+        // fully obscured so it can skip render work entirely while the
+        // panel is slid offscreen — pure win for battery on long idle.
         if (app_state.g.ghostty_surface) |surf_ptr| {
             const ghostty_runtime = @import("../ghostty/runtime.zig");
             const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
             ghostty_runtime.surfaceSetFocus(surf, false);
+            ghostty_runtime.surfaceSetOcclusion(surf, false);
         }
     }
 
