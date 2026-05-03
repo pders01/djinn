@@ -52,7 +52,17 @@ fn deferredHideForBlur(_: ?*anyopaque) callconv(.c) void {
     // switches with overlapping panels), skip the hide.
     const is_key: bool = p.ns_panel.msgSend(bool, "isKeyWindow", .{});
     if (is_key) return;
+
+    // Capture the app the user actually switched to (Cmd+Tab pick or
+    // click target). By now the runloop has resolved the focus event
+    // so `frontmostApplication` reads the user's choice, not djinn.
+    // We re-activate it after orderOut to defeat macOS's
+    // "Accessory app deactivates → restore previous regular app"
+    // heuristic, which on hide_on_blur paths would otherwise yank
+    // focus back to whatever was frontmost *before* djinn appeared.
+    const new_front = currentFrontmostPid();
     p.hideForBlur();
+    if (new_front != 0) activateAppByPid(new_front);
 }
 
 extern "c" fn dispatch_async_f(
