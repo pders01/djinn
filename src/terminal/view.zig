@@ -725,6 +725,8 @@ fn registerClass() void {
     const superclass = objc.getClass("NSView") orelse return;
     const cls = objc.allocateClassPair(superclass, "DjinnTerminalView") orelse return;
     _ = cls.addMethod("acceptsFirstResponder", acceptsFirstResponderImpl);
+    _ = cls.addMethod("becomeFirstResponder", becomeFirstResponderImpl);
+    _ = cls.addMethod("resignFirstResponder", resignFirstResponderImpl);
     _ = cls.addMethod("keyDown:", keyDownImpl);
     _ = cls.addMethod("tick:", tickImpl);
     _ = cls.addMethod("mouseDown:", mouseDownImpl);
@@ -1073,6 +1075,27 @@ fn tickImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
 }
 
 fn acceptsFirstResponderImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
+    return true;
+}
+
+/// Push focus state into the ghostty surface. Without this, ghostty
+/// thinks the surface is in its boot focus state forever — cursor
+/// blink stays in one mode (steady block when "focused", hollow when
+/// "unfocused"), and apps that subscribe to focus reports
+/// (`\e[I`/`\e[O`, mode 1004) never see anything.
+fn becomeFirstResponderImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
+    if (app.g.ghostty_surface) |surf_ptr| {
+        const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
+        ghostty_runtime.surfaceSetFocus(surf, true);
+    }
+    return true;
+}
+
+fn resignFirstResponderImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
+    if (app.g.ghostty_surface) |surf_ptr| {
+        const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
+        ghostty_runtime.surfaceSetFocus(surf, false);
+    }
     return true;
 }
 
