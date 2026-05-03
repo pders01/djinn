@@ -14,9 +14,17 @@ multi-profile tab strip + Cmd+Shift+P palette switcher on top.
 
 The post-alpha **input bridge audit** is also done: every NSResponder
 method djinn needs is now overridden + forwarded to ghostty (right /
-middle / hover / focus / modifier-only / Y-flip / scroll precision).
-What's left in this area is documented under "Lower-priority NSResponder
-gaps" below — none are user-blocking.
+middle / hover / focus / modifier-only / Y-flip / scroll precision /
+keyUp / pressureChange). Clipboard write/read wired through ghostty's
+callbacks (`df6923f`); system appearance flips push through to
+ghostty (`96f2197`). Remaining audit residue is `magnify:` and
+`quickLook:` — neither user-blocking.
+
+One **known regression** carries over: Cmd+Tab away from djinn lands
+on the wrong app (the pre-djinn frontmost, not the user's pick). Four
+attempts at fixing it landed this session and none worked; suspected
+cause is the macOS 14+ `activateWithOptions:` throttle. See "Cmd+Tab
+focus restoration" under Open work for the chronology.
 
 ## Open work — pick from here
 
@@ -36,24 +44,51 @@ Spawn path: pass through to ghostty via `surface_config_s.env_*`
 (check ghostty.h for the exact slot — there's a `_count` + `_pairs`
 pattern for repeating fields).
 
-### Runtime appearance change *(half-done)*
+### Cmd+Tab focus restoration *(unresolved — macOS 14+ activation throttle)*
 
-`reapplyTheme` in view.zig now fires on `viewDidChangeEffectiveAppearance`
-and re-skins the chrome (log pane, find overlay, palette, panel bg).
-`reloadConfigFromDisk` correctly re-applies the dual-theme override
-since `58dfa95`. What's still missing: the ghostty side never gets
-told the system flipped, so its conditional state is stuck at boot.
+Goal: when user Cmd+Tabs away from djinn (with `hide_on_blur`
+enabled), djinn slides offscreen and the user lands on the app
+they picked, not on whatever was frontmost before djinn appeared.
 
-To finish:
+Currently broken on macOS 14+ (verified on 26.x). Suspected root
+cause: `NSRunningApplication.activateWithOptions:` is throttled
+to user-gesture only, so any `activateAppByPid` call we make is
+silently dropped. macOS's own deactivation cascade (Accessory app
+loses last visible window → falls back to "previous regular app")
+runs uncontested and picks the pre-djinn frontmost.
 
-1. From `reapplyTheme`, call
-   `ghostty_app_set_color_scheme(app_handle, .light|.dark)` based on
-   `current_appearance`.
-2. Call `reloadConfigFromDisk()` so the override file is re-read for
-   the new variant.
+What we tried this session (commits `c51587b 139b2ee bc5e129 0106a9f`):
 
-Both calls are one-liners now that `surfaceSetFocus` / `surfaceSetOcclusion`
-already establish the wrapper pattern in runtime.zig.
+1. Skip `activateAppByPid(prev_app_pid)` on the blur path —
+   no help; cascade still picks prev app.
+2. Defer `hideForBlur` via `dispatch_async_f` so it runs after
+   Cmd+Tab resolves — no help.
+3. Capture `currentFrontmostPid` *after* Cmd+Tab resolves +
+   re-activate it explicitly — no help (activate throttled).
+4. Skip `orderOut:` on the blur path; just slide offscreen and
+   leave the panel in the window list to suppress the
+   deactivation cascade — still doesn't restore right app per
+   user testing.
+
+Where to look next:
+
+- `NSWorkspace.openApplicationAtURL:configuration:completionHandler:`
+  with `activates: true` may bypass the throttle since it's a
+  workspace-level call, not per-app.
+- `[NSApp hide:nil]` (NSApplication-level hide) might let macOS
+  pick a sensible "next" without the cascade rule kicking in;
+  worth comparing the macOS-native cmd+H behavior.
+- Check whether `frontmostApplication` is even reading the right
+  value mid-Cmd+Tab. If it's stale / lagged, our re-activate
+  target is wrong upstream of the throttle.
+- See ghostty.app's `Ghostty.QuickTerminalController` for how
+  upstream handles this — they hide the quick terminal on blur
+  and the right app stays focused, so there's a working pattern
+  in the same OS family to mine.
+
+`hide_on_blur` users currently get the wrong app on Cmd+Tab. The
+explicit-toggle path (Cmd+\ twice, or hotkey toggle) still works
+correctly — it uses `prev_app_pid` capture + `orderOut`.
 
 ### Dynamic profile creation *(deferred — needs config writeback)*
 
@@ -72,21 +107,21 @@ is the natural place to surface a "+ New profile…" affordance.
 
 ### Lower-priority NSResponder gaps *(audit residue)*
 
-Surfaced by the post-alpha input bridge audit; left out of the first
-pass because each affects a narrow feature.
+Surfaced by the post-alpha input bridge audit; `keyUp:` +
+`pressureChange:` shipped in `078aa9c`. Remaining:
 
-- `magnify:` — pinch-to-zoom font size. Forward to ghostty as
-  `increase_font_size:1` / `decrease_font_size:1` based on
-  `event.magnification` sign + threshold.
-- `pressureChange:` — force-touch pressure events; ghostty exposes
-  `ghostty_surface_mouse_pressure(surf, stage, pressure)`. Affects
-  force-touch context menus + pressure-sensitive vt apps.
-- `quickLook:` — three-finger-tap dictionary lookup over selection.
-  ghostty has `ghostty_surface_quicklook_font` for the IME-style
-  popover.
-- `keyUp:` — only matters for Kitty Keyboard Protocol full mode
-  (CSI u with key release). Forward via `ghostty_surface_key` with
-  `GHOSTTY_ACTION_RELEASE`.
+- `magnify:` — pinch-to-zoom font size. ghostty.app itself
+  doesn't override this on macOS; would have to invent the host
+  side (accumulator over `event.magnification` deltas, threshold
+  before firing `increase_font_size:1` / `decrease_font_size:1`).
+  Skip until users ask.
+- `quickLook:` — three-finger-tap dictionary lookup over the
+  selection. Needs CTFont attribute dict + NSAttributedString
+  presentation chain; ghostty exposes
+  `ghostty_surface_quicklook_word` + `ghostty_surface_quicklook_font`
+  but the macOS-side popover assembly is non-trivial. Mirror
+  ghostty.app's `quickLook(with:)` (SurfaceView_AppKit.swift:1438)
+  if this lands.
 
 ### Per-call log expansion *(deferred — speculative)*
 
@@ -181,10 +216,11 @@ re-litigates.
   CADisplayLink while the panel is offscreen.
 
 ### Panel UX fixes
-- **Blur-driven hide preserves user choice** (`c51587b`) — split
-  hide() into hide() (explicit toggle restores prev_app_pid) +
-  hideForBlur() (system already moved focus, leave it). Prevents
-  Cmd+Tab away yanking focus back to the app open before djinn.
+- **Blur-hide split + deferred hide** (`c51587b 139b2ee bc5e129
+  0106a9f`) — chain of attempts at the Cmd+Tab focus-restoration
+  bug. All four landed but the bug is still unresolved on macOS
+  14+; see "Cmd+Tab focus restoration" under Open work for the
+  full chronology and what to try next.
 - **NSNotificationCenter observer guarded** (`ff92da9`) — comment
   claimed setHideOnBlur was idempotent but every config reload
   re-added the observer. Add `g_blur_observer_registered` flag.
@@ -192,6 +228,23 @@ re-litigates.
   layered `writeAppearanceThemeOverride` before finalize but
   `reloadConfigFromDisk` skipped it; dual-theme users reverted to
   LIGHT on every config save. Mirror init's path.
+
+### Theme + clipboard
+- **System appearance pushed to ghostty** (`96f2197`) — closes
+  the runtime appearance change loop. `viewDidChangeEffectiveAppearance`
+  → `reapplyTheme` now also calls `appSetColorScheme` +
+  `reloadConfigFromDisk`, so dual-theme palettes flip with the
+  system instead of staying frozen at boot.
+- **Cmd+C / OSC 52 clipboard wired** (`df6923f`) —
+  `writeClipboardStub` was a no-op so ghostty's `copy_to_clipboard`
+  action discarded the bytes; Cmd+C from djinn looked broken. Push
+  the `text/plain` content array to NSPasteboard via
+  `setString:forType:`. Read side wired symmetrically for OSC 52.
+
+### Input bridge — extra coverage
+- **keyUp + pressureChange** (`078aa9c`) — Kitty Keyboard Protocol
+  full-mode key releases + force-touch pressure both reach the
+  surface now. `magnify:` + `quickLook:` deferred (see Open work).
 
 ## Tier-5 ship notes (kept for context)
 
