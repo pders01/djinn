@@ -1093,8 +1093,10 @@ fn mouseMovedImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callco
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     const loc = event.msgSend(NSPoint, "locationInWindow", .{});
     const local = view.msgSend(NSPoint, "convertPoint:fromView:", .{ loc, @as(?*anyopaque, null) });
+    const frame = view.msgSend(NSRect, "frame", .{});
     const flags: u64 = @intCast(event.msgSend(c_ulong, "modifierFlags", .{}));
-    ghostty_runtime.c.ghostty_surface_mouse_pos(surf, local.x, local.y, ghostty_input.modsFromNS(flags));
+    // ghostty wants top-down Y; NSView origin is bottom-left.
+    ghostty_runtime.c.ghostty_surface_mouse_pos(surf, local.x, frame.size.height - local.y, ghostty_input.modsFromNS(flags));
 }
 
 
@@ -1121,25 +1123,53 @@ fn mouseDraggedImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) call
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     const loc = event.msgSend(NSPoint, "locationInWindow", .{});
     const local = view.msgSend(NSPoint, "convertPoint:fromView:", .{ loc, @as(?*anyopaque, null) });
+    const frame = view.msgSend(NSRect, "frame", .{});
     const flags: u64 = @intCast(event.msgSend(c_ulong, "modifierFlags", .{}));
-    ghostty_runtime.c.ghostty_surface_mouse_pos(surf, local.x, local.y, ghostty_input.modsFromNS(flags));
+    ghostty_runtime.c.ghostty_surface_mouse_pos(surf, local.x, frame.size.height - local.y, ghostty_input.modsFromNS(flags));
 }
 
 // Trackpad scroll deltas arrive as fine-grained pixels. ghostty owns
-// the f64 → row accumulator + scrollback bounds; we just forward.
+// the f64 → row accumulator + scrollback bounds; we just forward —
+// but the scroll_mods byte (precision bit + momentum phase) must be
+// set or ghostty treats every pixel of delta as a whole line tick.
 fn scrollWheelImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
     const event = objc.Object.fromId(event_id);
 
-    // Surface mode: hand the raw deltas to ghostty. ghostty applies
-    // its own row accumulator + scrollback bounds. Sign matches
-    // NSEvent.scrollingDeltaY (positive = toward top of document).
     const surf_ptr = app.g.ghostty_surface orelse return;
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
-    const dx: f64 = event.msgSend(f64, "scrollingDeltaX", .{});
-    const dy: f64 = event.msgSend(f64, "scrollingDeltaY", .{});
-    if (dx == 0 and dy == 0) return;
-    ghostty_runtime.c.ghostty_surface_mouse_scroll(surf, dx, dy, 0);
+    var dx: f64 = event.msgSend(f64, "scrollingDeltaX", .{});
+    var dy: f64 = event.msgSend(f64, "scrollingDeltaY", .{});
+    const has_precise: bool = event.msgSend(bool, "hasPreciseScrollingDeltas", .{});
+    const phase: c_ulong = event.msgSend(c_ulong, "momentumPhase", .{});
+    if (has_precise) {
+        // Match ghostty.app's 2x feel multiplier on precision deltas.
+        dx *= 2;
+        dy *= 2;
+    }
+    if (dx == 0 and dy == 0 and phase == 0) return;
+    ghostty_runtime.c.ghostty_surface_mouse_scroll(surf, dx, dy, scrollMods(has_precise, phase));
     _ = self_id;
+}
+
+/// Encode NSEvent precision flag + momentum phase into ghostty's
+/// `ghostty_input_scroll_mods_t` packed byte: bit 0 = precision,
+/// bits 1-3 = momentum enum (none/began/stationary/changed/ended/
+/// cancelled/may_begin). NSEventPhase is a bit mask; ghostty uses a
+/// sequential enum, so map bit positions individually.
+fn scrollMods(precision: bool, phase: c_ulong) c_int {
+    var v: c_int = 0;
+    if (precision) v |= 0b0000_0001;
+    const momentum: c_int = switch (phase) {
+        0x01 => 1, // began
+        0x02 => 2, // stationary
+        0x04 => 3, // changed
+        0x08 => 4, // ended
+        0x10 => 5, // cancelled
+        0x20 => 6, // may_begin
+        else => 0, // none
+    };
+    v |= momentum << 1;
+    return v;
 }
 
 fn mouseUpImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
