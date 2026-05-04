@@ -115,8 +115,8 @@ pub fn updateSearchCountLabel() void {
     // top-right of parent so the chip grows leftward, not rightward
     // off-screen. h is fixed; only width tracks content.
     const text_size = root.msgSend(NSSize, "size", .{});
-    const pad_x: f64 = 24; // 12px each side — breathing room for the dim runs
-    const tf_h: f64 = 22;
+    const pad_x: f64 = 32; // 16px each side — generous chip padding
+    const tf_h: f64 = 24;
     const margin: f64 = 14;
     const new_w = @ceil(text_size.width) + pad_x;
     const parent = tf.msgSend(objc.Object, "superview", .{});
@@ -195,6 +195,13 @@ pub fn applyFindOverlayStyle(style: chrome_mod.Style) void {
     const NSColor = objc.getClass("NSColor") orelse return;
     tf.msgSend(void, "setBackgroundColor:", .{chrome_mod.nsColorFromRgb(NSColor, style.chip.bg)});
     tf.msgSend(void, "setTextColor:", .{chrome_mod.nsColorFromRgb(NSColor, style.chip.fg)});
+
+    const tf_layer = tf.msgSend(objc.Object, "layer", .{});
+    if (tf_layer.value != null) {
+        const border_ns = chrome_mod.nsColorFromRgb(NSColor, style.chip.border);
+        tf_layer.msgSend(void, "setBorderColor:", .{border_ns.msgSend(?*anyopaque, "CGColor", .{})});
+    }
+
     applyFindOverlayFont(tf, style);
     if (app.g.find_mode) updateSearchCountLabel();
 }
@@ -296,7 +303,7 @@ pub const TerminalView = struct {
         const NSTextField = objc.getClass("NSTextField") orelse return error.ClassNotFound;
         const NSColor_tf = objc.getClass("NSColor") orelse return error.ClassNotFound;
         const tf_alloc = NSTextField.msgSend(objc.Object, "alloc", .{});
-        const tf_h: f64 = 22;
+        const tf_h: f64 = 24;
         const tf_margin: f64 = 14;
         const tf_init_w: f64 = 80;
         const tf_frame = NSRect{
@@ -328,16 +335,17 @@ pub const TerminalView = struct {
         }
         tf.msgSend(void, "setBackgroundColor:", .{chrome_mod.nsColorFromRgb(NSColor_tf, style.chip.bg)});
         tf.msgSend(void, "setTextColor:", .{chrome_mod.nsColorFromRgb(NSColor_tf, style.chip.fg)});
-        // Full pill: cornerRadius = h/2. masksToBounds clips the bg
-        // fill to the rounded shape regardless of NSCell drawing.
+        // Lifted bg + 1px border + 4px round corners. Border survives
+        // background-opacity translucency where the bg fill alone can
+        // disappear into the desktop backdrop.
         tf.msgSend(void, "setWantsLayer:", .{@as(c_int, 1)});
         const tf_layer = tf.msgSend(objc.Object, "layer", .{});
         if (tf_layer.value != null) {
-            // 4px round, not a full pill. Matches the log pane's flat
-            // chrome — chip and log read as the same surface family,
-            // not a pill floating over a slab.
             tf_layer.msgSend(void, "setCornerRadius:", .{@as(f64, 4)});
             tf_layer.msgSend(void, "setMasksToBounds:", .{@as(c_int, 1)});
+            tf_layer.msgSend(void, "setBorderWidth:", .{@as(f64, 1)});
+            const border_ns = chrome_mod.nsColorFromRgb(NSColor_tf, style.chip.border);
+            tf_layer.msgSend(void, "setBorderColor:", .{border_ns.msgSend(?*anyopaque, "CGColor", .{})});
         }
         view.msgSend(void, "addSubview:", .{tf});
         app.g.search_field_id = tf.value;

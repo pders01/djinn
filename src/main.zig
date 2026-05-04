@@ -756,11 +756,16 @@ pub fn main() !void {
     );
 
     // Seed the log panel so it isn't empty on first launch — gives users a
-    // visible signal that the side panel is wired up before any agent connects.
+    // visible signal that the side panel is wired up before any agent
+    // connects. Three separate entries so the same-client grouping reads
+    // as one block under a single header instead of one long mid-token-
+    // wrapping line joined by `·`.
     {
-        var startup_msg: [128]u8 = undefined;
-        const m = std.fmt.bufPrint(&startup_msg, "djinn ready · MCP at 127.0.0.1:{d} · waiting for agents", .{mcp_server.port}) catch "djinn ready";
+        agent_state.appendLog(.info, "djinn ready") catch {};
+        var mcp_msg: [64]u8 = undefined;
+        const m = std.fmt.bufPrint(&mcp_msg, "MCP at 127.0.0.1:{d}", .{mcp_server.port}) catch "MCP up";
         agent_state.appendLog(.info, m) catch {};
+        agent_state.appendLog(.info, "waiting for agents") catch {};
     }
 
     // Defer login-item sync (SMAppService XPC) + FSEventStream setup

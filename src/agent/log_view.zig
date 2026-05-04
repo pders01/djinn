@@ -19,6 +19,9 @@ pub const LogView = struct {
     view: objc.Object,
     scroll: objc.Object,
     text_view: objc.Object,
+    /// 1px-wide border view at x=0; tracks chip.border color across
+    /// theme reloads via `applyStyle`.
+    separator: objc.Object,
     font: objc.Object,
     last_count: usize = 0,
     /// Tracks the client label of the previous entry so consecutive
@@ -31,6 +34,7 @@ pub const LogView = struct {
     bg: Rgb,
     fg: Rgb,
     dim: Rgb,
+    border: Rgb,
     info_color: Rgb,
     warn_color: Rgb,
     err_color: Rgb,
@@ -101,29 +105,49 @@ pub const LogView = struct {
         tv.msgSend(void, "setRichText:", .{@as(c_int, 1)});
         tv.msgSend(void, "setDrawsBackground:", .{@as(c_int, 1)});
         tv.msgSend(void, "setBackgroundColor:", .{ns_bg});
-        tv.msgSend(void, "setTextContainerInset:", .{NSSize{ .width = 14, .height = 14 }});
+        // Generous left + top, slightly larger right keeps long URLs
+        // from wrapping mid-token at the trailing edge.
+        tv.msgSend(void, "setTextContainerInset:", .{NSSize{ .width = 16, .height = 16 }});
 
-        const z_name = std.heap.page_allocator.allocSentinel(u8, style.font_family.len, 0) catch return error.OutOfMemory;
-        defer std.heap.page_allocator.free(z_name);
-        @memcpy(z_name[0..style.font_family.len], style.font_family);
-        const ns_name = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, z_name.ptr)});
-        const font = blk: {
-            const f = NSFont.msgSend(objc.Object, "fontWithName:size:", .{ ns_name, style.font_size_sm });
-            if (f.value != null) break :blk f;
-            break :blk NSFont.msgSend(objc.Object, "userFixedPitchFontOfSize:", .{style.font_size_sm});
-        };
+        // System UI font (medium weight) keeps log entries on a
+        // different typographic axis from the terminal monospace, so
+        // the panel reads as chrome instead of as more terminal output.
+        _ = NSString;
+        const font = chrome.chromeFont(NSFont, style.font_family, style.font_size_sm);
         tv.msgSend(void, "setFont:", .{font});
 
         scroll.msgSend(void, "setDocumentView:", .{tv});
+
+        // Hairline separator on the inner edge (x=0 in the wrapper's
+        // local coords, which is the side that meets the terminal
+        // surface). 1px wide, full height, dim chip border tone — gives
+        // the log pane a visible boundary even under translucency.
+        const sep_alloc = NSView.msgSend(objc.Object, "alloc", .{});
+        const sep = sep_alloc.msgSend(objc.Object, "initWithFrame:", .{NSRect{
+            .origin = .{ .x = 0, .y = 0 },
+            .size = .{ .width = 1, .height = height },
+        }});
+        sep.msgSend(void, "setWantsLayer:", .{@as(c_int, 1)});
+        const sep_layer = sep.msgSend(objc.Object, "layer", .{});
+        if (sep_layer.value != null) {
+            const sep_ns = chrome.nsColorFromRgb(NSColor, style.chip.border);
+            sep_layer.msgSend(void, "setBackgroundColor:", .{sep_ns.msgSend(?*anyopaque, "CGColor", .{})});
+        }
+        // NSViewMaxXMargin (4) + NSViewHeightSizable (16) — pinned to
+        // x=0, full height under resize.
+        sep.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, 4 | 16)});
+        wrapper.msgSend(void, "addSubview:", .{sep});
 
         return .{
             .view = wrapper,
             .scroll = scroll,
             .text_view = tv,
+            .separator = sep,
             .font = font,
             .bg = style.chip.bg,
             .fg = style.fg,
             .dim = style.dim,
+            .border = style.chip.border,
             .info_color = style.info,
             .warn_color = style.warn,
             .err_color = style.err,
@@ -140,6 +164,7 @@ pub const LogView = struct {
         self.bg = style.chip.bg;
         self.fg = style.fg;
         self.dim = style.dim;
+        self.border = style.chip.border;
         self.info_color = style.info;
         self.warn_color = style.warn;
         self.err_color = style.err;
@@ -156,6 +181,13 @@ pub const LogView = struct {
         const clip = self.scroll.msgSend(objc.Object, "contentView", .{});
         if (clip.value != null) clip.msgSend(void, "setBackgroundColor:", .{ns_bg});
         self.text_view.msgSend(void, "setBackgroundColor:", .{ns_bg});
+
+        const sep_layer = self.separator.msgSend(objc.Object, "layer", .{});
+        if (sep_layer.value != null) {
+            const sep_ns = chrome.nsColorFromRgb(NSColor, style.chip.border);
+            sep_layer.msgSend(void, "setBackgroundColor:", .{sep_ns.msgSend(?*anyopaque, "CGColor", .{})});
+        }
+
         self.view.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
         self.scroll.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
         self.text_view.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
@@ -199,6 +231,15 @@ pub const LogView = struct {
             std.mem.eql(u8, client_str, self.last_client_buf[0..self.last_client_len]);
 
         if (!same_client) {
+            // Hairline divider above each new-client group, except the
+            // very first one (no client previously known = no group to
+            // separate from). Box-drawing `─` rendered at chip.border
+            // tone gives a faint horizontal rule that scans as group
+            // boundary without becoming visual noise.
+            if (self.last_client_known) {
+                self.appendStyled("──────────────\n", self.border, .divider);
+            }
+
             var hdr_buf: [80]u8 = undefined;
             if (formatEntryHeader(&hdr_buf, client_str, entry.timestamp_ms)) |hdr| {
                 self.appendStyled(hdr, self.dim, .header);
@@ -219,7 +260,7 @@ pub const LogView = struct {
         self.appendStyled("\n", body_color, .spacer);
     }
 
-    const Kind = enum { header, body, spacer };
+    const Kind = enum { header, body, spacer, divider };
 
     fn appendStyled(self: *LogView, text: [:0]const u8, color: Rgb, kind: Kind) void {
         const NSString = objc.getClass("NSString") orelse return;
@@ -252,6 +293,14 @@ pub const LogView = struct {
             .spacer => {
                 para.msgSend(void, "setLineSpacing:", .{@as(f64, 0)});
                 para.msgSend(void, "setParagraphSpacing:", .{@as(f64, 0)});
+            },
+            .divider => {
+                // Tight rule between groups — collapses paragraph
+                // spacing both sides so the body's trailing gap +
+                // divider + header read as one visual transition.
+                para.msgSend(void, "setLineSpacing:", .{@as(f64, 0)});
+                para.msgSend(void, "setParagraphSpacing:", .{@as(f64, 4)});
+                para.msgSend(void, "setParagraphSpacingBefore:", .{@as(f64, 4)});
             },
         }
 

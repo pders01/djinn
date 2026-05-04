@@ -49,10 +49,11 @@ pub const Style = struct {
             .warn = t.palette[11],
             .err = t.palette[9],
             .chip = blk: {
-                // 12% lift toward fg — strong enough to read against
-                // terminal bg without inversion. Same fill drives the
-                // log pane, so chrome surfaces share one color.
-                const chip_bg = mix(t.background, t.foreground, 0.12);
+                // 22% lift toward fg — strong enough to survive
+                // `background-opacity < 1` translucency over a desktop
+                // backdrop. Same fill drives the log pane, so chrome
+                // surfaces share one color.
+                const chip_bg = mix(t.background, t.foreground, 0.22);
                 break :blk .{
                     .bg = chip_bg,
                     .fg = t.foreground,
@@ -61,11 +62,20 @@ pub const Style = struct {
                     // palette[8] would clash on bright themes; this
                     // composes correctly against the lifted bg.
                     .dim = mix(chip_bg, t.foreground, 0.45),
+                    // 35% blend toward fg — enough contrast for a
+                    // 1px stroke to read on the lifted chip bg, dim
+                    // enough not to fight the body text.
+                    .border = mix(chip_bg, t.foreground, 0.35),
                 };
             },
             .font_family = t.font_family,
-            .font_size_sm = @max(11, t.font_size - 2),
-            .font_size_chip = @max(11, t.font_size - 2),
+            // Cap chrome fonts so they stay visually subordinate to
+            // terminal output regardless of how big the user runs the
+            // terminal font. Floor 11 keeps text legible on small
+            // themes; ceiling 13 stops chrome from competing at 18pt+
+            // theme sizes.
+            .font_size_sm = @min(13, @max(11, t.font_size - 2)),
+            .font_size_chip = @min(12, @max(11, t.font_size - 2)),
         };
     }
 };
@@ -74,6 +84,11 @@ pub const Chip = struct {
     bg: Rgb,
     fg: Rgb,
     dim: Rgb,
+    /// Hairline border for chip surfaces. Same tone as `dim` but lifted
+    /// further toward the body fg so a 1px stroke reads as a deliberate
+    /// edge — without it, the chip's bg lift can disappear under
+    /// background-opacity translucency.
+    border: Rgb,
 };
 
 /// Linear blend of two colors. `t=0` → a, `t=1` → b. Component-wise
@@ -109,19 +124,20 @@ pub fn nsColorFromRgb(NSColor: objc.Class, c: Rgb) objc.Object {
     );
 }
 
-/// Resolve the chrome font (ghostty family at the small chrome size).
-/// Used by every host chrome surface — log entries, find chip, future
-/// status text — so they sit on the same typographic axis. Falls back
-/// to the system fixed-pitch font if the family doesn't resolve.
+/// Resolve the chrome font — system UI font (San Francisco) at medium
+/// weight. Sits on a different typographic axis from the terminal's
+/// monospace so chrome text doesn't read as more terminal output.
+/// Used by the find chip + log entries.
+///
+/// `family` is unused — kept in the signature so the call sites read
+/// uniformly across "chrome wants the system font" + future helpers
+/// that may want the ghostty family.
 pub fn chromeFont(NSFont: objc.Class, family: []const u8, size: f64) objc.Object {
-    const NSString = objc.getClass("NSString") orelse return NSFont.msgSend(objc.Object, "userFixedPitchFontOfSize:", .{size});
-    const z = std.heap.page_allocator.allocSentinel(u8, family.len, 0) catch return NSFont.msgSend(objc.Object, "userFixedPitchFontOfSize:", .{size});
-    defer std.heap.page_allocator.free(z);
-    @memcpy(z[0..family.len], family);
-    const ns_name = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, z.ptr)});
-    const f = NSFont.msgSend(objc.Object, "fontWithName:size:", .{ ns_name, size });
-    if (f.value != null) return f;
-    return NSFont.msgSend(objc.Object, "userFixedPitchFontOfSize:", .{size});
+    _ = family;
+    // NSFontWeightMedium = 0.23. systemFontOfSize:weight: takes a
+    // CGFloat weight; 0.23 sits between regular (0.0) and semibold
+    // (0.3) — readable without shouting.
+    return NSFont.msgSend(objc.Object, "systemFontOfSize:weight:", .{ size, @as(f64, 0.23) });
 }
 
 /// Same as `nsColorFromRgb` but with caller-provided alpha. Useful for
