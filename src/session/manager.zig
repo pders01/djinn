@@ -203,8 +203,14 @@ fn resolveScript(
     const path: []const u8 = if (std.mem.startsWith(u8, raw, "~/")) blk: {
         const home = std.posix.getenv("HOME") orelse return error.NoHome;
         const expanded = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, raw[2..] });
-        errdefer allocator.free(expanded);
-        try owned.append(allocator, expanded);
+        // Hand off ownership to `owned` immediately. A function-scope
+        // `errdefer allocator.free(expanded)` would still fire after
+        // a later error (e.g. statFile below), and the caller's
+        // errdefer drains `owned` on the same error → double-free.
+        owned.append(allocator, expanded) catch |e| {
+            allocator.free(expanded);
+            return e;
+        };
         break :blk expanded;
     } else raw;
 
