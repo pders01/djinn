@@ -974,9 +974,22 @@ fn tryDropImage(pb: objc.Object) bool {
     });
     if (png.value == null) return false;
 
+    // Filename is randomised so a co-operating local process can't
+    // pre-position a symlink at the path and trick the writeToFile
+    // call into following it elsewhere. With a 128-bit suffix the
+    // path is unpredictable within the sub-millisecond create→write
+    // window — same protection mkstemp(3) provides via a different
+    // mechanism.
+    var rand_buf: [16]u8 = undefined;
+    std.crypto.random.bytes(&rand_buf);
+    var hex_buf: [32]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (rand_buf, 0..) |b, i| {
+        hex_buf[i * 2] = hex_chars[b >> 4];
+        hex_buf[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
     var path_buf: [128]u8 = undefined;
-    const ms = std.time.milliTimestamp();
-    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/djinn-drop-{d}.png", .{ms}) catch return false;
+    const path = std.fmt.bufPrintZ(&path_buf, "/tmp/djinn-drop-{s}.png", .{hex_buf[0..]}) catch return false;
     const ns_path = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, path.ptr)});
     if (ns_path.value == null) return false;
     const wrote: bool = png.msgSend(bool, "writeToFile:atomically:", .{ ns_path, @as(c_int, 1) });
