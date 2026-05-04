@@ -3,10 +3,9 @@ const objc = @import("objc");
 const app_state = @import("../app.zig");
 
 // Class registration is a one-shot flag with no cross-callback reach,
-// so it stays module-private. Auto-hide + resize wiring goes through
-// app.g (panel ref, hide_on_blur, resize_handler).
+// so it stays module-private. Resize wiring goes through app.g.
 var g_class_registered: bool = false;
-var g_blur_observer_registered: bool = false;
+var g_resign_observer_registered: bool = false;
 
 /// Subclass NSPanel so we can override `canBecomeKeyWindow:` — borderless
 /// panels return NO by default, which prevents the contentView from ever
@@ -27,44 +26,25 @@ fn canBecomeKeyImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
     return true;
 }
 
+/// Sync internal panel state when macOS deactivates djinn and auto-hides
+/// the panel via `setHidesOnDeactivate:`. The actual hiding is OS-driven
+/// — we just keep `visible`, `prev_app_pid`, and the ghostty surface's
+/// focus/occlusion state in step.
+///
+/// Bails when NSApp is still active: that means key transferred to a
+/// sibling djinn window (find chip, palette overlay), not a real blur.
+/// macOS won't auto-hide in that case either.
 fn didResignKeyImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
     if (!app_state.g.hide_on_blur) return;
     const p = app_state.g.panel orelse return;
     if (!p.visible) return;
-    // Defer to the next runloop turn. didResignKey fires synchronously
-    // when the Cmd+Tab picker opens (before the user has even chosen
-    // their target). If we run hideForBlur right now, the panel's
-    // 250ms `setFrame:animate:YES` blocks while macOS is still
-    // resolving the picker; by the time the animation ends and we
-    // call `orderOut:`, our deactivation can race the user's pick and
-    // macOS picks the wrong frontmost. Async-on-main lets Cmd+Tab
-    // resolve first, then we hide cleanly.
-    const main_queue = c_dispatch.dispatch_get_main_queue();
-    dispatch_async_f(@ptrCast(main_queue), null, &deferredHideForBlur);
+
+    const NSApplication = objc.getClass("NSApplication") orelse return;
+    const nsapp = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
+    if (nsapp.msgSend(bool, "isActive", .{})) return;
+
+    p.syncHiddenState();
 }
-
-fn deferredHideForBlur(_: ?*anyopaque) callconv(.c) void {
-    if (!app_state.g.hide_on_blur) return;
-    const p = app_state.g.panel orelse return;
-    if (!p.visible) return;
-    // Re-check key status: if djinn re-acquired focus before this
-    // runloop turn (rare but possible — system focus thrash on app
-    // switches with overlapping panels), skip the hide.
-    const is_key: bool = p.ns_panel.msgSend(bool, "isKeyWindow", .{});
-    if (is_key) return;
-
-    p.hideForBlur();
-}
-
-extern "c" fn dispatch_async_f(
-    queue: ?*anyopaque,
-    ctx: ?*anyopaque,
-    work: *const fn (?*anyopaque) callconv(.c) void,
-) void;
-
-const c_dispatch = @cImport({
-    @cInclude("dispatch/dispatch.h");
-});
 
 fn didEndLiveResizeImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
     const handler = app_state.g.resize_handler orelse return;
@@ -131,6 +111,9 @@ pub const Panel = struct {
         );
 
         panel.msgSend(void, "setFloatingPanel:", .{@as(c_int, 1)});
+        // setHidesOnDeactivate driven by hide_on_blur via setHideOnBlur;
+        // default to NO so the panel persists across app switches when
+        // hide_on_blur is off.
         panel.msgSend(void, "setHidesOnDeactivate:", .{@as(c_int, 0)});
         panel.msgSend(void, "setReleasedWhenClosed:", .{@as(c_int, 0)});
         panel.msgSend(void, "setOpaque:", .{@as(c_int, 0)});
@@ -276,46 +259,27 @@ pub const Panel = struct {
         }
     }
 
+    /// Explicit hide (hotkey toggle while djinn is active). Slides
+    /// offscreen, orderOut, then restores the previously-frontmost
+    /// regular app via `activateAppByPid`. Cross-app activation is
+    /// throttled on macOS 14+ but works for the explicit-toggle path
+    /// because djinn is still the active app at the moment of the
+    /// call (user gesture in flight).
     pub fn hide(self: *Panel) void {
-        self.hideKind(true);
-    }
-
-    /// Hide variant for blur-driven dismissal (panel lost key state
-    /// because the user Cmd+Tab'd or clicked into another app).
-    /// Skips the prev-app reactivation: the system already handed
-    /// focus to whichever window the user picked, and clobbering
-    /// that with our captured `prev_app_pid` would yank them back to
-    /// the app they had open *before* summoning djinn.
-    pub fn hideForBlur(self: *Panel) void {
-        self.hideKind(false);
-    }
-
-    fn hideKind(self: *Panel, restore_prev: bool) void {
         const frame = self.ns_panel.msgSend(NSRect, "frame", .{});
 
-        // Anchor restore Y to current (possibly-resized) height so next show
-        // doesn't push the panel off-screen. Use the screen the panel
-        // currently lives on (its frame origin) rather than mainScreen to
-        // avoid sliding the panel off the wrong monitor.
         var target_x = frame.origin.x;
         var visible_y = self.visible_y;
         var hidden_y = self.hidden_y;
         if (currentScreen()) |screen| {
-            const sframe = screen.msgSend(NSRect, "frame", .{});
-            // Pick the screen whose frame contains the panel origin, not the
-            // cursor's screen — the panel may be sliding away from a different
-            // monitor than the user is now hovering. NSScreen.frame here is
-            // currentScreen()'s, which may diverge; favor the panel's actual
-            // screen via NSWindow.screen when available.
             const win_screen = self.ns_panel.msgSend(objc.Object, "screen", .{});
             const used = if (win_screen.value != null) win_screen else screen;
             const fr = used.msgSend(NSRect, "frame", .{});
             visible_y = fr.origin.y + fr.size.height - frame.size.height;
             hidden_y = fr.origin.y + fr.size.height;
-            target_x = frame.origin.x; // keep current x; user already saw it land here
+            target_x = frame.origin.x;
             self.visible_y = visible_y;
             self.hidden_y = hidden_y;
-            _ = sframe;
         }
 
         const offscreen = NSRect{
@@ -324,39 +288,26 @@ pub const Panel = struct {
         };
         self.ns_panel.msgSend(void, "setFrame:display:animate:", .{ offscreen, @as(c_int, 1), @as(c_int, 1) });
 
-        // Explicit toggle path: orderOut removes the panel from the
-        // window list, which lets macOS deactivate djinn cleanly so
-        // the menu bar returns to the previously-frontmost regular
-        // app. We also re-activate `prev_app_pid` explicitly because
-        // macOS 14+ throttles cross-app activation and won't always
-        // restore focus on its own.
-        //
-        // Blur path (Cmd+Tab / click-away): SKIP orderOut. djinn is
-        // an Accessory app; once orderOut removes the last visible
-        // window, macOS triggers a deactivation cascade that picks
-        // "previous regular app" — which is whatever was frontmost
-        // BEFORE the user summoned djinn, not the app they just
-        // Cmd+Tab'd to. `activateAppByPid` can't override this on
-        // macOS 14+ (cross-app activate is gated on user gesture).
-        // Leaving the panel in the window list at offscreen Y stops
-        // the cascade entirely; the user's pick stays frontmost.
-        if (restore_prev) {
-            self.ns_panel.msgSend(void, "orderOut:", .{@as(?*anyopaque, null)});
-            const restore = NSRect{
-                .origin = .{ .x = target_x, .y = visible_y },
-                .size = frame.size,
-            };
-            self.ns_panel.msgSend(void, "setFrame:display:", .{ restore, @as(c_int, 0) });
-            if (self.prev_app_pid != 0) activateAppByPid(self.prev_app_pid);
-        }
+        self.ns_panel.msgSend(void, "orderOut:", .{@as(?*anyopaque, null)});
+        const restore = NSRect{
+            .origin = .{ .x = target_x, .y = visible_y },
+            .size = frame.size,
+        };
+        self.ns_panel.msgSend(void, "setFrame:display:", .{ restore, @as(c_int, 0) });
+        if (self.prev_app_pid != 0) activateAppByPid(self.prev_app_pid);
+
+        self.syncHiddenState();
+    }
+
+    /// Reconcile internal state with the panel being hidden — clears
+    /// `visible`, `prev_app_pid`, and tells the ghostty surface it
+    /// lost focus + occlusion. Called both from `hide()` (explicit
+    /// toggle) and from `didResignKeyImpl` (macOS-driven auto-hide
+    /// via `setHidesOnDeactivate:`).
+    pub fn syncHiddenState(self: *Panel) void {
         self.prev_app_pid = 0;
         self.visible = false;
 
-        // Step 5: ghostty surface yields focus when the panel is hidden.
-        // Lets ghostty drop to its idle render cadence + clear cursor
-        // blink state. set_occlusion(false) tells the surface it's
-        // fully obscured so it can skip render work entirely while the
-        // panel is slid offscreen — pure win for battery on long idle.
         if (app_state.g.ghostty_surface) |surf_ptr| {
             const ghostty_runtime = @import("../ghostty/runtime.zig");
             const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
@@ -408,17 +359,26 @@ pub const Panel = struct {
         });
     }
 
-    /// Enable auto-hide when the panel loses key status. Idempotent: registers
-    /// the NSNotificationCenter observer on first call only. Without the
-    /// guard, every config reload (FSEvent fan-in via `onConfigChanged`)
-    /// would re-add the observer, and `didResignKeyImpl` would fire N
-    /// times per resign after N reloads.
+    /// Enable auto-hide when djinn loses application focus. Implemented
+    /// as `setHidesOnDeactivate:enabled` — macOS hides the panel when
+    /// the user clicks/Cmd+Tabs into another app, and the user's chosen
+    /// app stays frontmost (no Accessory-app deactivation cascade fires
+    /// because djinn's deactivation is the *consequence* of the other
+    /// app activating, not the trigger).
+    ///
+    /// `didResignKeyImpl` runs alongside the auto-hide to keep djinn's
+    /// internal state (`visible`, ghostty focus/occlusion) in sync;
+    /// the resignKey observer is registered once and gates on
+    /// `hide_on_blur` at fire time.
     pub fn setHideOnBlur(self: *Panel, enabled: bool) void {
         app_state.g.hide_on_blur = enabled;
         app_state.g.panel = self;
-        if (!enabled) return;
-        if (g_blur_observer_registered) return;
-        g_blur_observer_registered = true;
+
+        const c_enabled: c_int = if (enabled) 1 else 0;
+        self.ns_panel.msgSend(void, "setHidesOnDeactivate:", .{c_enabled});
+
+        if (g_resign_observer_registered) return;
+        g_resign_observer_registered = true;
 
         const NSNotificationCenter = objc.getClass("NSNotificationCenter") orelse return;
         const center = NSNotificationCenter.msgSend(objc.Object, "defaultCenter", .{});

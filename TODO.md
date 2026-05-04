@@ -19,11 +19,6 @@ wired through ghostty's callbacks (`df6923f`); system appearance
 flips push through to ghostty (`96f2197`). Remaining gaps are
 `magnify:` and `quickLook:` — neither user-blocking.
 
-One **known regression**: Cmd+Tab away from djinn lands on the wrong
-app (the pre-djinn frontmost, not the user's pick). Suspected cause
-is the macOS 14+ `activateWithOptions:` throttle. See "Cmd+Tab focus
-restoration" under Open work.
-
 ## Open work — pick from here
 
 ### Per-profile env vars *(deferred from v1 spec)*
@@ -41,52 +36,6 @@ to a `[]const struct { k: []const u8, v: []const u8 }` on the entry.
 Spawn path: pass through to ghostty via `surface_config_s.env_*`
 (check ghostty.h for the exact slot — there's a `_count` + `_pairs`
 pattern for repeating fields).
-
-### Cmd+Tab focus restoration *(unresolved — macOS 14+ activation throttle)*
-
-Goal: when user Cmd+Tabs away from djinn (with `hide_on_blur`
-enabled), djinn slides offscreen and the user lands on the app
-they picked, not on whatever was frontmost before djinn appeared.
-
-Currently broken on macOS 14+ (verified on 26.x). Suspected root
-cause: `NSRunningApplication.activateWithOptions:` is throttled
-to user-gesture only, so any `activateAppByPid` call we make is
-silently dropped. macOS's own deactivation cascade (Accessory app
-loses last visible window → falls back to "previous regular app")
-runs uncontested and picks the pre-djinn frontmost.
-
-Attempts so far (commits `c51587b 139b2ee bc5e129 0106a9f`):
-
-1. Skip `activateAppByPid(prev_app_pid)` on the blur path —
-   no help; cascade still picks prev app.
-2. Defer `hideForBlur` via `dispatch_async_f` so it runs after
-   Cmd+Tab resolves — no help.
-3. Capture `currentFrontmostPid` *after* Cmd+Tab resolves +
-   re-activate it explicitly — no help (activate throttled).
-4. Skip `orderOut:` on the blur path; just slide offscreen and
-   leave the panel in the window list to suppress the
-   deactivation cascade — still doesn't restore right app per
-   user testing.
-
-Where to look next:
-
-- `NSWorkspace.openApplicationAtURL:configuration:completionHandler:`
-  with `activates: true` may bypass the throttle since it's a
-  workspace-level call, not per-app.
-- `[NSApp hide:nil]` (NSApplication-level hide) might let macOS
-  pick a sensible "next" without the cascade rule kicking in;
-  worth comparing the macOS-native cmd+H behavior.
-- Check whether `frontmostApplication` is even reading the right
-  value mid-Cmd+Tab. If it's stale / lagged, our re-activate
-  target is wrong upstream of the throttle.
-- See ghostty.app's `Ghostty.QuickTerminalController` for how
-  upstream handles this — they hide the quick terminal on blur
-  and the right app stays focused, so there's a working pattern
-  in the same OS family to mine.
-
-`hide_on_blur` users currently get the wrong app on Cmd+Tab. The
-explicit-toggle path (Cmd+\ twice, or hotkey toggle) still works
-correctly — it uses `prev_app_pid` capture + `orderOut`.
 
 ### Dynamic profile creation *(deferred — needs config writeback)*
 
