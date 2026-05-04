@@ -20,9 +20,15 @@ identity="${DJINN_SIGN_IDENTITY:-DjinnLocalDev}"
 # anchored to a system-trusted root, even though codesign itself
 # accepts them. Probe by certificate presence instead, then attempt
 # the signed path with a fallback to ad-hoc on failure.
-if security find-certificate -c "$identity" login.keychain >/dev/null 2>&1 \
-        && codesign --force --sign "$identity" --deep "$bundle" 2>/dev/null; then
-    exit 0
+#
+# codesign's stderr is preserved so a failed signed-path sign
+# (expired cert, keychain locked, entitlement clash, …) shows a
+# diagnostic before the ad-hoc fallback masks it as success.
+if security find-certificate -c "$identity" login.keychain >/dev/null 2>&1; then
+    if codesign --force --sign "$identity" --deep "$bundle"; then
+        exit 0
+    fi
+    echo "codesign with '$identity' failed; falling back to ad-hoc" >&2
 fi
 
 codesign --force --sign - --deep "$bundle"
