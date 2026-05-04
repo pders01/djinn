@@ -81,12 +81,18 @@ security add-trusted-cert -d -r trustAsRoot -p codeSign \
     -k "$KEYCHAIN" "$WORKDIR/cert.pem" 2>/dev/null || true
 
 # Re-binding the private key's partition list so codesign can use it
-# without an interactive prompt. The empty -k password assumes the
-# user's login keychain matches their account login (default).
-# Failures here are non-fatal — codesign will still work, just with
-# a one-time keychain unlock prompt on first sign.
+# without an interactive prompt. `-l "$IDENTITY"` scopes the change
+# to only the freshly-imported DjinnLocalDev key — without that
+# filter, `-s` would re-write the partition list on every private
+# key in login.keychain (SSH, GPG, other code-signing identities)
+# and silently weaken their access controls.
+#
+# The empty -k password assumes the user's login keychain matches
+# their account login (default). Failures here are non-fatal —
+# codesign will still work, just with a one-time keychain unlock
+# prompt on first sign.
 security set-key-partition-list -S apple-tool:,apple:,codesign: \
-    -s -k "" "$KEYCHAIN" >/dev/null 2>&1 || true
+    -s -k "" -l "$IDENTITY" "$KEYCHAIN" >/dev/null 2>&1 || true
 
 echo "identity '$IDENTITY' installed in login.keychain"
 echo "bundle codesign step will pick it up on next 'just deploy'"
