@@ -34,7 +34,7 @@ jobs:
           fi
 
       - name: Install Zig 0.15.2
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
 

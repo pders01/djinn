@@ -17,9 +17,8 @@ permissions:
 
 jobs:
   test:
-    # Apple-silicon runner. The test path links only ghostty-vt-static
-    # (no Metal compile) so this works on stock GitHub macOS images
-    # without downloading the Metal Toolchain.
+    # Apple-silicon runner. Test path skips the Metal compile so this
+    # works on stock GitHub macOS images without the Metal Toolchain.
     runs-on: macos-15
     timeout-minutes: 20
 
@@ -28,7 +27,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Zig 0.15.2
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
 
@@ -46,9 +45,7 @@ jobs:
         run: ./scripts/build.sh test
 
       - name: Build debug exe (smoke)
-        # Catches link-time regressions the test suite can't see, since
-        # the test build links ghostty-vt-static while the real exe
-        # pulls the full libghostty.
+        # Catches link-time regressions the test suite can't see.
         run: ./scripts/build.sh
 
       - name: Run djinn --version
@@ -68,7 +65,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install Zig 0.15.2
-        uses: mlugg/setup-zig@v1
+        uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
 
