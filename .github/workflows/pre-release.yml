@@ -1,0 +1,124 @@
+name: Pre-release
+
+# Rolling pre-release: every push to main rebuilds the bundle and
+# republishes the `pre-release` tag with a fresh artifact set, so
+# users can `curl | bash` the installer and get the latest main-tip
+# build without waiting for a stable tag cut.
+#
+# The `pre-release` tag is force-updated on every run; users pin to
+# this label deliberately when they want bleeding-edge.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Only one pre-release build at a time. Newer pushes cancel older
+# in-flight runs so the tag tracks HEAD instead of getting stuck on
+# a stale build that finished after a newer one started.
+concurrency:
+  group: pre-release
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    runs-on: macos-15
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Ensure Metal Toolchain
+        # See ci.yml for the rationale on the xcode-select swap +
+        # `xcrun --find metal` probe before falling back to
+        # `-downloadComponent`.
+        run: |
+          newest_xcode=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$newest_xcode" ]; then
+            echo "Selecting $newest_xcode"
+            sudo xcode-select -s "$newest_xcode"
+          fi
+          if xcrun --find metal >/dev/null 2>&1; then
+            echo "Metal compiler at $(xcrun --find metal)"
+          else
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
+
+      - name: Cache zig packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build signed Djinn.app (ad-hoc)
+        run: ./scripts/build.sh bundle-sign
+
+      - name: Verify bundle metadata
+        run: |
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+            zig-out/Djinn.app/Contents/Info.plist
+          codesign --verify --verbose=2 zig-out/Djinn.app
+
+      - name: Verify dylib linkage
+        run: |
+          otool -L zig-out/Djinn.app/Contents/MacOS/djinn | grep -q '@rpath/libghostty.dylib' \
+            || { echo "::error::libghostty not linked via @rpath"; exit 1; }
+          otool -l zig-out/Djinn.app/Contents/MacOS/djinn | grep -A2 LC_RPATH | grep -q '@loader_path' \
+            || { echo "::error::@loader_path missing from LC_RPATH"; exit 1; }
+          zig-out/Djinn.app/Contents/MacOS/djinn --version
+
+      - name: Package release artifacts
+        # `pre-release` tag is the stable label users pin to; the
+        # zip + sha256 + install.sh stay alongside it. install.sh
+        # is shipped from the repo so the curl|bash one-liner
+        # always pulls the script that matches the build's release
+        # layout.
+        run: |
+          cd zig-out
+          zip -r -y "Djinn-pre-release-${{ runner.arch }}.zip" Djinn.app
+          shasum -a 256 "Djinn-pre-release-${{ runner.arch }}.zip" \
+            > "Djinn-pre-release-${{ runner.arch }}.zip.sha256"
+          cp ../scripts/install-from-release.sh install.sh
+
+      - name: Move pre-release tag to HEAD
+        # softprops/action-gh-release creates the tag if it doesn't
+        # exist but doesn't move an existing tag. Force-push the
+        # tag here so the release attaches to the right commit.
+        run: |
+          git tag -f pre-release
+          git push --force origin refs/tags/pre-release
+
+      - name: Publish pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: pre-release
+          name: pre-release (rolling)
+          prerelease: true
+          # `make_latest: false` keeps the actual stable release as
+          # the "Latest" badge target. pre-release is never the
+          # default download.
+          make_latest: false
+          body: |
+            Rolling build of `main` — refreshed every push.
+
+            Install:
+            ```
+            curl -fsSL https://github.com/${{ github.repository }}/releases/download/pre-release/install.sh | bash
+            ```
+
+            Pinned to commit `${{ github.sha }}`.
+          files: |
+            zig-out/Djinn-pre-release-${{ runner.arch }}.zip
+            zig-out/Djinn-pre-release-${{ runner.arch }}.zip.sha256
+            zig-out/install.sh

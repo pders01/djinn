@@ -101,7 +101,21 @@ nix flake check          # tests in the sandbox
 
 `dep.artifact("ghostty")` on darwin is blocked by an unintentional install guard in upstream ghostty (their own comment: "we shouldn't have this guard but we don't currently build on macOS this way ironically so we need to fix that"). djinn vendor-patches the guard locally; see `patches/ghostty-001-darwin-install.patch` for the full motivation.
 
-## Install (local demo)
+## Install
+
+### Quick install (pre-built bundle)
+
+```sh
+curl -fsSL https://github.com/pders01/djinn/releases/download/pre-release/install.sh | bash
+```
+
+Downloads the latest `main`-tip bundle, drops it into `~/Applications`, opens it. macOS prompts for Accessibility permission on first launch (needed for the global hotkey).
+
+The `pre-release` tag is rolled forward on every push to `main`, so the installer always pulls the freshest build. For a pinned alpha/beta build, use a stable tag from [Releases](https://github.com/pders01/djinn/releases) and replace `pre-release` in the URL.
+
+The downloaded bundle is ad-hoc signed (no Apple Developer ID — see "Stable signing identity" below). macOS Gatekeeper may show a "downloaded from the internet" prompt on first launch despite the installer stripping the quarantine xattr; click "Open" to proceed.
+
+### Build from source
 
 For a real install — Spotlight launchable, login-item capable, surviving relog — build the signed `.app` bundle and copy it to `~/Applications`:
 
