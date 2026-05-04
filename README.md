@@ -4,16 +4,16 @@ Quake-drop terminal for macOS, with an MCP-driven agent status surface.
 
 Two products in one binary:
 
-- A native macOS Quake-drop popup terminal (NSPanel + libghostty-vt + CoreText, with selection, blur, live resize, and a side log).
+- A native macOS Quake-drop popup terminal (NSPanel + libghostty + CoreText, with selection, blur, live resize, and a side log).
 - An HTTP MCP server that lets AI coding agents push structured status to the menubar — so you know the agent's state without keeping the terminal focused.
 
 ## Status
 
-Tier-5 surface migration is complete: djinn is a libghostty-surface
-host. ghostty owns the visible terminal area end-to-end (PTY, render,
-scrollback, selection, hyperlink hover, search, IME). djinn keeps
-panel chrome, MCP server, agent state surface, hotkey, menubar, log
-pane, drag-drop, find-overlay UI, and an action keymap.
+djinn is a libghostty-surface host. ghostty owns the visible
+terminal area end-to-end (PTY, render, scrollback, selection,
+hyperlink hover, search, IME). djinn keeps panel chrome, MCP
+server, agent state surface, hotkey, menubar, log pane, drag-drop,
+find-overlay UI, and an action keymap.
 
 Working:
 
@@ -37,7 +37,7 @@ Working:
 - SMAppService login-item registration when launched from the bundle.
 - Unified chrome design language (`src/chrome.zig`): log pane + find chip share Style-derived colors + typography.
 
-Known gaps: per-call log expansion (collapsed args + result), animated row insertion, sleep/wake recovery (untested but ghostty's problem now). See `TODO.md`.
+Known gaps: per-call log expansion (collapsed args + result), animated row insertion, sleep/wake recovery. See `TODO.md`.
 
 ## Build
 
@@ -95,11 +95,11 @@ nix run .#test           # run the unit suite
 nix flake check          # tests in the sandbox
 ```
 
-**These runners build on the HOST against your working tree**, not inside `/nix/store`. djinn doesn't ship a pure `packages.default`: ghostty's `.metal` shader compile goes through `xcrun → metal`, and Apple ships the Metal Toolchain through cryptexd at `/var/run/com.apple.security.cryptexd/...`, which the nix builder can't reach even with `__noChroot = true`. The dev shell + apps are the right level of nix integration for this codebase.
+**These runners build on the HOST against your working tree**, not inside `/nix/store`. djinn doesn't ship a pure `packages.default`: ghostty's `.metal` shader compile goes through `xcrun → metal`, and Apple ships the Metal Toolchain through cryptexd at `/var/run/com.apple.security.cryptexd/...`, which the nix builder can't reach even with `__noChroot = true`.
 
 ### Why a wrapper script
 
-`dep.artifact("ghostty")` on darwin is blocked by an unintentional install guard in upstream ghostty (their own comment: "we shouldn't have this guard but we don't currently build on macOS this way ironically so we need to fix that"). PR'ing this fix upstream is on hold until the maintainer understands the xcframework + Xcode build path interaction enough to land the right shape; vendor-patching locally keeps us moving. See `patches/ghostty-001-darwin-install.patch` for the full motivation.
+`dep.artifact("ghostty")` on darwin is blocked by an unintentional install guard in upstream ghostty (their own comment: "we shouldn't have this guard but we don't currently build on macOS this way ironically so we need to fix that"). djinn vendor-patches the guard locally; see `patches/ghostty-001-darwin-install.patch` for the full motivation.
 
 ## Install (local demo)
 
@@ -326,11 +326,6 @@ opacity = 1.0
 Set in `~/.config/djinn/config` to override ghostty's `background-opacity`. Blur stays via `background-blur-radius`, but the visual-effect view sits behind an opaque terminal bg so font smoothing kicks in. Trade-off: you no longer see the blurred backdrop through cell bg cells (only the panel chrome around the text).
 
 ## Architecture
-
-Post-Tier-5: ghostty owns the visible terminal area end-to-end (PTY,
-render, scrollback, selection, hyperlink hover, search). djinn keeps
-panel chrome, MCP server, agent state surface, hotkey, menubar, log
-pane, drag-drop, find-overlay UI, and an action keymap.
 
 ### View tree
 
