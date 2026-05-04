@@ -150,7 +150,12 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
         const ns_label = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, z_label.ptr)});
 
         const text_size = ns_label.msgSend(NSSize, "sizeWithAttributes:", .{attrs});
-        const text_x = x + (tab_w - text_size.width) / 2.0;
+        // Left-align the label inside its tab cell with a fixed
+        // horizontal inset. Center alignment shifted labels around as
+        // active/inactive flipped fonts; left-align reads as a stable
+        // anchor — same idiom as Safari's tab bar.
+        const tab_pad: f64 = 12;
+        const text_x = x + tab_pad;
         const text_y = (bounds.size.height - text_size.height) / 2.0;
         ns_label.msgSend(void, "drawAtPoint:withAttributes:", .{ NSPoint{ .x = text_x, .y = text_y }, attrs });
 
