@@ -33,15 +33,37 @@ pub const Notifier = struct {
     /// `name` semantics:
     ///   - "" or null → no-op
     ///   - "default" → /System/Library/Sounds/Funk.aiff
-    ///   - absolute path (starts with "/") → play that file
+    ///   - absolute path → must live under /System/Library/Sounds/
+    ///     or ~/Library/Sounds/, no `..` segments
     ///   - anything else → /System/Library/Sounds/<name>.aiff
+    ///     (short stems must not contain `/`)
+    ///
+    /// Validation prevents a config-controlled path from reaching
+    /// arbitrary files on disk — `afplay` would otherwise open and
+    /// attempt to play any file readable by the user, which is a
+    /// minor info-disclosure surface (file existence + readability)
+    /// when the config originates from an untrusted source.
     pub fn playSound(_: *const Notifier, name: ?[]const u8) void {
         const n = name orelse return;
         if (n.len == 0) return;
 
         const allocator = std.heap.page_allocator;
         const path: []const u8 = blk: {
-            if (n[0] == '/') break :blk allocator.dupe(u8, n) catch return;
+            if (n[0] == '/') {
+                if (!isAllowedSoundPath(n)) {
+                    std.debug.print("warning: sound path '{s}' outside allowed dirs; skipping\n", .{n});
+                    return;
+                }
+                break :blk allocator.dupe(u8, n) catch return;
+            }
+            // Short stem: must be a bare filename, no path separators.
+            // Apple ships sounds with simple names (Tink, Funk, …); a
+            // value like `../etc/passwd` would otherwise be glued onto
+            // the prefix and escape the sounds dir.
+            if (std.mem.indexOfScalar(u8, n, '/') != null) {
+                std.debug.print("warning: sound stem '{s}' contains '/'; skipping\n", .{n});
+                return;
+            }
             const stem = if (std.mem.eql(u8, n, "default")) "Funk" else n;
             break :blk std.fmt.allocPrint(allocator, "/System/Library/Sounds/{s}.aiff", .{stem}) catch return;
         };
@@ -127,6 +149,24 @@ fn deliverOnMain(ctx: ?*anyopaque) callconv(.c) void {
     );
     if (center.value == null) return;
     center.msgSend(void, "deliverNotification:", .{note});
+}
+
+/// Whitelist for absolute sound paths. macOS's bundled sounds live
+/// under `/System/Library/Sounds/`; user-installed sounds live under
+/// `~/Library/Sounds/`. Anything else (a config that points at
+/// `/etc/passwd`, an attacker-controlled symlink, …) is rejected so
+/// `afplay` doesn't silently probe random files. `..` segments are
+/// rejected before the prefix check so a path like
+/// `/System/Library/Sounds/../../../etc/passwd` doesn't slip
+/// through.
+fn isAllowedSoundPath(path: []const u8) bool {
+    if (std.mem.indexOf(u8, path, "/../") != null) return false;
+    if (std.mem.endsWith(u8, path, "/..")) return false;
+    if (std.mem.startsWith(u8, path, "/System/Library/Sounds/")) return true;
+    const home = std.posix.getenv("HOME") orelse return false;
+    var buf: [512]u8 = undefined;
+    const user_prefix = std.fmt.bufPrint(&buf, "{s}/Library/Sounds/", .{home}) catch return false;
+    return std.mem.startsWith(u8, path, user_prefix);
 }
 
 fn execAfplay(path: []const u8) void {
