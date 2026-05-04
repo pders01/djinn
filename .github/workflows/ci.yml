@@ -69,10 +69,17 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Install Metal Toolchain
-        # ghostty's renderer compiles `.metal` shaders via xcrun ->
-        # metal. Not part of base Xcode on the runner image.
-        run: sudo xcodebuild -downloadComponent MetalToolchain
+      - name: Ensure Metal Toolchain
+        # ghostty's renderer compiles `.metal` shaders via xcrun -> metal.
+        # macos-15 runners ship Metal Toolchain pre-installed in most
+        # Xcode versions; probe for the compiler before falling back to
+        # `-downloadComponent` (which only exists on Xcode 15.3+).
+        run: |
+          if xcrun --find metal >/dev/null 2>&1; then
+            echo "Metal compiler at $(xcrun --find metal)"
+          else
+            sudo xcodebuild -downloadComponent MetalToolchain
+          fi
 
       - name: Cache zig packages
         uses: actions/cache@v4
