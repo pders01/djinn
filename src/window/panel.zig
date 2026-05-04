@@ -268,14 +268,22 @@ pub const Panel = struct {
     /// Explicit hide (hotkey toggle). Slides offscreen, orderOut, then
     /// conditionally restores the previously-frontmost regular app.
     ///
-    /// The restore fires only when djinn itself is frontmost at hide
+    /// The restore fires only when djinn was the active app at hide
     /// time. Counter-example: user shows djinn over A, Cmd+Tabs to B,
     /// then hits hotkey to dismiss the still-visible panel. djinn is
-    /// not frontmost (B is) — restoring `prev_app_pid=A` would yank
+    /// not active (B is) — restoring `prev_app_pid=A` would yank
     /// the user back to A, undoing their Cmd+Tab. So we leave
     /// frontmost alone in that case and just hide the chrome.
+    ///
+    /// `NSApp.isActive` is the correct probe here, not
+    /// `NSWorkspace.frontmostApplication`. djinn is an Accessory app
+    /// — the workspace's frontmost-application machinery never
+    /// reports an Accessory as frontmost, even when its panel owns
+    /// key. `isActive` reflects the AppKit-level "is this process
+    /// driving the menu bar / receiving key events" view, which is
+    /// exactly the user-intent question we want to answer.
     pub fn hide(self: *Panel) void {
-        const djinn_was_frontmost = currentFrontmostPid() == 0;
+        const djinn_was_active = self.ns_app.msgSend(bool, "isActive", .{});
 
         const frame = self.ns_panel.msgSend(NSRect, "frame", .{});
 
@@ -306,7 +314,7 @@ pub const Panel = struct {
         };
         self.ns_panel.msgSend(void, "setFrame:display:", .{ restore, @as(c_int, 0) });
 
-        if (djinn_was_frontmost and self.prev_app_pid != 0) {
+        if (djinn_was_active and self.prev_app_pid != 0) {
             activateAppByPid(self.prev_app_pid);
         }
 
