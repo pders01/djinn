@@ -110,7 +110,13 @@ pub const Panel = struct {
             .{ visible_frame, style_mask, backing, @as(c_int, 0) },
         );
 
-        panel.msgSend(void, "setFloatingPanel:", .{@as(c_int, 1)});
+        // setFloatingPanel:1 makes the panel "stay key when other windows
+        // lose focus" — desirable for tool palettes, fatal for Quake-drop.
+        // It prevents Cmd+Tab from deactivating djinn, so windowDidResignKey
+        // never fires + the panel never hides. setLevel + collection
+        // behavior below give us the visual on-top property without the
+        // focus-stickiness.
+        panel.msgSend(void, "setFloatingPanel:", .{@as(c_int, 0)});
         // setHidesOnDeactivate driven by hide_on_blur via setHideOnBlur;
         // default to NO so the panel persists across app switches when
         // hide_on_blur is off.
@@ -259,13 +265,18 @@ pub const Panel = struct {
         }
     }
 
-    /// Explicit hide (hotkey toggle while djinn is active). Slides
-    /// offscreen, orderOut, then restores the previously-frontmost
-    /// regular app via `activateAppByPid`. Cross-app activation is
-    /// throttled on macOS 14+ but works for the explicit-toggle path
-    /// because djinn is still the active app at the moment of the
-    /// call (user gesture in flight).
+    /// Explicit hide (hotkey toggle). Slides offscreen, orderOut, then
+    /// conditionally restores the previously-frontmost regular app.
+    ///
+    /// The restore fires only when djinn itself is frontmost at hide
+    /// time. Counter-example: user shows djinn over A, Cmd+Tabs to B,
+    /// then hits hotkey to dismiss the still-visible panel. djinn is
+    /// not frontmost (B is) — restoring `prev_app_pid=A` would yank
+    /// the user back to A, undoing their Cmd+Tab. So we leave
+    /// frontmost alone in that case and just hide the chrome.
     pub fn hide(self: *Panel) void {
+        const djinn_was_frontmost = currentFrontmostPid() == 0;
+
         const frame = self.ns_panel.msgSend(NSRect, "frame", .{});
 
         var target_x = frame.origin.x;
@@ -294,7 +305,10 @@ pub const Panel = struct {
             .size = frame.size,
         };
         self.ns_panel.msgSend(void, "setFrame:display:", .{ restore, @as(c_int, 0) });
-        if (self.prev_app_pid != 0) activateAppByPid(self.prev_app_pid);
+
+        if (djinn_was_frontmost and self.prev_app_pid != 0) {
+            activateAppByPid(self.prev_app_pid);
+        }
 
         self.syncHiddenState();
     }
