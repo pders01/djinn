@@ -285,6 +285,100 @@ pub fn activateSession(idx: usize) bool {
     return true;
 }
 
+/// Context for deferred surface re-spawn. Heap-allocated by
+/// `restartActiveSession` and freed by `restartSurfaceCallback` —
+/// the slices it carries are *borrowed*: cmd is either
+/// `active.profile.command` (owned by SessionManager for the
+/// program lifetime) or a static literal like "/bin/zsh"; cwd is
+/// owned by SessionManager. No string lifetime to manage here.
+const RestartCtx = struct {
+    cmd: []const u8,
+    cwd: ?[]const u8,
+};
+
+/// Re-spawn the active session's child process. When `override_cmd` is
+/// non-null it replaces the profile's command (used by `shell_session`
+/// to force /bin/zsh). The old surface is freed synchronously and the
+/// new surface is bound on the next main-queue iteration so ghostty's
+/// IO mailbox has a runloop turn to unwind.
+pub fn restartActiveSession(override_cmd: ?[]const u8) void {
+    const sm = app.g.session_manager orelse return;
+    const ga = app.g.ghostty_app orelse return;
+    const allocator = app.g.allocator orelse return;
+    const active = sm.active();
+
+    // Free the old surface. Null the session slot + global pointer so
+    // nothing tries to use a stale handle between now and when the
+    // re-spawn callback runs.
+    if (active.surface) |sp| {
+        ga.surfaceFree(@ptrCast(sp));
+        active.surface = null;
+        active.spawned = false;
+        active.exited = false;
+        app.g.ghostty_surface = null;
+    }
+
+    const ctx = allocator.create(RestartCtx) catch return;
+    ctx.* = .{
+        .cmd = override_cmd orelse active.profile.command,
+        .cwd = active.profile.cwd,
+    };
+
+    // Schedule re-spawn on the next main-queue iteration. The
+    // one-turn gap is load-bearing: ghostty's IO mailbox needs a
+    // runloop cycle to unwind after surface_free before the same
+    // NSView can host a fresh surface.
+    const main_queue = c_dispatch.dispatch_get_main_queue();
+    dispatch_async_f(@ptrCast(main_queue), ctx, &restartSurfaceCallback);
+}
+
+/// Callback fired by dispatch_async_f after a runloop turn. Recovers
+/// the active session from global state, re-binds a ghostty surface
+/// to its surface_host NSView, and refreshes tab strip + menubar.
+fn restartSurfaceCallback(ctx_opaque: ?*anyopaque) callconv(.c) void {
+    const ctx: *RestartCtx = @ptrCast(@alignCast(ctx_opaque orelse return));
+    const allocator = app.g.allocator orelse return;
+    defer allocator.destroy(ctx);
+
+    const ga = app.g.ghostty_app orelse return;
+    const sm = app.g.session_manager orelse return;
+    const active = sm.active();
+
+    const host_raw = active.surface_host orelse return;
+    const host = objc.Object.fromId(host_raw);
+
+    const surf = bindGhosttySurface(allocator, ga, host, ctx.cmd, ctx.cwd) orelse {
+        std.debug.print("error: restart surface spawn failed for profile '{s}'\n", .{active.profile.name});
+        return;
+    };
+
+    active.surface = @ptrCast(surf);
+    active.spawned = true;
+    active.exited = false;
+    app.g.ghostty_surface = active.surface;
+    app.g.surface_host_id = if (active.surface_host) |h| @ptrCast(@alignCast(h)) else null;
+
+    // Re-anchor keyboard focus on the new surface's view. Without
+    // this, AppKit may have lost the responder chain during the
+    // surface_free → newSurface gap.
+    if (app.g.view_id) |vid| {
+        const term = objc.Object.fromId(vid);
+        const window = term.msgSend(objc.Object, "window", .{});
+        if (window.value != null) {
+            _ = window.msgSend(c_int, "makeFirstResponder:", .{term});
+        }
+    }
+
+    // Tab strip + menubar refresh.
+    @import("session/tab_strip.zig").refresh();
+    if (app.g.menubar) |mb| {
+        if (app.g.agent_state) |st| {
+            const snap = st.snapshot();
+            mb.updateState(@enumFromInt(@intFromEnum(snap.state)), snap.message);
+        }
+    }
+}
+
 /// Bind a persistent ghostty surface to `surface_host`. Returns null on
 /// failure (caller logs + bails — host can't run without a surface).
 /// Provider override flows through as argv[0]; a shell command (`zsh`,

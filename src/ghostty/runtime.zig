@@ -559,13 +559,25 @@ const c_dispatch = @cImport({
     @cInclude("dispatch/dispatch.h");
 });
 
-/// child_exited: shell exited (Ctrl+D EOF, `exit`, kill, etc). Return
-/// false so ghostty proceeds with its own close path — close_surface_cb
-/// fires there and hides the panel. Returning true would short-circuit
-/// the close path entirely (ghostty interprets true as "host showed a
-/// custom dialog, skip default + skip self.close").
-fn handleChildExited(_: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, _: c.ghostty_action_s) bool {
-    return false;
+/// child_exited: shell exited (Ctrl+D EOF, `exit`, kill, etc).
+/// Mark the owning session so the tab strip can reflect the dead-child
+/// state, then return true to prevent ghostty from auto-closing the
+/// surface. The host handles restart via Cmd+R / Cmd+Shift+R actions.
+fn handleChildExited(host: *HostContext, _: c.ghostty_app_t, target: c.ghostty_target_s, _: c.ghostty_action_s) bool {
+    if (host.app_state.session_manager) |sm| {
+        if (target.tag == c.GHOSTTY_TARGET_SURFACE) {
+            for (sm.sessions) |*sess| {
+                if (sess.surface) |sp| {
+                    const surf: c.ghostty_surface_t = @ptrCast(sp);
+                    if (surf == target.target.surface) {
+                        sess.exited = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    return true;
 }
 
 fn closePanelMain(ctx: ?*anyopaque) callconv(.c) void {
@@ -934,8 +946,11 @@ fn writeClipboardImpl(
 }
 
 fn closeSurfaceStub(userdata: ?*anyopaque, _: bool) callconv(.c) void {
-    // Surface requested close (after child_exited or other lifecycle
-    // event). Hide the panel — same shape as the child_exited handler.
+    // Surface requested close — only fires for paths NOT suppressed by
+    // handleChildExited (returning true there short-circuits this).
+    // Reaches here on app shutdown / forced close. Hide the panel;
+    // per-session `exited` state is owned by handleChildExited where
+    // target.surface lets us identify the right session.
     const host = hostFromUserdata(userdata) orelse return;
     if (host.app_state.panel) |p| {
         dispatch_async_f(@ptrCast(c_dispatch.dispatch_get_main_queue()), p, &closePanelMain);

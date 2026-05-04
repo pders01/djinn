@@ -39,6 +39,9 @@ pub const Session = struct {
     /// True after the first `activate(idx)` call wired a surface to the
     /// host. The caller checks this and only spawns once.
     spawned: bool = false,
+    /// True after the child process exits. The tab strip can use this
+    /// to show a restart hint; Cmd+R / Cmd+Shift+R restarts the session.
+    exited: bool = false,
 };
 
 pub const SessionManager = struct {

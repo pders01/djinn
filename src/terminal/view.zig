@@ -1650,6 +1650,10 @@ var actions = [_]Action{
     .{ .name = "prev_tab", .mods = mod_cmd | mod_shift, .keycode = 33, .handler = actionPrevTab },
     // Palette switcher — Cmd+Shift+P (kVK_ANSI_P = 35).
     .{ .name = "palette_open", .mods = mod_cmd | mod_shift, .keycode = 35, .handler = actionPaletteOpen },
+    // Restart dead session — Cmd+R re-spawns with the same profile command.
+    .{ .name = "restart_session", .mods = mod_cmd, .keycode = 15, .handler = actionRestartSession },
+    // Drop to a plain shell — Cmd+Shift+R forces /bin/zsh for the session.
+    .{ .name = "shell_session", .mods = mod_cmd | mod_shift, .keycode = 15, .handler = actionShellSession },
 };
 
 /// Override an entry's binding by name. Called from main() during
@@ -1904,6 +1908,14 @@ fn actionPrevTab() void {
 
 fn actionPaletteOpen() void {
     @import("../session/palette.zig").open();
+}
+
+fn actionRestartSession() void {
+    @import("../main.zig").restartActiveSession(null);
+}
+
+fn actionShellSession() void {
+    @import("../main.zig").restartActiveSession("/bin/zsh");
 }
 
 // ─── NSTextInputClient (IME) ────────────────────────────────────────
