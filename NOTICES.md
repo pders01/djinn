@@ -11,8 +11,7 @@ linked artifacts.
 License: **MIT** (Copyright (c) 2024 Mitchell Hashimoto, Ghostty
 contributors).
 
-djinn links the full `libghostty.dylib` and additionally the
-`ghostty-vt-static` archive. The visible terminal area, the terminal
+djinn links the full `libghostty.dylib`. The visible terminal area, the terminal
 config grammar, the per-action key encoder, the surface search API,
 and the bundled libghostty are all ghostty's work. Several djinn
 config conventions (the `key = value` file format, `keybind =
@@ -32,9 +31,7 @@ at the upstream ghostty repository.
 A small darwin-only patch (`patches/ghostty-001-darwin-install.patch`)
 is applied to ghostty's `build.zig` to remove an upstream install
 guard that hides `dep.artifact("ghostty")` on macOS. The patch is
-~10 lines and removes a guard rather than adding logic; it is
-intended to land upstream once the maintainer confirms the
-xcframework + Xcode build path is the right shape.
+~10 lines and removes a guard rather than adding logic.
 
 ### zig-objc — `git+https://github.com/mitchellh/zig-objc`
 

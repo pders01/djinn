@@ -5,26 +5,24 @@ GitHub Actions CI + release workflow, branded `.icns`, MIT LICENSE +
 NOTICES, multi-profile sessions, theme inheritance for `light:X,dark:Y`
 specs, dim-priority semantics for `state.json` vs config.
 
-Tier-5 surface migration is **complete**: djinn is a libghostty-surface
-host. ghostty owns the visible terminal area end-to-end (PTY, render,
-scrollback, selection, hyperlink hover, search, IME). djinn keeps panel
-chrome, MCP server, agent state surface, hotkey, menubar, log pane,
-drag-drop, find-overlay UI, an action keymap, a SessionManager, and a
+djinn is a libghostty-surface host. ghostty owns the visible
+terminal area end-to-end (PTY, render, scrollback, selection,
+hyperlink hover, search, IME). djinn keeps panel chrome, MCP server,
+agent state surface, hotkey, menubar, log pane, drag-drop,
+find-overlay UI, an action keymap, a SessionManager, and a
 multi-profile tab strip + Cmd+Shift+P palette switcher on top.
 
-The post-alpha **input bridge audit** is also done: every NSResponder
-method djinn needs is now overridden + forwarded to ghostty (right /
-middle / hover / focus / modifier-only / Y-flip / scroll precision /
-keyUp / pressureChange). Clipboard write/read wired through ghostty's
-callbacks (`df6923f`); system appearance flips push through to
-ghostty (`96f2197`). Remaining audit residue is `magnify:` and
-`quickLook:` — neither user-blocking.
+Every NSResponder method djinn needs is overridden + forwarded to
+ghostty (right / middle / hover / focus / modifier-only / Y-flip /
+scroll precision / keyUp / pressureChange). Clipboard write/read
+wired through ghostty's callbacks (`df6923f`); system appearance
+flips push through to ghostty (`96f2197`). Remaining gaps are
+`magnify:` and `quickLook:` — neither user-blocking.
 
-One **known regression** carries over: Cmd+Tab away from djinn lands
-on the wrong app (the pre-djinn frontmost, not the user's pick). Four
-attempts at fixing it landed this session and none worked; suspected
-cause is the macOS 14+ `activateWithOptions:` throttle. See "Cmd+Tab
-focus restoration" under Open work for the chronology.
+One **known regression**: Cmd+Tab away from djinn lands on the wrong
+app (the pre-djinn frontmost, not the user's pick). Suspected cause
+is the macOS 14+ `activateWithOptions:` throttle. See "Cmd+Tab focus
+restoration" under Open work.
 
 ## Open work — pick from here
 
@@ -57,7 +55,7 @@ silently dropped. macOS's own deactivation cascade (Accessory app
 loses last visible window → falls back to "previous regular app")
 runs uncontested and picks the pre-djinn frontmost.
 
-What we tried this session (commits `c51587b 139b2ee bc5e129 0106a9f`):
+Attempts so far (commits `c51587b 139b2ee bc5e129 0106a9f`):
 
 1. Skip `activateAppByPid(prev_app_pid)` on the blur path —
    no help; cascade still picks prev app.
@@ -175,7 +173,7 @@ Mostly window-manager actions (new_window, new_tab, toggle_fullscreen)
 that don't apply to a Quake-drop panel. **Skip** — listed so nobody
 re-litigates.
 
-## Recently shipped — this session
+## Recently shipped
 
 ### Visible profile UI
 - **Tab strip** (`9752269`) — DjinnTabStrip subclass paints one chip
@@ -188,7 +186,7 @@ re-litigates.
   appends " · {profile.label}" when more than one profile exists;
   refreshes on every `activateSession`.
 
-### Input bridge — Tier-5 audit fixes
+### Input bridge fixes
 - **Font zoom** (`ed8ae89`) — Cmd++ / Cmd+- / Cmd+0 forward to
   ghostty as `increase_font_size:1` etc.; previously mutated only
   host-side `app.g.font_size` so the surface kept boot size.
@@ -217,10 +215,9 @@ re-litigates.
 
 ### Panel UX fixes
 - **Blur-hide split + deferred hide** (`c51587b 139b2ee bc5e129
-  0106a9f`) — chain of attempts at the Cmd+Tab focus-restoration
-  bug. All four landed but the bug is still unresolved on macOS
-  14+; see "Cmd+Tab focus restoration" under Open work for the
-  full chronology and what to try next.
+  0106a9f`) — attempts at the Cmd+Tab focus-restoration bug. All
+  four landed but the bug remains unresolved on macOS 14+; see
+  "Cmd+Tab focus restoration" under Open work.
 - **NSNotificationCenter observer guarded** (`ff92da9`) — comment
   claimed setHideOnBlur was idempotent but every config reload
   re-added the observer. Add `g_blur_observer_registered` flag.
@@ -246,45 +243,17 @@ re-litigates.
   full-mode key releases + force-touch pressure both reach the
   surface now. `magnify:` + `quickLook:` deferred (see Open work).
 
-## Tier-5 ship notes (kept for context)
-
-The migration commits + the gnarly bits worth remembering:
-
-### Step 7 — PTY ownership (`797cad9`)
-`surface_config.command` owns the child. Pty.spawn gated on backend,
-then dropped entirely in step 10. Provider override (`claude`,
-`codex`, …) flows in as a NUL-terminated argv[0] heap-duped to C.
-
-### Step 8 — host action handlers (`81972ff`)
-8 ghostty action callbacks gain real host work: desktop_notification
-→ Notifier, mouse_shape → NSCursor, mouse_visibility → NSCursor
-hide/unhide, mouse_over_link → pointing hand, secure_input →
-EnableSecureEventInput, set_title / set_tab_title → logged, pwd
-→ logged.
-
-### Step 9 — config bridging (`6931e15`)
-`theme.resolve` queries the live `ghostty_config_t` via
-`ghostty_config_get` instead of re-parsing `~/.config/ghostty/config`.
-Same Config the surface uses.
-
-### Step 10 — retire CG/Metal renderer + vt parser (-4344 LOC)
-Stage A: `render/atlas|metal|scene.zig` deleted (~1500 LOC).
-Stage B: `drawRectImpl` + glyph caches + prewarm + flushGlyphRun
-deleted. `pty.zig` + `terminal.zig` (vt-static wrapper) deleted.
-view.zig: 2879 → 1578.
-
-### Critical fix — `wakeup_cb` (`acd7280`)
-Wires `ghostty_app_tick` on the main queue. Without it ghostty's IO
-mailbox events stall (child_exited, OSC actions, render hints never
-fire).
-
 ## Ghostty dependency boundary
 
-djinn links the **full libghostty** (surface API). vt-static is gone.
+djinn links the **full libghostty** (surface API).
 `patches/ghostty-001-darwin-install.patch` +
 `scripts/apply-ghostty-patch.sh` make `dep.artifact("ghostty")`
 resolve on macOS; `scripts/build.sh` applies the patch and unsets
 nix's Apple SDK env vars.
+
+The `wakeup_cb` (`acd7280`) wires `ghostty_app_tick` on the main
+queue — without it ghostty's IO mailbox events stall (child_exited,
+OSC actions, render hints never fire).
 
 ## Style / code-health (kept current)
 
@@ -360,17 +329,3 @@ nix's Apple SDK env vars.
   more than once. Look for the second trigger (FSEvent reload here)
   to estimate severity.
 
-## Memory bank
-
-- `djinn_direction.md` — product thesis
-- `djinn_v0_problems.md` — what we ripped out and why
-- `djinn_rewrite_plan.md` — phase-by-phase plan
-- `djinn_dev_shell.md` — flake quirks
-- `djinn_zig_015_pitfalls.md` — fcntl, posix.O packed struct
-- `djinn_shell_default.md` — never trust $SHELL from a dev shell
-- `djinn_nsview_layer_backing.md` — drawRect must always paint full
-  area on modern macOS (note: drawRect retired in step 10; kept for
-  historical context)
-- `djinn_theme_autoswitch.md` — needs `theme = light:X,dark:Y` form
-- `djinn_cold_start.md` — cold-start performance map
-- `djinn_ghostty_full_lib_patch.md` — patch + script
