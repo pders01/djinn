@@ -53,3 +53,70 @@ jobs:
 
       - name: Run djinn --version
         run: ./zig-out/bin/djinn --version
+
+  bundle:
+    # Exercises the full distributable path: Metal shader compile via
+    # xcrun, install_name_tool rpath rewrite, plist version
+    # interpolation, ad-hoc codesign. release.yml uses the same step,
+    # so a green job here means a tag push will publish.
+    runs-on: macos-15
+    timeout-minutes: 45
+    needs: test
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.15.2
+
+      - name: Install Metal Toolchain
+        # ghostty's renderer compiles `.metal` shaders via xcrun ->
+        # metal. Not part of base Xcode on the runner image.
+        run: sudo xcodebuild -downloadComponent MetalToolchain
+
+      - name: Cache zig packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build signed Djinn.app (ad-hoc)
+        run: ./scripts/build.sh bundle-sign
+
+      - name: Verify bundle metadata
+        run: |
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+            zig-out/Djinn.app/Contents/Info.plist
+          codesign --verify --verbose=2 zig-out/Djinn.app
+
+      - name: Verify dylib linkage
+        # otool confirms install_name_tool rewrote LC_LOAD_DYLIB to
+        # @rpath/libghostty.dylib and the LC_RPATH list includes
+        # @loader_path. dyld eagerly loads all LC_LOAD_DYLIB entries
+        # at process start, so `--version` failing here means rpath
+        # is broken even though the path doesn't touch libghostty
+        # symbols directly.
+        run: |
+          otool -L zig-out/Djinn.app/Contents/MacOS/djinn | grep -q '@rpath/libghostty.dylib' \
+            || { echo "::error::libghostty not linked via @rpath"; exit 1; }
+          otool -l zig-out/Djinn.app/Contents/MacOS/djinn | grep -A2 LC_RPATH | grep -q '@loader_path' \
+            || { echo "::error::@loader_path missing from LC_RPATH"; exit 1; }
+          zig-out/Djinn.app/Contents/MacOS/djinn --version
+
+      - name: Zip bundle
+        run: |
+          cd zig-out
+          zip -r -y "Djinn-${GITHUB_SHA::7}-${{ runner.arch }}.zip" Djinn.app
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Djinn-${{ github.sha }}-${{ runner.arch }}
+          path: zig-out/Djinn-*.zip
+          retention-days: 14
+          if-no-files-found: error
