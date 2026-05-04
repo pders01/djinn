@@ -95,6 +95,9 @@ pub fn updateSearchCountLabel() void {
     const NSAttributedString = objc.getClass("NSMutableAttributedString") orelse return;
     const root_alloc = NSAttributedString.msgSend(objc.Object, "alloc", .{});
     const root = root_alloc.msgSend(objc.Object, "init", .{});
+    // alloc/init owned by us; setAttributedStringValue copies the
+    // string into the field's cell, so we release after the set.
+    defer root.msgSend(void, "release", .{});
 
     // Format mirrors log-entry headers (`{client} · {hh:mm}`) — middle
     // dot separators, dim accent text, fg body. Same idiom, different
@@ -159,7 +162,12 @@ fn appendFindRun(root: objc.Object, text: []const u8, color: chrome_mod.Rgb, sty
     // NSCenterTextAlignment = 2. NSTextField paints the cell vertically
     // centered already; horizontal center keeps the chip balanced even
     // when needle length changes (no jitter).
+    //
+    // `alloc/init` returns +1 retain owned by us; the dict retains on
+    // insert. release after balances the +1 so para's lifetime tracks
+    // the dict's.
     const para = NSParagraphStyle.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "init", .{});
+    defer para.msgSend(void, "release", .{});
     para.msgSend(void, "setAlignment:", .{@as(c_long, 2)});
 
     const fg_key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "NSColor")});
@@ -175,6 +183,7 @@ fn appendFindRun(root: objc.Object, text: []const u8, color: chrome_mod.Rgb, sty
 
     const attr_alloc = NSAttributedString.msgSend(objc.Object, "alloc", .{});
     const attr = attr_alloc.msgSend(objc.Object, "initWithString:attributes:", .{ ns_text, dict });
+    defer attr.msgSend(void, "release", .{});
     root.msgSend(void, "appendAttributedString:", .{attr});
 }
 

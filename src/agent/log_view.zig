@@ -281,7 +281,11 @@ pub const LogView = struct {
 
         // header rows pack tight against their body; body adds breathing
         // room before the next entry. spacer is just the trailing \n.
+        // alloc/init returns a +1 retain owned by us; the dict will
+        // retain on insert. `release` after the dict construction
+        // balances the +1 so para's lifetime tracks the dict's.
         const para = NSParagraphStyle.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "init", .{});
+        defer para.msgSend(void, "release", .{});
         switch (kind) {
             .header => {
                 // 4pt gap below the `{client} · HH:MM` header so the
@@ -319,11 +323,14 @@ pub const LogView = struct {
             .{ &objects, &keys, @as(c_ulong, 3) },
         );
 
+        // alloc/init owned by us; textStorage retains on append. Our
+        // release balances the +1 so attr's lifetime tracks textStorage.
         const attr = NSAttributedString.msgSend(objc.Object, "alloc", .{}).msgSend(
             objc.Object,
             "initWithString:attributes:",
             .{ ns_text, dict },
         );
+        defer attr.msgSend(void, "release", .{});
 
         const storage = self.text_view.msgSend(objc.Object, "textStorage", .{});
         storage.msgSend(void, "appendAttributedString:", .{attr});
