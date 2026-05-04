@@ -151,9 +151,15 @@ pub fn build(b: *std.Build) void {
     bundle_step.dependOn(&bundle_plist.step);
     bundle_step.dependOn(&bundle_icon.step);
 
-    // Ad-hoc codesign so Gatekeeper accepts launches from the bundle.
-    // Runs after install_name_tool so the signature covers the rpath fix.
-    const sign_cmd = b.addSystemCommand(&.{ "codesign", "--force", "--sign", "-", "--deep" });
+    // codesign-bundle.sh probes login.keychain for a stable
+    // self-signed identity (`DjinnLocalDev`, created by
+    // `scripts/dev-cert-create.sh`) and uses it if present, else falls
+    // back to ad-hoc. The stable identity keeps the bundle's
+    // designated requirement constant across rebuilds, so TCC's
+    // Accessibility + Input Monitoring grants persist instead of
+    // burning on every install-app. Runs after install_name_tool so
+    // the signature covers the rpath fix.
+    const sign_cmd = b.addSystemCommand(&.{"scripts/codesign-bundle.sh"});
     sign_cmd.addArg(b.pathJoin(&.{ b.install_path, "Djinn.app" }));
     sign_cmd.step.dependOn(bundle_step);
 

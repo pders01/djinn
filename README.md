@@ -136,6 +136,41 @@ Once the bundle is in `~/Applications`:
 
 The CLI flags wrap `SMAppService.mainAppService` and only work from a code-signed bundle home — running the raw `./zig-out/bin/djinn` will return `error.OperationFailed`. Disable with `--login-item-disable` or via `system.open_at_login = false` in the config.
 
+### Stable signing identity (one-shot)
+
+By default every `install-app` re-signs ad-hoc, which produces a fresh cdhash and burns TCC's Accessibility / Input Monitoring grants — the hotkey silently stops working until you reset + re-grant. To keep grants across rebuilds without paying for a Developer ID:
+
+```sh
+just dev-cert
+```
+
+Generates a self-signed code-signing certificate (`DjinnLocalDev`) in your login keychain, marks it trusted-for-code-signing locally, and wires it into the bundle codesign step. The bundle's designated requirement (`identifier "com.pders01.djinn" and certificate leaf = H"…"`) then stays constant across rebuilds, so TCC matches subsequent builds as the same app and preserves grants.
+
+Idempotent — re-running detects the existing identity and skips. The cert is local-only; it doesn't pass Gatekeeper notarization and isn't a substitute for a paid Developer ID for distribution. Solo iteration only.
+
+### If it's stuck
+
+Symptoms: hotkey does nothing, panel never appears, or the running djinn keeps the old binary loaded.
+
+If you've run `just dev-cert`, the cdhash-driven grant churn shouldn't happen. If it does:
+
+```sh
+killall djinn                                # drop the running instance
+tccutil reset All com.pders01.djinn          # clear stale TCC grants
+just deploy                                  # rebuild bundle + sign + install + open
+```
+
+If you haven't run `just dev-cert`, every `install-app` will keep burning grants. Run it once and avoid the dance.
+
+Standalone steps for inspection between stages:
+
+```sh
+nix develop --command bash -c './scripts/build.sh install-app'   # rebuild only
+open ~/Applications/Djinn.app                                    # re-launch
+```
+
+After the next launch following a TCC reset, macOS prompts for Accessibility — grant it, re-launch, the hotkey is live.
+
 ## Wiring an agent
 
 djinn writes its MCP endpoint info on startup to:

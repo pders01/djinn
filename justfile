@@ -58,14 +58,23 @@ profile duration="10":
 tcc-reset:
     tccutil reset All com.pders01.djinn
 
+# One-shot install of a stable self-signed code-signing identity in the
+# user's login keychain. Re-running is safe; a present + valid identity
+# short-circuits. After this, every `install-app` rebuilds with a stable
+# designated requirement so TCC grants persist instead of burning on
+# each cdhash change.
+dev-cert:
+    ./scripts/dev-cert-create.sh
+
 # Smoke loop: build + test in one shot.
 check: build test
 
-# One-shot deploy: reset TCC grants (cdhash about to change), build +
-# sign + rsync the bundle, launch via `open` so LaunchServices brings
-# the menubar item up. macOS will re-prompt for Accessibility on the
-# first hotkey press — grant and re-launch.
-deploy: tcc-reset install-app
+# One-shot deploy: build + sign + rsync the bundle, launch via `open`.
+# When `dev-cert` has been run, the bundle's designated requirement
+# stays stable across rebuilds — so this no longer needs to reset TCC
+# every time. First launch still prompts for Accessibility; subsequent
+# launches skip the prompt.
+deploy: install-app
     open ~/Applications/Djinn.app
 
 # Print the active toolchain wrapper (`bash -c` vs `nix develop ... bash -c`).
