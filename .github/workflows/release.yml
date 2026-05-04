@@ -40,10 +40,18 @@ jobs:
 
       - name: Ensure Metal Toolchain
         # ghostty's renderer compiles `.metal` shaders via xcrun -> metal.
-        # macos-15 runners ship Metal Toolchain pre-installed in most
-        # Xcode versions; probe for the compiler before falling back to
-        # `-downloadComponent` (which only exists on Xcode 15.3+).
+        # macos-15 runners ship multiple Xcode versions; the default
+        # selection via `xcode-select -p` is sometimes pinned to an
+        # older release that pre-dates `-downloadComponent`
+        # (Xcode 15.3+). Explicitly switch to the newest installed
+        # Xcode before probing so the toolchain download path actually
+        # works when Metal compiler is missing.
         run: |
+          newest_xcode=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
+          if [ -n "$newest_xcode" ]; then
+            echo "Selecting $newest_xcode"
+            sudo xcode-select -s "$newest_xcode"
+          fi
           if xcrun --find metal >/dev/null 2>&1; then
             echo "Metal compiler at $(xcrun --find metal)"
           else
