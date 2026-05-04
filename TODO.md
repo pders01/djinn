@@ -12,30 +12,54 @@ agent state surface, hotkey, menubar, log pane, drag-drop,
 find-overlay UI, an action keymap, a SessionManager, and a
 multi-profile tab strip + Cmd+Shift+P palette switcher on top.
 
-Every NSResponder method djinn needs is overridden + forwarded to
-ghostty (right / middle / hover / focus / modifier-only / Y-flip /
-scroll precision / keyUp / pressureChange). Clipboard write/read
-wired through ghostty's callbacks (`df6923f`); system appearance
-flips push through to ghostty (`96f2197`). Remaining gaps are
-`magnify:` and `quickLook:` — neither user-blocking.
+NSResponder coverage is complete (right / middle / hover / focus /
+modifier-only / Y-flip / scroll precision / keyUp / pressureChange).
+Clipboard write/read flows through ghostty's callbacks; system
+appearance flips push to ghostty + reload its config from disk.
+Cmd+Tab focus restoration on macOS 14+ is fixed via
+`setHidesOnDeactivate:` + dropping `setFloatingPanel:1`.
+
+Profile scripts (`profile.<name>.script = path`) let users construct
+the agentic shell with arbitrary bash; the script `exec`s the agent
+at the end, and djinn validates existence + execute-bit at startup.
+
+`just dev-cert` installs a stable self-signed codesign identity in
+the user's login keychain so every `install-app` keeps TCC grants
+across rebuilds. Local iteration no longer needs `tccutil reset`.
 
 ## Open work — pick from here
 
-### Per-profile env vars *(deferred from v1 spec)*
+### Restart current session / drop to shell *(asked, not started)*
 
-Config grammar already accepts `profile.<name>.<field>` with fields
-{provider, command, cwd, title}. Add an env namespace:
+When the script-spawned child exits (Pi exits, agent crashes, user
+runs `exit`), ghostty currently shows "Process exited. Press any key
+to close the terminal." There's no in-app path to re-spawn the same
+profile or fall back to a plain shell.
+
+Sketch:
+- `restart_session` action — frees `app.g.session_manager.active().surface`
+  via `ghostty_surface_free`, then re-runs the spawn path against the
+  same `Session.surface_host` NSView. Bind to `Cmd+R` by default.
+- `shell_session` action — same path but overrides command to
+  `/bin/zsh` for the current session. Bind to `Cmd+Shift+R`.
+- Trickiest part: dispatching the re-spawn on the main queue after
+  `surface_free` returns — ghostty's IO mailbox needs a runloop turn
+  to unwind before a fresh surface binds to the same NSView.
+
+### Per-profile env vars *(low priority — script subsumes)*
+
+`profile.<name>.script` already lets users export env vars before
+`exec`'ing the agent, so this is no longer blocking. Still nice to
+have for declarative configs that don't want a shell layer:
 
 ```
 profile.main.env.OPENAI_API_KEY = sk-...
-profile.main.env.ANTHROPIC_API_KEY = sk-...
 ```
 
 Parse via `applyProfileKey` — when `field` starts with `env.`, append
 to a `[]const struct { k: []const u8, v: []const u8 }` on the entry.
 Spawn path: pass through to ghostty via `surface_config_s.env_*`
-(check ghostty.h for the exact slot — there's a `_count` + `_pairs`
-pattern for repeating fields).
+(`_count` + `_pairs` pattern in ghostty.h).
 
 ### Dynamic profile creation *(deferred — needs config writeback)*
 
@@ -54,21 +78,13 @@ is the natural place to surface a "+ New profile…" affordance.
 
 ### Lower-priority NSResponder gaps *(audit residue)*
 
-Surfaced by the post-alpha input bridge audit; `keyUp:` +
-`pressureChange:` shipped in `078aa9c`. Remaining:
-
-- `magnify:` — pinch-to-zoom font size. ghostty.app itself
-  doesn't override this on macOS; would have to invent the host
-  side (accumulator over `event.magnification` deltas, threshold
-  before firing `increase_font_size:1` / `decrease_font_size:1`).
-  Skip until users ask.
+- `magnify:` — pinch-to-zoom font size. ghostty.app itself doesn't
+  override this; would need a host-side accumulator over
+  `event.magnification` deltas. Skip until users ask.
 - `quickLook:` — three-finger-tap dictionary lookup over the
   selection. Needs CTFont attribute dict + NSAttributedString
-  presentation chain; ghostty exposes
-  `ghostty_surface_quicklook_word` + `ghostty_surface_quicklook_font`
-  but the macOS-side popover assembly is non-trivial. Mirror
-  ghostty.app's `quickLook(with:)` (SurfaceView_AppKit.swift:1438)
-  if this lands.
+  presentation. Mirror ghostty.app's `quickLook(with:)`
+  (SurfaceView_AppKit.swift:1438) if this lands.
 
 ### Per-call log expansion *(deferred — speculative)*
 
@@ -98,13 +114,14 @@ Surface child behavior post-system-sleep is untested. Should be
 ghostty's problem (we don't own the PTY or render pump), but worth
 opening the panel after a sleep cycle. No automation path.
 
-### TCC churn *(blocked on Developer ID signing)*
+### TCC for distribution *(blocked on Developer ID signing)*
 
-Every `install-app` rebuild burns Accessibility + PostEvent grants
-because the cdhash changes. Workaround: `just tcc-reset` (or `just
-deploy` which chains it). Real fix: Developer ID certificate +
-notarytool flow in `release.yml`. Needs paid Apple Developer account
-($99/yr) — out of scope for the alpha.
+Local iteration is fixed via `just dev-cert`. For *redistribution*
+(handing the bundle to another user), they'd hit the same cdhash
+churn on each new release: TCC matches on certificate leaf hash, not
+on the act of signing. Real fix for shipping: Developer ID
+certificate + notarytool flow in `release.yml`. Needs paid Apple
+Developer account ($99/yr) — out of scope for the alpha.
 
 ### Pure-nix package build *(blocked on Metal Toolchain access)*
 
@@ -122,75 +139,92 @@ Mostly window-manager actions (new_window, new_tab, toggle_fullscreen)
 that don't apply to a Quake-drop panel. **Skip** — listed so nobody
 re-litigates.
 
-## Recently shipped
+## Recently shipped — current session
 
-### Visible profile UI
-- **Tab strip** (`9752269`) — DjinnTabStrip subclass paints one chip
-  per profile inline, no per-tab NSView; click maps x → idx →
-  `activateSession(idx)`. Auto-hides for single-profile setups.
-- **Palette switcher** (`ab9b18e`) — Cmd+Shift+P modal overlay,
-  type-to-filter, Up/Down to move, Return to switch, Esc to dismiss.
-  Owns input via `app.g.palette_mode` (same idiom as `find_mode`).
-- **Active-profile indicator** (`94bdc63`) — dropdown subtitle
-  appends " · {profile.label}" when more than one profile exists;
-  refreshes on every `activateSession`.
+### Cmd+Tab focus restoration
+- **`setHidesOnDeactivate:` for blur-hide** — replaces the
+  cross-app-activate dance that fought macOS 14+'s throttle. djinn
+  deactivates as a *consequence* of the user's target activating, so
+  no cascade fires.
+- **Drop `setFloatingPanel:1`** — floating panels keep app key state
+  across cross-window focus shifts (tool-palette idiom), which
+  prevented `windowDidResignKey` from firing on Cmd+Tab.
+- **`Panel.hide` skips prev-app restore when user navigated away** —
+  guard via `NSApp.isActive` (not `NSWorkspace.frontmostApplication`,
+  which never reports an Accessory app as frontmost).
 
-### Input bridge fixes
-- **Font zoom** (`ed8ae89`) — Cmd++ / Cmd+- / Cmd+0 forward to
-  ghostty as `increase_font_size:1` etc.; previously mutated only
-  host-side `app.g.font_size` so the surface kept boot size.
-- **Mouse Y-flip + scroll mods** (`d6adf03`) — `mouse_pos` now
-  sends `frame.height - local.y` (ghostty wants top-down);
-  `scroll_mods` byte encodes precision + momentum so trackpad
-  pixel deltas don't get treated as line counts.
-- **Right + middle mouse** (`bee065b`) — register `rightMouse*`
-  + `otherMouse*`, factor through `forwardMouseButton` /
-  `forwardMousePos` helpers. Mouse-tracking apps (tmux, vim, htop)
-  see secondary buttons.
-- **Focus state** (`6a474f5`) — override `becomeFirstResponder` /
-  `resignFirstResponder` to call `surfaceSetFocus`. Affects cursor
-  blink + focus-event reports (`\e[I` / `\e[O`).
-- **flagsChanged** (`1c660d9`) — modifier-only press/release
-  forwarded via `ghostty_surface_key`; required for Cmd-hover
-  hyperlink detection. Mirrors ghostty.app's side-specific
-  NX_DEVICER*KEYMASK logic.
-- **Hover** (`0e93bf2`) — NSTrackingArea registered with
-  `.mouseEnteredAndExited | .mouseMoved | .inVisibleRect |
-  .activeAlways`. `mouseEntered` re-pushes pos; `mouseExited`
-  sends (-1, -1) only when no button is held.
-- **Occlusion** (`1f26a27`) — Panel.show/hide call
-  `surfaceSetOcclusion(true/false)` so the surface throttles
-  CADisplayLink while the panel is offscreen.
+### Profile scripts
+- **`profile.<name>.script`** points at an executable shell script;
+  djinn passes the path to ghostty as the PTY command. Script must
+  `exec` the agent at the end.
+- Spawn precedence: `script > command > provider shortcut > /bin/zsh`.
+- `SessionManager.resolveScript` expands `~/`, validates existence +
+  execute bit; on failure logs a warning and falls through to the
+  next layer.
 
-### Panel UX fixes
-- **Blur-hide split + deferred hide** (`c51587b 139b2ee bc5e129
-  0106a9f`) — attempts at the Cmd+Tab focus-restoration bug. All
-  four landed but the bug remains unresolved on macOS 14+; see
-  "Cmd+Tab focus restoration" under Open work.
-- **NSNotificationCenter observer guarded** (`ff92da9`) — comment
-  claimed setHideOnBlur was idempotent but every config reload
-  re-added the observer. Add `g_blur_observer_registered` flag.
-- **Theme override survives reload** (`58dfa95`) — `App.init`
-  layered `writeAppearanceThemeOverride` before finalize but
-  `reloadConfigFromDisk` skipped it; dual-theme users reverted to
-  LIGHT on every config save. Mirror init's path.
+### Chrome polish
+- **Single border tone**: `chip.border = mix(bg, black, 0.2)`.
+  Tracks ghostty's split-divider tone (sampled #151824 against
+  #1a1b26 bg). All four host surfaces (find chip, log pane, tab
+  strip, palette) use this token.
+- **Chrome typography**: `chrome.chromeFont` returns the system UI
+  font (San Francisco, medium weight). Caps at 13pt for log entries,
+  12pt for chips so chrome stays subordinate to terminal output
+  regardless of theme font size.
+- **Layout chrome = surface bg, overlay chrome = chip bg**: tab strip
+  + log pane fill `style.bg` (no seam against terminal column);
+  find chip + palette switcher fill `chip.bg` (lifted, with 1px
+  chip.border outline).
+- **Per-group hairline divider in the log pane** (`─` × N) above
+  each new-client header. Single-client streams stay clean.
+- **Tab labels left-aligned** with 12pt inset — stable horizontal
+  position across active/inactive font swaps.
+- **Divider between terminal + log pane is now a transparent
+  hit-target** — the prior white@5% fill produced a dark fringe
+  next to the log pane's chip.border separator on translucent
+  panels.
 
-### Theme + clipboard
-- **System appearance pushed to ghostty** (`96f2197`) — closes
-  the runtime appearance change loop. `viewDidChangeEffectiveAppearance`
-  → `reapplyTheme` now also calls `appSetColorScheme` +
-  `reloadConfigFromDisk`, so dual-theme palettes flip with the
-  system instead of staying frozen at boot.
-- **Cmd+C / OSC 52 clipboard wired** (`df6923f`) —
-  `writeClipboardStub` was a no-op so ghostty's `copy_to_clipboard`
-  action discarded the bytes; Cmd+C from djinn looked broken. Push
-  the `text/plain` content array to NSPasteboard via
-  `setString:forType:`. Read side wired symmetrically for OSC 52.
+### Stable codesign identity
+- **`scripts/dev-cert-create.sh`** generates a self-signed cert in
+  login.keychain. OpenSSL `-legacy -macalg SHA1` PKCS12 (modern
+  AES-256/SHA-256 fails macOS's `security import`).
+- **`scripts/codesign-bundle.sh`** probes via `find-certificate`
+  (`find-identity -v` filters self-signed even though codesign
+  accepts them); falls back to ad-hoc on failure.
+- `just dev-cert` recipe + README "Stable signing identity" section.
+- TCC grants now persist across rebuilds — designated requirement
+  stays constant (`identifier "..." and certificate leaf = H"..."`).
 
-### Input bridge — extra coverage
-- **keyUp + pressureChange** (`078aa9c`) — Kitty Keyboard Protocol
-  full-mode key releases + force-touch pressure both reach the
-  surface now. `magnify:` + `quickLook:` deferred (see Open work).
+### CI fixes
+- **`mlugg/setup-zig` v1 → v2** — v1 line ended at 1.2.2 and didn't
+  recognise the newer Zig mirror tarball naming, breaking installs
+  with cascading 503/404s.
+- **Pin newest Xcode + probe `xcrun --find metal`** — runner's default
+  `xcode-select` may point at an Xcode <15.3 that rejects
+  `-downloadComponent`. Switch to `/Applications/Xcode_*.app | sort
+  -V | tail -1` first, then probe; fallback to `-downloadComponent`
+  works against the newer Xcode if the toolchain is genuinely
+  missing.
+- **`bundle` job** added to ci.yml — full distributable path
+  (Metal compile, install_name_tool rpath, ad-hoc codesign,
+  `--version` smoke) runs on every push, not just on tags.
+
+### Bug fixes from review
+- **`Panel.hide` Accessory-app guard** — see above.
+- **NSObject leaks in chrome paint loops** — `appendStyled` (log
+  pane) + `appendFindRun` / `updateSearchCountLabel` (find chip)
+  allocated `NSMutableParagraphStyle` and `NSAttributedString`
+  without `release`. Hot-path leak under streaming logs / find
+  typing. Paired `defer release` after consumer takes its retain.
+- **`resolveScript` double-free** — function-scope `errdefer
+  allocator.free(expanded)` fired on later error AFTER `owned`
+  already retained the pointer; outer init errdefer drained `owned`
+  → double-free. Replaced with explicit `catch |e| { free; return
+  e; }` at ownership-transfer point.
+- **`codesign-bundle.sh` swallowed errors** — stderr was redirected
+  to `/dev/null`, so failed signed-path runs silently fell to ad-hoc
+  with no diagnostic. TCC stability goal silently unmet. Stderr now
+  surfaces.
 
 ## Ghostty dependency boundary
 
@@ -234,8 +268,9 @@ OSC actions, render hints never fire).
 - **Stash key NSView pointers on AppState** instead of indexing
   `container.subviews[idx]`. Slots: `surface_host_id`,
   `divider_view_id`, `search_field_id`, `tab_strip_id`,
-  `palette_view_id`. Per-session surface_host pointers live on
-  `Session.surface_host` (`?*anyopaque`).
+  `tab_strip_separator_id`, `palette_view_id`. Per-session
+  surface_host pointers live on `Session.surface_host`
+  (`?*anyopaque`).
 - **NSTextFieldCell does not vertically center.** Subclass + override
   `drawInteriorWithFrame:inView:` (see `DjinnChipCell` in view.zig).
 - **`acceptsFirstMouse:` YES on borderless-panel drag controls.**
@@ -275,6 +310,41 @@ OSC actions, render hints never fire).
 - **Idempotency comments are review fuel.** When a comment promises
   "registers on first call only" but the code unconditionally
   registers, the bug stays latent until something triggers the path
-  more than once. Look for the second trigger (FSEvent reload here)
-  to estimate severity.
-
+  more than once.
+- **Accessory app + `NSWorkspace.frontmostApplication`** never
+  reports djinn itself as frontmost — workspace tracks regular
+  apps only. Use `NSApp.isActive` for "is djinn the active app"
+  questions; use `NSWorkspace.frontmostApplication` only for
+  "which OTHER app owns the menu bar".
+- **`setFloatingPanel:1`** keeps the app's key window across
+  cross-window focus shifts (tool-palette idiom). Fatal for
+  Quake-drop UX: `windowDidResignKey` never fires on Cmd+Tab,
+  so blur-driven hide never engages. Use `setLevel:` +
+  collection behavior alone for visual on-top.
+- **`setHidesOnDeactivate:`** is the right blur-hide knob on
+  Accessory apps. It sidesteps the macOS 14+ cross-app activation
+  throttle entirely — the user's target activates, djinn
+  deactivates as a consequence, panel auto-hides. No cascade.
+- **alloc/init from Zig is +1 retained**, period. There's no ARC
+  bridging; every `alloc/init` needs a `release`. `defer
+  obj.msgSend(void, "release", .{})` after the consumer takes
+  its +1 retain is the idiomatic balance. Class factory methods
+  (`stringWith…:`, `dictionaryWith…:`) return autoreleased
+  objects and don't need an explicit release.
+- **errdefer at function scope keeps firing for the whole
+  function body.** Once ownership transfers (e.g. to an
+  ArrayList), the errdefer becomes harmful — a later error in
+  the same function fires the errdefer AND the caller's drain
+  of the list → double-free. Use explicit `catch |e| { free;
+  return e; }` at the ownership-transfer site instead of relying
+  on errdefer past it.
+- **Chrome design vocabulary**: layout chrome (tab strip, log
+  pane, terminal column) shares `style.bg` — single continuous
+  surface, only chrome cue is a 1px chip.border at the seam.
+  Overlay chrome (find chip, palette switcher) uses
+  `style.chip.bg` (lifted) + 1px chip.border outline + 4px
+  corner radius — floats above the surface deliberately.
+- **Border tone is theme-derived, not hardcoded**:
+  `chip.border = mix(bg, black, 0.2)`. Tracks ghostty's
+  split-divider hairline tone across all themes; pure-black mix
+  is the only theme-invariant way to "go darker than bg by N%".
