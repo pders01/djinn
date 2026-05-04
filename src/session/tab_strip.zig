@@ -10,10 +10,9 @@ const objc = @import("objc");
 const app = @import("../app.zig");
 const chrome = @import("../chrome.zig");
 
-/// Strip height in points. Sized to comfortably fit the chip font
-/// (~11pt) with a few px breathing room top + bottom; matches the
-/// log-pane "ACTIVITY" header band visually.
-pub const tab_h: f64 = 22;
+/// Strip height in points. Matches the find chip's 24pt height so
+/// every floating chrome surface sits on the same vertical metric.
+pub const tab_h: f64 = 24;
 
 const NSPoint = extern struct { x: f64, y: f64 };
 const NSSize = extern struct { width: f64, height: f64 };
@@ -37,7 +36,42 @@ pub fn create(width: f64, container_h: f64) objc.Object {
     // NSViewMinYMargin (1<<5) + NSViewWidthSizable (1<<1).
     view.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, (1 << 1) | (1 << 5))});
     view.msgSend(void, "setWantsLayer:", .{@as(c_int, 1)});
+
+    // Bottom hairline as a CALayer-backed subview pinned to the
+    // bottom edge. Same construction as `LogView`'s left separator
+    // so both surfaces' borders render through identical paint paths
+    // — sharp 1px on @1x, 2 device pixels on @2x, no antialias drift
+    // from `NSBezierPath.fillRect` rounding.
+    const NSView = objc.getClass("NSView") orelse return view;
+    const sep_alloc = NSView.msgSend(objc.Object, "alloc", .{});
+    const sep = sep_alloc.msgSend(objc.Object, "initWithFrame:", .{NSRect{
+        .origin = .{ .x = 0, .y = 0 },
+        .size = .{ .width = width, .height = 1 },
+    }});
+    sep.msgSend(void, "setWantsLayer:", .{@as(c_int, 1)});
+    // NSViewWidthSizable (1<<1) + NSViewMaxYMargin (1<<5) — pinned
+    // to the bottom edge under live resize. drawRect's `isFlipped`
+    // doesn't affect autoresizing math; that uses parent-relative
+    // bottom-up coords.
+    sep.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, 1 << 1)});
+    app.g.tab_strip_separator_id = sep.value;
+    view.msgSend(void, "addSubview:", .{sep});
+
     return view;
+}
+
+/// Re-skin the bottom hairline. Called from `reapplyTheme` so the
+/// strip's border tracks chip.border across appearance flips.
+pub fn applyStyle(style: chrome.Style) void {
+    const sid = app.g.tab_strip_separator_id orelse return;
+    const NSColor = objc.getClass("NSColor") orelse return;
+    const sep = objc.Object.fromId(sid);
+    const sep_layer = sep.msgSend(objc.Object, "layer", .{});
+    if (sep_layer.value != null) {
+        const ns = chrome.nsColorFromRgb(NSColor, style.chip.border);
+        sep_layer.msgSend(void, "setBackgroundColor:", .{ns.msgSend(?*anyopaque, "CGColor", .{})});
+    }
+    refresh();
 }
 
 /// Schedule a redraw — call after the active index changes so the
@@ -81,9 +115,11 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
     const NSDictionary = objc.getClass("NSDictionary") orelse return;
     const NSMutableDictionary = objc.getClass("NSMutableDictionary") orelse return;
 
-    // Strip background: same fill as the log pane / chip bg so the
-    // strip reads as part of the chrome family, not a separate band.
-    const bg = chrome.nsColorFromRgb(NSColor, style.chip.bg);
+    // Strip background: terminal bg, same as the surface below.
+    // The strip recedes into the panel surface; the only chrome
+    // affordance left is the label color contrast (fg vs chip.dim)
+    // and the bottom hairline marking the strip/surface boundary.
+    const bg = chrome.nsColorFromRgb(NSColor, style.bg);
     bg.msgSend(void, "set", .{});
     NSBezierPath.msgSend(void, "fillRect:", .{bounds});
 
@@ -94,26 +130,15 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
     const font_key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "NSFont")});
     const fg_key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "NSColor")});
 
+    // Minimal indicator: shared chip.bg for the whole strip; active
+    // vs inactive carried entirely by label color (fg vs chip.dim).
+    // No fills, no underlines — the strip recedes into chrome and
+    // the active tab reads via contrast alone. Same idiom as the log
+    // pane's per-entry header (`{client} · HH:MM` in dim, body in fg).
     for (sm.sessions, 0..) |sess, i| {
         const x = @as(f64, @floatFromInt(i)) * tab_w;
-        const tab_rect = NSRect{
-            .origin = .{ .x = x, .y = 0 },
-            .size = .{ .width = tab_w, .height = bounds.size.height },
-        };
-
         const is_active = i == sm.active_idx;
-        if (is_active) {
-            // Active tab: lifted bg matches terminal area (pulls the
-            // active tab forward of the strip background). 30% darker
-            // than chip.bg so it reads as a distinct surface; using
-            // theme bg directly bleeds into the terminal area below.
-            const active_bg = chrome.nsColorFromRgb(NSColor, style.bg);
-            active_bg.msgSend(void, "set", .{});
-            NSBezierPath.msgSend(void, "fillRect:", .{tab_rect});
-        }
 
-        // Text attributes: active uses fg, inactive uses dim. Built
-        // per-tab so the color can swap without retaining attr dicts.
         const text_color = chrome.nsColorFromRgb(NSColor, if (is_active) style.fg else style.chip.dim);
         const attrs = NSMutableDictionary.msgSend(objc.Object, "dictionaryWithCapacity:", .{@as(c_ulong, 2)});
         attrs.msgSend(void, "setObject:forKey:", .{ font, font_key });
@@ -124,15 +149,17 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
         const z_label = std.fmt.bufPrintZ(&name_buf, "{s}", .{label}) catch continue;
         const ns_label = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, z_label.ptr)});
 
-        // Measure to center horizontally + vertically inside the tab.
         const text_size = ns_label.msgSend(NSSize, "sizeWithAttributes:", .{attrs});
         const text_x = x + (tab_w - text_size.width) / 2.0;
         const text_y = (bounds.size.height - text_size.height) / 2.0;
-        const text_pt = NSPoint{ .x = text_x, .y = text_y };
-        ns_label.msgSend(void, "drawAtPoint:withAttributes:", .{ text_pt, attrs });
+        ns_label.msgSend(void, "drawAtPoint:withAttributes:", .{ NSPoint{ .x = text_x, .y = text_y }, attrs });
 
         _ = NSDictionary; // keep import live for future attribute dicts
     }
+
+    // Bottom hairline is a CALayer-backed subview created in
+    // `create()` so it shares the log pane's separator paint path.
+    // Color is set on applyStyle + refreshed on theme reload.
 }
 
 fn mouseDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {

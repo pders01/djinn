@@ -562,14 +562,11 @@ pub fn createDivider(term_w: f64, height: f64) objc.Object {
         .size = .{ .width = divider_width, .height = height },
     }});
     div.msgSend(void, "setWantsLayer:", .{@as(c_int, 1)});
-    const NSColor = objc.getClass("NSColor") orelse return div;
-    const div_color = NSColor.msgSend(objc.Object, "colorWithSRGBRed:green:blue:alpha:", .{
-        @as(f64, 1.0), @as(f64, 1.0), @as(f64, 1.0), @as(f64, 0.05),
-    });
-    const layer = div.msgSend(objc.Object, "layer", .{});
-    if (layer.value != null) {
-        layer.msgSend(void, "setBackgroundColor:", .{div_color.msgSend(?*anyopaque, "CGColor", .{})});
-    }
+    // Divider is a transparent hit-target — the visible boundary
+    // between terminal + log pane is the log pane's 1px chip.border
+    // separator. Painting the divider with white@5% alpha left a
+    // white-tinted fringe next to the chrome border on translucent
+    // panels.
     // MinXMargin | HeightSizable — divider tracks its x relative to the
     // right edge as the panel resizes.
     div.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, (1 << 0) | (1 << 4))});
@@ -2120,6 +2117,7 @@ fn reapplyTheme() void {
     app.g.chrome_style = new_style;
     if (app.g.log_view) |lv| lv.applyStyle(new_style);
     applyFindOverlayStyle(new_style);
+    @import("../session/tab_strip.zig").applyStyle(new_style);
 
     if (app.g.panel) |p| {
         const bg_r = @as(f64, @floatFromInt(new_theme.background.r)) / 255.0;

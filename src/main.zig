@@ -420,6 +420,7 @@ fn buildContainer(
         const strip = tab_strip.create(width, height);
         container.msgSend(void, "addSubview:", .{strip});
         app.g.tab_strip_id = strip.value;
+        if (app.g.chrome_style) |s| tab_strip.applyStyle(s);
     }
 
     return container;

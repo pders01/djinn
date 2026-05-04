@@ -164,6 +164,11 @@ pub const AppState = struct {
     /// otherwise. Action handlers + applyLogLayout consult this to
     /// decide whether to reserve `tab_strip.tab_h` at the top.
     tab_strip_id: ?objc.c.id = null,
+    /// Pointer to the 1px CALayer-backed subview that paints the tab
+    /// strip's bottom hairline. Stable for the strip's lifetime so
+    /// `applyStyle` can repaint it on theme flips without walking
+    /// the strip's subview list.
+    tab_strip_separator_id: ?objc.c.id = null,
     /// Stable pointer to the ghostty App so the lazy-spawn path in the
     /// session switcher can call `ga.newSurface` without re-importing
     /// the runtime module from inside view.zig.

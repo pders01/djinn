@@ -62,10 +62,17 @@ pub const Style = struct {
                     // palette[8] would clash on bright themes; this
                     // composes correctly against the lifted bg.
                     .dim = mix(chip_bg, t.foreground, 0.45),
-                    // 35% blend toward fg — enough contrast for a
-                    // 1px stroke to read on the lifted chip bg, dim
-                    // enough not to fight the body text.
-                    .border = mix(chip_bg, t.foreground, 0.35),
+                    // Darker than the surface bg so the hairline
+                    // reads as a "split divider" — same idiom
+                    // ghostty uses between split panes. 20% blend
+                    // toward black puts the border ~one shade
+                    // beneath bg without going so dark it stops
+                    // tracking the theme.
+                    //
+                    // Sampled ghostty Tokyo Night Storm:
+                    //   bg=#1a1b26  divider=#151824
+                    //   ~= mix(bg, black, 0.2) component-wise
+                    .border = mix(t.background, .{ .r = 0, .g = 0, .b = 0 }, 0.2),
                 };
             },
             .font_family = t.font_family,

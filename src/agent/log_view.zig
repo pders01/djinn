@@ -51,11 +51,12 @@ pub const LogView = struct {
         const NSFont = objc.getClass("NSFont") orelse return error.ClassNotFound;
         const NSString = objc.getClass("NSString") orelse return error.ClassNotFound;
 
-        // Single elevated bg shared with the find chip. The log pane
-        // and the chip read as one chrome family — same fill, same
-        // typography. Shape (split column vs. floating pill) does the
-        // work of distinguishing roles.
-        const ns_bg = chrome.nsColorFromRgb(NSColor, style.chip.bg);
+        // Pane background matches the terminal surface so the strip
+        // + pane + terminal column read as one continuous panel. The
+        // chrome cue is the 1px chip.border separator on the left
+        // edge — visible boundary, no bg lift to break visual flow
+        // against the tab strip above.
+        const ns_bg = chrome.nsColorFromRgb(NSColor, style.bg);
 
         const wrapper_alloc = NSView.msgSend(objc.Object, "alloc", .{});
         const wrapper = wrapper_alloc.msgSend(
@@ -144,7 +145,7 @@ pub const LogView = struct {
             .text_view = tv,
             .separator = sep,
             .font = font,
-            .bg = style.chip.bg,
+            .bg = style.bg,
             .fg = style.fg,
             .dim = style.dim,
             .border = style.chip.border,
@@ -161,7 +162,7 @@ pub const LogView = struct {
     /// colors — repainting them all would mean re-streaming the ring,
     /// which costs more than the visual mismatch is worth).
     pub fn applyStyle(self: *LogView, style: chrome.Style) void {
-        self.bg = style.chip.bg;
+        self.bg = style.bg;
         self.fg = style.fg;
         self.dim = style.dim;
         self.border = style.chip.border;
@@ -170,7 +171,7 @@ pub const LogView = struct {
         self.err_color = style.err;
 
         const NSColor = objc.getClass("NSColor") orelse return;
-        const ns_bg = chrome.nsColorFromRgb(NSColor, style.chip.bg);
+        const ns_bg = chrome.nsColorFromRgb(NSColor, style.bg);
 
         const wrapper_layer = self.view.msgSend(objc.Object, "layer", .{});
         if (wrapper_layer.value != null) {
@@ -283,21 +284,24 @@ pub const LogView = struct {
         const para = NSParagraphStyle.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "init", .{});
         switch (kind) {
             .header => {
-                para.msgSend(void, "setLineSpacing:", .{@as(f64, 1)});
-                para.msgSend(void, "setParagraphSpacing:", .{@as(f64, 0)});
+                // 4pt gap below the `{client} · HH:MM` header so the
+                // first body line breathes; without it the timestamp
+                // collides with the message.
+                para.msgSend(void, "setLineSpacing:", .{@as(f64, 0)});
+                para.msgSend(void, "setParagraphSpacing:", .{@as(f64, 4)});
             },
             .body => {
-                para.msgSend(void, "setLineSpacing:", .{@as(f64, 2)});
-                para.msgSend(void, "setParagraphSpacing:", .{@as(f64, 12)});
+                // Tight log-style rhythm — close to a real shell, just
+                // enough leading + trailing gap to keep adjacent lines
+                // distinct.
+                para.msgSend(void, "setLineSpacing:", .{@as(f64, 0)});
+                para.msgSend(void, "setParagraphSpacing:", .{@as(f64, 2)});
             },
             .spacer => {
                 para.msgSend(void, "setLineSpacing:", .{@as(f64, 0)});
                 para.msgSend(void, "setParagraphSpacing:", .{@as(f64, 0)});
             },
             .divider => {
-                // Tight rule between groups — collapses paragraph
-                // spacing both sides so the body's trailing gap +
-                // divider + header read as one visual transition.
                 para.msgSend(void, "setLineSpacing:", .{@as(f64, 0)});
                 para.msgSend(void, "setParagraphSpacing:", .{@as(f64, 4)});
                 para.msgSend(void, "setParagraphSpacingBefore:", .{@as(f64, 4)});

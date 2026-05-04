@@ -231,6 +231,22 @@ fn mountOverlay() void {
         }},
     );
     view.msgSend(void, "setWantsLayer:", .{@as(c_int, 1)});
+
+    // 1px chip.border stroke around the palette box, same idiom as
+    // find chip + log pane separator. Layer-driven so it pixel-aligns
+    // on Retina without antialias drift.
+    const NSColor = objc.getClass("NSColor") orelse return;
+    if (app.g.chrome_style) |s| {
+        const layer = view.msgSend(objc.Object, "layer", .{});
+        if (layer.value != null) {
+            layer.msgSend(void, "setCornerRadius:", .{@as(f64, 4)});
+            layer.msgSend(void, "setMasksToBounds:", .{@as(c_int, 1)});
+            layer.msgSend(void, "setBorderWidth:", .{@as(f64, 1)});
+            const border = chrome.nsColorFromRgb(NSColor, s.chip.border);
+            layer.msgSend(void, "setBorderColor:", .{border.msgSend(?*anyopaque, "CGColor", .{})});
+        }
+    }
+
     container.msgSend(void, "addSubview:", .{view});
     app.g.palette_view_id = view.value;
 }
@@ -263,8 +279,10 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
     const NSFont = objc.getClass("NSFont") orelse return;
     const NSMutableDictionary = objc.getClass("NSMutableDictionary") orelse return;
 
-    // Backdrop fill — chip bg matches the rest of djinn's chrome.
-    const bg = chrome.nsColorFromRgb(NSColor, style.chip.bg);
+    // Backdrop fill — terminal bg, matching the surface beneath. The
+    // 1px chip.border outline (set on the layer in mountOverlay) is
+    // the only chrome cue that the palette is a separate surface.
+    const bg = chrome.nsColorFromRgb(NSColor, style.bg);
     bg.msgSend(void, "set", .{});
     NSBezierPath.msgSend(void, "fillRect:", .{bounds});
 
@@ -296,9 +314,10 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
         };
         const is_selected = i == app.g.palette_selected;
         if (is_selected) {
-            // Selected row: lift to terminal bg so it pops out of the
-            // chip-bg backdrop.
-            const sel = chrome.nsColorFromRgb(NSColor, style.bg);
+            // Selected row: chip.bg lift over the surface backdrop.
+            // Inverse of the prior treatment now that the palette
+            // backdrop is the surface bg itself.
+            const sel = chrome.nsColorFromRgb(NSColor, style.chip.bg);
             sel.msgSend(void, "set", .{});
             NSBezierPath.msgSend(void, "fillRect:", .{row_rect});
         }
