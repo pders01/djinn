@@ -8,9 +8,9 @@ const Config = @import("../config.zig").Config;
 /// index; they don't reach into the spawn payload.
 pub const Profile = struct {
     name: []const u8,
-    /// Effective command to spawn. Already resolved through provider
-    /// shortcut → command mapping, so the caller hands this to ghostty
-    /// without further interpretation.
+    /// Effective command to spawn. Already resolved through the
+    /// `script` > `command` > `provider` shortcut chain, so the
+    /// caller hands this to ghostty without further interpretation.
     command: []const u8,
     /// Working directory for the spawned process. Null = inherit
     /// caller's cwd (typically $HOME after djinn's startup chdir).
@@ -47,6 +47,10 @@ pub const SessionManager = struct {
     /// Index into `sessions` for the currently visible surface. Never
     /// out of bounds — `init` ensures at least one session exists.
     active_idx: usize = 0,
+    /// Strings the manager allocated during resolve (e.g. tilde-
+    /// expanded script paths). Freed in `deinit` so callers don't
+    /// have to track each allocation separately.
+    owned_strings: std.ArrayList([]u8) = .{},
 
     /// Build a SessionManager from the parsed config. When the config
     /// declares no profiles, synthesize a single profile from the flat
@@ -55,6 +59,12 @@ pub const SessionManager = struct {
     pub fn init(allocator: std.mem.Allocator, cfg: *const Config) !SessionManager {
         var sessions = std.ArrayList(Session){};
         errdefer sessions.deinit(allocator);
+
+        var owned: std.ArrayList([]u8) = .{};
+        errdefer {
+            for (owned.items) |s| allocator.free(s);
+            owned.deinit(allocator);
+        }
 
         if (cfg.profiles.entries.len == 0) {
             // Legacy single-profile path. Synthesize "default" from the
@@ -67,13 +77,27 @@ pub const SessionManager = struct {
             });
         } else {
             for (cfg.profiles.entries) |e| {
-                // Per-profile provider / command resolution. If the
-                // profile sets `command`, use it verbatim. Else map
-                // `provider` through the same shortcut table the flat
-                // path uses (claude / codex / aider / gemini /
-                // opencode / crush / pi → exact name; anything else
-                // → /bin/zsh).
-                const cmd = if (e.command) |c| c else providerCommand(e.provider orelse "generic");
+                // Spawn-command precedence: `script` > `command` >
+                // `provider` shortcut > /bin/zsh fallback.
+                //
+                // `script` runs through resolveScript which expands a
+                // leading `~/` and verifies the file exists + has an
+                // execute bit. On failure we warn and fall through to
+                // the next layer, so a typo in a script path doesn't
+                // break the whole profile — the user still gets a
+                // working terminal.
+                const cmd = blk: {
+                    if (e.script) |s| {
+                        if (resolveScript(allocator, s, &owned)) |path| break :blk path else |err| {
+                            std.debug.print(
+                                "warning: profile '{s}' script '{s}' unusable ({}); falling back\n",
+                                .{ e.name, s, err },
+                            );
+                        }
+                    }
+                    if (e.command) |c| break :blk c;
+                    break :blk providerCommand(e.provider orelse "generic");
+                };
                 try sessions.append(allocator, .{
                     .profile = .{
                         .name = e.name,
@@ -89,6 +113,7 @@ pub const SessionManager = struct {
             .allocator = allocator,
             .sessions = try sessions.toOwnedSlice(allocator),
             .active_idx = 0,
+            .owned_strings = owned,
         };
 
         // Resolve `default-profile` into an index. Unknown names fall
@@ -107,6 +132,8 @@ pub const SessionManager = struct {
 
     pub fn deinit(self: *SessionManager) void {
         self.allocator.free(self.sessions);
+        for (self.owned_strings.items) |s| self.allocator.free(s);
+        self.owned_strings.deinit(self.allocator);
     }
 
     pub fn active(self: *SessionManager) *Session {
@@ -160,6 +187,35 @@ pub const SessionManager = struct {
         return if (self.active_idx == 0) self.sessions.len - 1 else self.active_idx - 1;
     }
 };
+
+/// Expand a leading `~/` against `$HOME`, then stat the file and
+/// verify it's executable. Returns the resolved (possibly newly
+/// allocated) path on success; the path is appended to `owned` so
+/// SessionManager.deinit can free it. On any failure (missing $HOME
+/// for tilde, file not found, not executable) returns the underlying
+/// error and the caller falls through to the next spawn-command
+/// layer.
+fn resolveScript(
+    allocator: std.mem.Allocator,
+    raw: []const u8,
+    owned: *std.ArrayList([]u8),
+) ![]const u8 {
+    const path: []const u8 = if (std.mem.startsWith(u8, raw, "~/")) blk: {
+        const home = std.posix.getenv("HOME") orelse return error.NoHome;
+        const expanded = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, raw[2..] });
+        errdefer allocator.free(expanded);
+        try owned.append(allocator, expanded);
+        break :blk expanded;
+    } else raw;
+
+    // Stat checks both existence and accessibility. The `IXUSR | IXGRP
+    // | IXOTH` mask catches "file is there but the user forgot
+    // chmod +x" — the most common script setup mistake.
+    const stat = try std.fs.cwd().statFile(path);
+    if (stat.kind != .file) return error.NotARegularFile;
+    if (stat.mode & 0o111 == 0) return error.NotExecutable;
+    return path;
+}
 
 /// Map provider name → spawn command. Mirrors `Config.getProviderCommand`'s
 /// table; broken out so SessionManager can resolve per-profile providers
@@ -263,6 +319,76 @@ test "SessionManager: switchTo / next / prev arithmetic" {
     try std.testing.expectEqualStrings("a", mgr.active().profile.name);
     try std.testing.expect(mgr.prev()); // a -> c (wrap)
     try std.testing.expectEqualStrings("c", mgr.active().profile.name);
+}
+
+test "SessionManager: script wins over command + provider" {
+    // Use the build's own zig binary as a known-executable file.
+    // Picking something stable across nix shell + host shell so the
+    // test isn't sensitive to which env runs it.
+    const tmp_path = try makeTempExecutable(std.testing.allocator);
+    defer std.testing.allocator.free(tmp_path);
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const entries = [_]Config.ProfileEntry{
+        .{
+            .name = "main",
+            .provider = "claude",
+            .command = "/opt/bin/my-claude",
+            .script = tmp_path,
+        },
+    };
+    var cfg = Config{};
+    cfg.profiles.entries = &entries;
+
+    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
+    defer mgr.deinit();
+    try std.testing.expectEqualStrings(tmp_path, mgr.active().profile.command);
+}
+
+test "SessionManager: missing script falls through to command" {
+    const entries = [_]Config.ProfileEntry{
+        .{
+            .name = "main",
+            .command = "/opt/bin/my-claude",
+            .script = "/nonexistent/path/that/should/not/be/here.sh",
+        },
+    };
+    var cfg = Config{};
+    cfg.profiles.entries = &entries;
+
+    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
+    defer mgr.deinit();
+    try std.testing.expectEqualStrings("/opt/bin/my-claude", mgr.active().profile.command);
+}
+
+test "SessionManager: non-executable script falls through to provider" {
+    // Create a regular file with no execute bit.
+    const tmp_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/djinn-test-script-{d}.txt", .{std.time.microTimestamp()});
+    defer std.testing.allocator.free(tmp_path);
+    {
+        const f = try std.fs.cwd().createFile(tmp_path, .{ .mode = 0o644 });
+        f.close();
+    }
+    defer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+    const entries = [_]Config.ProfileEntry{
+        .{ .name = "main", .provider = "codex", .script = tmp_path },
+    };
+    var cfg = Config{};
+    cfg.profiles.entries = &entries;
+
+    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
+    defer mgr.deinit();
+    try std.testing.expectEqualStrings("codex", mgr.active().profile.command);
+}
+
+fn makeTempExecutable(allocator: std.mem.Allocator) ![]u8 {
+    const path = try std.fmt.allocPrint(allocator, "/tmp/djinn-test-script-{d}.sh", .{std.time.microTimestamp()});
+    errdefer allocator.free(path);
+    const f = try std.fs.cwd().createFile(path, .{ .mode = 0o755 });
+    defer f.close();
+    try f.writeAll("#!/bin/sh\nexec /bin/zsh\n");
+    return path;
 }
 
 test "SessionManager: profile.label falls back to name" {

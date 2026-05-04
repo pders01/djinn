@@ -78,6 +78,13 @@ pub const Config = struct {
         command: ?[]const u8 = null,
         cwd: ?[]const u8 = null,
         title: ?[]const u8 = null,
+        /// Path to an executable user script that constructs the
+        /// agentic shell. When set, takes precedence over `command`
+        /// and `provider`. Script must `exec` the agent at the end —
+        /// otherwise the PTY child exits and djinn shows an empty
+        /// terminal. `~`-relative paths are expanded at SessionManager
+        /// resolve time.
+        script: ?[]const u8 = null,
     };
 
     pub const ProfilesConfig = struct {
@@ -252,6 +259,7 @@ pub const Config = struct {
                 if (e.command) |s| allocator.free(s);
                 if (e.cwd) |s| allocator.free(s);
                 if (e.title) |s| allocator.free(s);
+                if (e.script) |s| allocator.free(s);
             }
             break :blk &.{};
         };
@@ -424,6 +432,8 @@ pub const Config = struct {
             entry.cwd = dup;
         } else if (eq(field, "title")) {
             entry.title = dup;
+        } else if (eq(field, "script")) {
+            entry.script = dup;
         } else {
             allocator.free(dup);
             return error.UnknownProfileField;
@@ -713,6 +723,20 @@ test "Config: malformed profile key warns + skips" {
     const config = try Config.parse(arena.allocator(), src);
     try std.testing.expectEqual(@as(usize, 1), config.profiles.entries.len);
     try std.testing.expectEqualStrings("good", config.profiles.entries[0].name);
+}
+
+test "Config: profile.script parses + survives roundtrip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\profile.main.script = ~/.config/djinn/profiles/main.sh
+    ;
+    const config = try Config.parse(arena.allocator(), src);
+    try std.testing.expectEqual(@as(usize, 1), config.profiles.entries.len);
+    try std.testing.expectEqualStrings(
+        "~/.config/djinn/profiles/main.sh",
+        config.profiles.entries[0].script.?,
+    );
 }
 
 test "Config: unknown profile field warns + skips" {

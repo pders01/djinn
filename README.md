@@ -284,6 +284,8 @@ provider = generic
 # cycle. Lazy-spawned: a profile's child process only starts on the
 # first activate.
 #
+# Spawn-command precedence:  script > command > provider > /bin/zsh
+#
 # default-profile = main
 # profile.main.provider  = claude
 # profile.main.cwd       = ~/projects/main
@@ -291,6 +293,15 @@ provider = generic
 # profile.codex.provider = codex
 # profile.codex.command  = /opt/bin/codex
 # profile.codex.cwd      = ~/projects/side
+#
+# `script` points at an executable user script that builds the agentic
+# shell (load env vars, unwrap secrets, mise/asdf shim, conda activate,
+# etc.). The script must `exec` the agent at the end — otherwise the
+# PTY child exits and djinn shows an empty terminal.
+#
+# profile.work.script = ~/.config/djinn/profiles/work.sh
+# profile.work.cwd    = ~/projects/work
+# profile.work.title  = work claude
 
 # Theme — falls through to ghostty's resolved config when
 # inherit-ghostty=true (default). Overrides only listed below.
@@ -333,6 +344,31 @@ scrollback-size = 10000
 `provider` selects the default command to spawn in the terminal. Known shortcuts: `claude`, `codex`, `aider`, `gemini`, `opencode`, `crush` (charmbracelet/crush), `pi` (Pi AI). Anything else uses `/bin/zsh` (macOS's default since 10.15). Override with `--provider <name>` or by setting `provider-command` directly.
 
 > **Why /bin/zsh and not $SHELL?** djinn is normally launched from a dev shell (`nix develop`, devbox, etc.) which sets `$SHELL` to a sandboxed bash with broken terminfo lookup. `/bin/zsh` always has working terminfo so readline arrow keys / Ctrl bindings work without surprises.
+
+### Profile scripts
+
+For anything more elaborate than `provider = X` + `command = /opt/bin/X`, point `profile.<name>.script` at an executable shell script. djinn passes the script's path to ghostty as the PTY command — the script does whatever setup it needs (env vars, secret unwrap, mise/asdf, conda activate, dotenv load, …) and then `exec`s the agent so the agent inherits the configured environment as PID 1 of the PTY.
+
+```sh
+#!/usr/bin/env bash
+# ~/.config/djinn/profiles/work.sh
+set -euo pipefail
+
+export ANTHROPIC_API_KEY="$(security find-generic-password -a work -s anthropic -w)"
+export PATH="$HOME/.mise/installs/node/22.6.0/bin:$PATH"
+cd ~/projects/work
+
+exec claude --model sonnet
+```
+
+```ini
+profile.work.script = ~/.config/djinn/profiles/work.sh
+profile.work.title  = work claude
+```
+
+The script must be executable (`chmod +x`) and must end with `exec <agent-cmd>` — otherwise the script process exits when the last non-`exec` command returns and djinn shows an empty terminal. djinn validates existence + execute bit at startup; missing or non-executable scripts log a warning and the profile falls through to `command` / `provider` / `/bin/zsh`.
+
+Spawn-command precedence: `script` > `command` > `provider` shortcut > `/bin/zsh`.
 
 ### Ghostty config inheritance
 
