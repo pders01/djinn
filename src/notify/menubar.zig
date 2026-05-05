@@ -429,7 +429,7 @@ const default_config_skeleton =
     \\#          font_inc, font_dec, font_reset, clear_scrollback,
     \\#          open_settings, toggle_log_pane, palette_open,
     \\#          tab_1..tab_9, next_tab, prev_tab
-    \\# Example: keybind = clear_scrollback=cmd+l
+    \\# keybind = clear_scrollback=cmd+l
     \\
 ;
 
