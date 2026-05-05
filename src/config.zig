@@ -64,7 +64,6 @@ pub const Config = struct {
     pub const ProviderConfig = struct {
         name: []const u8 = "generic",
         command: ?[]const u8 = null,
-        args: []const []const u8 = &.{},
     };
 
     /// One named profile = one provider instance. The session layer
