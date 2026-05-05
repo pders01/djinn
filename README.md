@@ -352,6 +352,7 @@ bell-sound = Tink                   # name in /System/Library/Sounds or absolute
 
 # System
 open-at-login = false               # bool — only effective from a signed .app bundle
+mcp-enabled = true                  # bool — listen on 127.0.0.1 for MCP clients
 system-notifications = true         # bool — NSUserNotification on agent attention/done
 menubar-icon = true                 # bool
 attention-sound = Glass             # system sound name, "default" (= Funk), or absolute path

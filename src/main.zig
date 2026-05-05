@@ -831,7 +831,11 @@ pub fn main() !void {
     }
     defer if (hotkey_active) hotkey_storage.deinit();
 
-    // MCP HTTP server.
+    // MCP HTTP server. Gated on `mcp-enabled`; when off, the ToolTable
+    // and Dispatcher still build (cheap, harmless) but no socket binds
+    // and no accept thread spawns — and ~/.config/djinn/mcp.json isn't
+    // touched, so stale endpoint info from a previous run isn't left
+    // pointing at a port nothing's listening on.
     var tools = ToolTable{
         .state = &agent_state,
         .notifier = &notifier,
@@ -839,21 +843,30 @@ pub fn main() !void {
     };
     app.g.tool_table = &tools;
     var dispatcher = Dispatcher{ .tool_table = tools.table() };
-    var mcp_server = McpServer.init(allocator, dispatcher.handler()) catch |err| {
-        std.debug.print("warning: MCP server init failed: {}\n", .{err});
-        std.process.exit(1);
-    };
-    defer mcp_server.deinit();
+    var mcp_server_opt: ?McpServer = null;
+    if (config.mcp.enabled) {
+        mcp_server_opt = McpServer.init(allocator, dispatcher.handler()) catch |err| {
+            std.debug.print("warning: MCP server init failed: {}\n", .{err});
+            std.process.exit(1);
+        };
+    }
+    defer if (mcp_server_opt) |*s| s.deinit();
 
-    writeMcpEndpointInfo(allocator, mcp_server.port, mcp_server.token) catch |err| {
-        std.debug.print("warning: failed to write MCP endpoint info: {}\n", .{err});
-    };
+    if (mcp_server_opt) |*s| {
+        writeMcpEndpointInfo(allocator, s.port, s.token) catch |err| {
+            std.debug.print("warning: failed to write MCP endpoint info: {}\n", .{err});
+        };
+        const mcp_thread = try std.Thread.spawn(.{}, McpServer.run, .{s});
+        mcp_thread.detach();
+    }
 
-    const mcp_thread = try std.Thread.spawn(.{}, McpServer.run, .{&mcp_server});
-    mcp_thread.detach();
-
+    var mcp_label_buf: [40]u8 = undefined;
+    const mcp_label: []const u8 = if (mcp_server_opt) |s|
+        std.fmt.bufPrint(&mcp_label_buf, "http://127.0.0.1:{d}", .{s.port}) catch "?"
+    else
+        "disabled";
     std.debug.print(
-        "djinn running (provider: {s}, hotkey: {s}, grid: {d}x{d}, font: \"{s}\" @ {d:.1}pt, cell: {d:.0}x{d:.0}, mcp: http://127.0.0.1:{d})\n",
+        "djinn running (provider: {s}, hotkey: {s}, grid: {d}x{d}, font: \"{s}\" @ {d:.1}pt, cell: {d:.0}x{d:.0}, mcp: {s})\n",
         .{
             config.provider.name,
             keybinding,
@@ -863,7 +876,7 @@ pub fn main() !void {
             theme.font_size,
             view.cell_w,
             view.cell_h,
-            mcp_server.port,
+            mcp_label,
         },
     );
 
@@ -874,9 +887,13 @@ pub fn main() !void {
     // wrapping line joined by `·`.
     {
         agent_state.appendLog(.info, "djinn ready") catch {};
-        var mcp_msg: [64]u8 = undefined;
-        const m = std.fmt.bufPrint(&mcp_msg, "MCP at 127.0.0.1:{d}", .{mcp_server.port}) catch "MCP up";
-        agent_state.appendLog(.info, m) catch {};
+        if (mcp_server_opt) |s| {
+            var mcp_msg: [64]u8 = undefined;
+            const m = std.fmt.bufPrint(&mcp_msg, "MCP at 127.0.0.1:{d}", .{s.port}) catch "MCP up";
+            agent_state.appendLog(.info, m) catch {};
+        } else {
+            agent_state.appendLog(.info, "MCP disabled") catch {};
+        }
         agent_state.appendLog(.info, "waiting for agents") catch {};
     }
 

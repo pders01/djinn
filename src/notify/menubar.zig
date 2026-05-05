@@ -425,6 +425,9 @@ const default_config_skeleton =
     \\bell-visual = false                 # brief alpha flash on the panel
     \\bell-sound = Tink                   # name in /System/Library/Sounds or absolute path
     \\
+    \\# ─── MCP server ──────────────────────────────────────────────
+    \\mcp-enabled = true                  # bool — listen on 127.0.0.1 for MCP clients
+    \\
     \\# ─── Notifications ──────────────────────────────────────────
     \\system-notifications = true
     \\menubar-icon = true
