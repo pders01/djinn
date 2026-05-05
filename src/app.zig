@@ -30,13 +30,6 @@ pub const AppState = struct {
     /// app.zig avoids duplicate-opaque-type conflicts. Callers cast to
     /// the cg.CTFontRef alias they already have in scope.
     font: ?*const anyopaque = null,
-    /// Family name slice, lifetime owned by config (lives for app duration).
-    /// Empty default; set in TerminalView.init so font-resize can rebuild.
-    font_family: []const u8 = "",
-    /// Initial size from config. Surface owns runtime mutation via
-    /// `increase_font_size`/`decrease_font_size` actions; this stays
-    /// frozen at boot value (used only for chrome metric fallback).
-    font_size: f64 = 13,
     cell_w: f64 = 8,
     cell_h: f64 = 16,
     baseline: f64 = 4,

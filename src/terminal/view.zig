@@ -252,8 +252,6 @@ pub const TerminalView = struct {
 
         app.g.font = @ptrCast(metrics.font);
         app.g.view_id = view.value;
-        app.g.font_family = font_name;
-        app.g.font_size = font_size;
         app.g.cell_w = metrics.cell_w;
         app.g.cell_h = metrics.cell_h;
         app.g.baseline = metrics.baseline;
