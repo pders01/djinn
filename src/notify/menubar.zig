@@ -402,6 +402,7 @@ const default_config_skeleton =
     \\# font-size = 13
     \\# padding-x = 8
     \\# padding-y = 8
+    \\# scrollback-size = 100000            # rows; unset → ghostty's 10M default
     \\
     \\# ─── Theme (overrides the values inherited from ghostty) ────
     \\inherit-ghostty = true

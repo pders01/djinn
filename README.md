@@ -337,6 +337,7 @@ inherit-ghostty = true              # bool
 # font-size = 13                    # points
 # padding-x = 8                     # pixels
 # padding-y = 8                     # pixels
+# scrollback-size = 100000          # rows; unset → ghostty's default (10M)
 
 # Log pane
 log-pane-enabled = false            # bool

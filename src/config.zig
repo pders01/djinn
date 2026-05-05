@@ -117,11 +117,11 @@ pub const Config = struct {
     };
 
     pub const ScrollbackConfig = struct {
-        /// Rows of scrollback retained beyond the visible grid. Matches
-        /// ghostty's default. Bumping helps when CC streams thousands of
-        /// log lines; cost is roughly `size * cols * sizeof(cell)` of
-        /// resident memory in the ghostty page list.
-        size: u32 = 10000,
+        /// Rows of scrollback retained beyond the visible grid. null =
+        /// inherit ghostty's own `scrollback-limit` (10M by default).
+        /// Cost is roughly `size * cols * sizeof(cell)` of resident
+        /// memory in the ghostty page list.
+        size: ?u32 = null,
     };
 
     pub const LogPaneConfig = struct {
@@ -664,7 +664,7 @@ test "Config: parse scrollback + system" {
         \\open-at-login = yes
     ;
     const config = try Config.parse(std.testing.allocator, src);
-    try std.testing.expectEqual(@as(u32, 50000), config.scrollback.size);
+    try std.testing.expectEqual(@as(?u32, 50000), config.scrollback.size);
     try std.testing.expect(config.system.open_at_login);
 }
 

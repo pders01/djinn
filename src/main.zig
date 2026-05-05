@@ -543,10 +543,6 @@ pub fn main() !void {
     // action callbacks can recover host state via
     // `ghostty_app_userdata`. Must run before App.init (which copies
     // the userdata pointer into runtime_config_s).
-    ghostty_runtime.setHost(&app.g);
-    var ghostty_app_opt = ghostty_runtime.App.init();
-    defer if (ghostty_app_opt) |*a| a.deinit();
-
     var args = try std.process.argsWithAllocator(allocator);
     defer args.deinit();
     _ = args.skip();
@@ -567,6 +563,10 @@ pub fn main() !void {
         std.debug.print("error: config load failed: {}\n", .{err});
         std.process.exit(1);
     };
+
+    ghostty_runtime.setHost(&app.g);
+    var ghostty_app_opt = ghostty_runtime.App.init(config.scrollback.size);
+    defer if (ghostty_app_opt) |*a| a.deinit();
     const keybinding = keybinding_override orelse config.hotkey.toggle;
 
     const binding = parseKeybinding(keybinding) catch {

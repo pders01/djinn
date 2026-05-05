@@ -184,6 +184,36 @@ fn pickThemeVariant(spec: []const u8, dark: bool) ?[]const u8 {
     return null;
 }
 
+/// Write a tmp ghostty config file with djinn-side overrides — keys
+/// djinn config exposes that map onto ghostty's own keys. Loaded after
+/// the user's `~/.config/ghostty/config` so djinn settings win.
+/// Returns the tmp path (owned, free with page_allocator) or null when
+/// there's nothing to write.
+fn writeDjinnGhosttyOverride(scrollback_limit: ?u32) ?[]const u8 {
+    if (scrollback_limit == null) return null;
+
+    const allocator = std.heap.page_allocator;
+    const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
+    const tmp_path = std.fmt.allocPrint(allocator, "{s}/djinn-ghostty-override.conf", .{tmpdir}) catch return null;
+    const out = std.fs.createFileAbsolute(tmp_path, .{ .truncate = true }) catch {
+        allocator.free(tmp_path);
+        return null;
+    };
+    defer out.close();
+    var buf: [128]u8 = undefined;
+    if (scrollback_limit) |n| {
+        const line = std.fmt.bufPrint(&buf, "scrollback-limit = {d}\n", .{n}) catch {
+            allocator.free(tmp_path);
+            return null;
+        };
+        out.writeAll(line) catch {
+            allocator.free(tmp_path);
+            return null;
+        };
+    }
+    return tmp_path;
+}
+
 fn detectDarkAppearance() bool {
     // NSAppearance lookup. Same logic as theme.detectSystemAppearance,
     // duplicated here to avoid a circular import (theme imports this
@@ -239,7 +269,7 @@ pub const App = struct {
     /// fails — none of the failure modes have rich error messages
     /// (the C API just returns null), so callers should treat null
     /// as "Tier-5 surface unavailable, fall back to vt-static path."
-    pub fn init() ?App {
+    pub fn init(scrollback_limit: ?u32) ?App {
         const cfg = c.ghostty_config_new() orelse {
             std.debug.print("ghostty_app: config_new returned null\n", .{});
             return null;
@@ -259,6 +289,18 @@ pub const App = struct {
         // a tmp file that overrides the original line. Loaded BEFORE
         // finalize so the right theme file gets merged in.
         if (writeAppearanceThemeOverride()) |tmp_path| {
+            defer std.heap.page_allocator.free(tmp_path);
+            const z = std.heap.page_allocator.allocSentinel(u8, tmp_path.len, 0) catch return null;
+            defer std.heap.page_allocator.free(z);
+            @memcpy(z[0..tmp_path.len], tmp_path);
+            c.ghostty_config_load_file(cfg, z.ptr);
+        }
+
+        // djinn-side overrides for ghostty config keys we surface in
+        // djinn's own config file. Currently just `scrollback-size →
+        // scrollback-limit`; loaded after the appearance override so
+        // either can be patched independently.
+        if (writeDjinnGhosttyOverride(scrollback_limit)) |tmp_path| {
             defer std.heap.page_allocator.free(tmp_path);
             const z = std.heap.page_allocator.allocSentinel(u8, tmp_path.len, 0) catch return null;
             defer std.heap.page_allocator.free(z);
