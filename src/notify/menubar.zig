@@ -378,63 +378,50 @@ const default_config_skeleton =
     \\# Settings menu (Cmd+,) reopens this file.
     \\
     \\# ─── Window ──────────────────────────────────────────────────
-    \\window-width = 800
-    \\window-height = 400
-    \\window-position = top-center
-    \\hide-on-blur = false
+    \\window-width = 800                  # pixels
+    \\window-height = 400                 # pixels
+    \\window-toggle-style = instant       # instant | minimize
+    \\hide-on-blur = false                # bool — auto-hide on losing key focus
     \\
     \\# ─── Toggle hotkey ───────────────────────────────────────────
+    \\# Mods: cmd, ctrl, alt/option, shift. Key: any char or named key
+    \\# (grave, space, escape, return, tab, f1..f12, up/down/left/right).
     \\hotkey = ctrl+space
     \\
-    \\# ─── Provider (claude / codex / aider / gemini / generic) ───
+    \\# ─── Provider (claude / codex / aider / gemini / opencode / crush / pi / generic) ───
     \\provider = generic
     \\# provider-command = /usr/local/bin/claude
-    \\
-    \\# ─── Renderer ────────────────────────────────────────────────
-    \\# coregraphics — drawRect + CTFontDrawGlyphs (default)
-    \\# metal       — djinn's CAMetalLayer + glyph atlas
-    \\# ghostty     — Tier-5: libghostty surface owns the layer (native font + AA)
-    \\render-backend = coregraphics
     \\
     \\# ─── Terminal ────────────────────────────────────────────────
     \\# font-family = IosevkaTerm Nerd Font Mono
     \\# font-size = 13
     \\# padding-x = 8
     \\# padding-y = 8
-    \\# cursor-style = block         # block / bar / underline
     \\
-    \\# ─── Theme ───────────────────────────────────────────────────
+    \\# ─── Theme (overrides the values inherited from ghostty) ────
     \\inherit-ghostty = true
-    \\# opacity = 0.95
-    \\# background = #1e1e2e
-    \\# foreground = #cdd6f4
-    \\# cursor-color = #f5e0dc
-    \\
-    \\# ─── Cursor + scrollback ────────────────────────────────────
-    \\cursor-blink = true
-    \\scrollback-size = 10000
+    \\# opacity = 0.95                    # 0.0 – 1.0
+    \\# background = #1e1e2e              # hex
+    \\# foreground = #cdd6f4              # hex
+    \\# cursor-color = #f5e0dc            # hex
     \\
     \\# ─── Log pane (toggle: Cmd+/) ───────────────────────────────
     \\log-pane-enabled = false
-    \\log-pane-width-fraction = 0.28
-    \\log-pane-width-min = 220
-    \\log-pane-width-max = 360
+    \\log-pane-width-fraction = 0.28      # share of panel width
+    \\log-pane-width-min = 220            # pixel floor
+    \\log-pane-width-max = 360            # pixel ceiling
     \\
     \\# ─── System ──────────────────────────────────────────────────
-    \\open-at-login = false
+    \\open-at-login = false               # only effective from a signed .app bundle
     \\
     \\# ─── Bell ────────────────────────────────────────────────────
-    \\bell-audible = true
-    \\bell-visual = false
-    \\bell-sound = Tink
-    \\
-    \\# ─── MCP server ──────────────────────────────────────────────
-    \\mcp-enabled = true
+    \\bell-audible = true                 # play sound on BEL (0x07)
+    \\bell-sound = Tink                   # name in /System/Library/Sounds or absolute path
     \\
     \\# ─── Notifications ──────────────────────────────────────────
     \\system-notifications = true
     \\menubar-icon = true
-    \\attention-sound = Glass
+    \\attention-sound = Glass             # system sound name, "default", or absolute path
     \\
     \\# ─── Keybinds ────────────────────────────────────────────────
     \\# Format: keybind = action=trigger
