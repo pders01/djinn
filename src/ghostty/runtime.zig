@@ -630,14 +630,17 @@ fn closePanelMain(ctx: ?*anyopaque) callconv(.c) void {
     }
 }
 
-/// ring_bell: surface owns the visual flash overlay; we only handle
-/// the audible side (afplay subprocess).
+/// ring_bell: audible side via afplay, visual side as a brief alpha
+/// dim on the panel. Both are gated independently by config.
 fn handleRingBell(host: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, _: c.ghostty_action_s) bool {
     const cfg = host.app_state.config orelse return false;
     if (cfg.bell.audible) {
         const notify = @import("../notify/darwin.zig");
         const notifier = notify.Notifier{ .enabled = true };
         notifier.playSound(cfg.bell.sound);
+    }
+    if (cfg.bell.visual) {
+        if (host.app_state.panel) |p| p.flashBell();
     }
     return true;
 }

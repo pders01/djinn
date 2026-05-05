@@ -422,6 +422,7 @@ const default_config_skeleton =
     \\
     \\# ─── Bell ────────────────────────────────────────────────────
     \\bell-audible = true                 # play sound on BEL (0x07)
+    \\bell-visual = false                 # brief alpha flash on the panel
     \\bell-sound = Tink                   # name in /System/Library/Sounds or absolute path
     \\
     \\# ─── Notifications ──────────────────────────────────────────

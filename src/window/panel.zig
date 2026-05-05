@@ -19,7 +19,16 @@ fn registerPanelClass() void {
     _ = cls.addMethod("canBecomeMainWindow", canBecomeKeyImpl);
     _ = cls.addMethod("djinnPanelDidResignKey:", didResignKeyImpl);
     _ = cls.addMethod("djinnPanelDidEndLiveResize:", didEndLiveResizeImpl);
+    _ = cls.addMethod("djinnPanelRestoreBellAlpha:", restoreBellAlphaImpl);
     objc.registerClassPair(cls);
+}
+
+/// Reset alpha after a visual-bell flash. Scheduled via
+/// performSelector:withObject:afterDelay: from `Panel.flashBell`.
+fn restoreBellAlphaImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
+    const p = app_state.g.panel orelse return;
+    const panel_obj = objc.Object.fromId(self_id);
+    panel_obj.msgSend(void, "setAlphaValue:", .{p.expected_alpha});
 }
 
 fn canBecomeKeyImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
@@ -93,6 +102,12 @@ pub const Panel = struct {
     /// value for that axis.
     position_x: ?f64 = null,
     position_y: ?f64 = null,
+    /// Steady-state alpha — what `flashBell` restores to after the
+    /// visual-bell dim. Tracked here because theme reloads (light/dark
+    /// flip) update it via `setBackgroundColor`. Blur-on panels stay at
+    /// 1.0 (the visual-effect view does the painting); blur-off panels
+    /// follow `theme.opacity`.
+    expected_alpha: f64 = 1.0,
     /// PID of the application that was frontmost when the panel was last
     /// shown. Used to restore focus on hide so a Quake-style toggle behaves
     /// like Spotlight: pop in over your work, then disappear without leaving
@@ -218,6 +233,7 @@ pub const Panel = struct {
             .width = width,
             .height = height,
             .blur = blur,
+            .expected_alpha = if (blur) 1.0 else opacity,
         };
     }
 
@@ -501,6 +517,21 @@ pub const Panel = struct {
         );
         self.ns_panel.msgSend(void, "setBackgroundColor:", .{bg});
         self.ns_panel.msgSend(void, "setAlphaValue:", .{opacity});
+        self.expected_alpha = opacity;
+    }
+
+    /// Brief alpha dim as a visual bell. Triggered by ghostty's
+    /// RING_BELL action when `bell.visual = true`. Hardcoded duration
+    /// (0.08s) and dim factor (alpha → 0.4) keep the flash short
+    /// enough to feel like an event rather than a state change.
+    pub fn flashBell(self: *Panel) void {
+        self.ns_panel.msgSend(void, "setAlphaValue:", .{@as(f64, 0.4)});
+        const sel = objc.sel("djinnPanelRestoreBellAlpha:");
+        self.ns_panel.msgSend(void, "performSelector:withObject:afterDelay:", .{
+            sel,
+            @as(?*anyopaque, null),
+            @as(f64, 0.08),
+        });
     }
 
     pub fn deinit(self: *Panel) void {

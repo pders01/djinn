@@ -347,6 +347,7 @@ log-pane-width-max = 360            # pixel ceiling
 
 # Bell
 bell-audible = true                 # bool — play sound on BEL (0x07)
+bell-visual = false                 # bool — brief alpha flash on the panel
 bell-sound = Tink                   # name in /System/Library/Sounds or absolute path
 
 # System
