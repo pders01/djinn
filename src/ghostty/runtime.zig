@@ -527,6 +527,7 @@ fn hostFromUserdata(ud: ?*anyopaque) ?*HostContext {
 /// to call ghostty_app_tick on main to drain. Without this the surface
 /// never fires actions or close callbacks.
 fn wakeupStub(_: ?*anyopaque) callconv(.c) void {
+    if (!host_inited) return;
     if (host_storage.app_handle) |h| {
         dispatch_async_f(@ptrCast(c_dispatch.dispatch_get_main_queue()), h, &tickAppMain);
     }

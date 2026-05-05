@@ -314,7 +314,8 @@ pub const Config = struct {
             // position_x/y; the enum form clears them so the named anchor
             // takes full effect even when `-x` / `-y` lines appeared
             // earlier in the file (precedence by setting, not parse order).
-            if (std.meta.stringToEnum(WindowConfig.Position, dashToUnder(val))) |p| {
+            var pos_buf: [64]u8 = undefined;
+            if (std.meta.stringToEnum(WindowConfig.Position, dashToUnder(val, &pos_buf))) |p| {
                 config.window.position = p;
                 config.window.position_x = null;
                 config.window.position_y = null;
@@ -329,7 +330,8 @@ pub const Config = struct {
         } else if (eq(key, "window-position-y")) {
             config.window.position_y = try std.fmt.parseFloat(f64, val);
         } else if (eq(key, "window-toggle-style")) {
-            config.window.toggle_style = std.meta.stringToEnum(WindowConfig.ToggleStyle, dashToUnder(val)) orelse return error.UnknownEnum;
+            var ts_buf: [64]u8 = undefined;
+            config.window.toggle_style = std.meta.stringToEnum(WindowConfig.ToggleStyle, dashToUnder(val, &ts_buf)) orelse return error.UnknownEnum;
         } else if (eq(key, "window-topmost")) {
             config.window.topmost = try parseBool(val);
         } else if (eq(key, "hide-on-blur")) {
@@ -545,14 +547,13 @@ fn unquote(s: []const u8) []const u8 {
 }
 
 /// Convert dashed value to underscored so std.meta.stringToEnum hits.
-/// Operates on a small static buffer; OK because enum names are short.
-fn dashToUnder(s: []const u8) []const u8 {
-    const Buf = struct {
-        var b: [64]u8 = undefined;
-    };
-    if (s.len > Buf.b.len) return s;
-    for (s, 0..) |c, i| Buf.b[i] = if (c == '-') '_' else c;
-    return Buf.b[0..s.len];
+/// Caller-supplied buffer keeps the result safe to nest; if the input
+/// is longer than the buffer the original slice is returned unchanged
+/// (the enum lookup will then miss, which is the right outcome).
+fn dashToUnder(s: []const u8, buf: []u8) []const u8 {
+    if (s.len > buf.len) return s;
+    for (s, 0..) |c, i| buf[i] = if (c == '-') '_' else c;
+    return buf[0..s.len];
 }
 
 // Tests
