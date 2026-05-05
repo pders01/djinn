@@ -277,14 +277,14 @@ start is a comment, inline `#` is a hex color. All keys optional:
 
 ```ini
 # Window
-window-width = 800
-window-height = 400
-window-position = top_center
-window-toggle-style = instant
-window-topmost = true
-hide-on-blur = false
+window-width = 800                  # pixels
+window-height = 400                 # pixels
+window-toggle-style = instant       # instant (pop in place) | minimize (slide animation)
+hide-on-blur = false                # bool — auto-hide when djinn loses key focus
 
 # Hotkey (see "Picking a hotkey that won't fight macOS")
+# Modifiers: cmd, ctrl, alt/option, shift. Key: any character or named key
+# (grave, space, escape, return, tab, f1..f12, up/down/left/right).
 hotkey = ctrl+grave
 
 # Provider — child program. Shortcuts: claude / codex / aider /
@@ -319,41 +319,44 @@ provider = generic
 
 # Theme — falls through to ghostty's resolved config when
 # inherit-ghostty=true (default). Overrides only listed below.
-inherit-ghostty = true
-# opacity = 0.95
-# background = #1a1a1e
-# foreground = #cccccc
-# cursor-color = #ffffff
+inherit-ghostty = true              # bool
+# opacity = 0.95                    # float 0.0 – 1.0
+# background = #1a1a1e              # hex color
+# foreground = #cccccc              # hex color
+# cursor-color = #ffffff            # hex color
 
 # Terminal typography
-# font-family = Menlo
-# font-size = 13
-# padding-x = 8
-# padding-y = 8
+# font-family = Menlo               # any installed font
+# font-size = 13                    # points
+# padding-x = 8                     # pixels
+# padding-y = 8                     # pixels
 
 # Log pane
-log-pane-enabled = false
-log-pane-width-fraction = 0.28
-log-pane-width-min = 220
-log-pane-width-max = 360
+log-pane-enabled = false            # bool
+log-pane-width-fraction = 0.28      # float — share of panel width
+log-pane-width-min = 220            # pixel floor
+log-pane-width-max = 360            # pixel ceiling
 
 # Bell
-bell-audible = true
-bell-visual = false
-bell-sound = Tink
+bell-audible = true                 # bool — play sound on BEL (0x07)
+bell-sound = Tink                   # name in /System/Library/Sounds or absolute path
 
 # System
-open-at-login = false
-mcp-enabled = true
-system-notifications = true
-menubar-icon = true
-attention-sound = Glass
-scrollback-size = 10000
+open-at-login = false               # bool — only effective from a signed .app bundle
+system-notifications = true         # bool — NSUserNotification on agent attention/done
+menubar-icon = true                 # bool
+attention-sound = Glass             # system sound name, "default" (= Funk), or absolute path
 
 # Keymap overrides — `keybind = <action>=<trigger>`
+# Actions: copy, paste, scroll_page_up, scroll_page_down, font_inc, font_dec,
+#          font_reset, clear_scrollback, open_settings, toggle_log_pane,
+#          palette_open, tab_1..tab_9, next_tab, prev_tab.
+# Triggers: same modifier+key grammar as `hotkey`.
 # keybind = clear_scrollback=cmd+l
 # keybind = copy=cmd+c
 ```
+
+> Bool values accept `true|yes|on|1` or `false|no|off|0`.
 
 `provider` selects the default command to spawn in the terminal. Known shortcuts: `claude`, `codex`, `aider`, `gemini`, `opencode`, `crush` (charmbracelet/crush), `pi` (Pi AI). Anything else uses `/bin/zsh` (macOS's default since 10.15). Override with `--provider <name>` or by setting `provider-command` directly.
 
