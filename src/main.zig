@@ -620,6 +620,7 @@ pub fn main() !void {
     // Bell now flows through ghostty's RING_BELL action handler, not
     // a Terminal callback (terminal.zig retired in step 10).
     panel.setHideOnBlur(config.window.hide_on_blur);
+    panel.setInstantToggle(config.window.toggle_style == .instant);
     panel.setResizeEndHandler(&onPanelResize);
 
     // With blur on, the panel is fully transparent and the visual-effect view

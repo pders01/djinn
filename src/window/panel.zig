@@ -67,6 +67,9 @@ pub const Panel = struct {
     width: f64 = 800,
     height: f64 = 400,
     blur: bool = false,
+    /// When true, show/hide skip the slide animation and the panel pops in
+    /// place. Wired from `window-toggle-style = instant`.
+    instant_toggle: bool = false,
     /// PID of the application that was frontmost when the panel was last
     /// shown. Used to restore focus on hide so a Quake-style toggle behaves
     /// like Spotlight: pop in over your work, then disappear without leaving
@@ -221,15 +224,20 @@ pub const Panel = struct {
             self.visible_y = visible_y;
         }
 
-        const start = NSRect{
-            .origin = .{ .x = target_x, .y = target_y },
-            .size = frame.size,
-        };
         const target = NSRect{
             .origin = .{ .x = target_x, .y = visible_y },
             .size = frame.size,
         };
-        self.ns_panel.msgSend(void, "setFrame:display:", .{ start, @as(c_int, 0) });
+
+        if (self.instant_toggle) {
+            self.ns_panel.msgSend(void, "setFrame:display:", .{ target, @as(c_int, 0) });
+        } else {
+            const start = NSRect{
+                .origin = .{ .x = target_x, .y = target_y },
+                .size = frame.size,
+            };
+            self.ns_panel.msgSend(void, "setFrame:display:", .{ start, @as(c_int, 0) });
+        }
         self.ns_panel.msgSend(void, "makeKeyAndOrderFront:", .{@as(?*anyopaque, null)});
         self.ns_app.msgSend(void, "activateIgnoringOtherApps:", .{@as(c_int, 1)});
 
@@ -240,7 +248,9 @@ pub const Panel = struct {
         if (app_state.g.view_id) |vid| {
             _ = self.ns_panel.msgSend(c_int, "makeFirstResponder:", .{objc.Object.fromId(vid)});
         }
-        self.ns_panel.msgSend(void, "setFrame:display:animate:", .{ target, @as(c_int, 1), @as(c_int, 1) });
+        if (!self.instant_toggle) {
+            self.ns_panel.msgSend(void, "setFrame:display:animate:", .{ target, @as(c_int, 1), @as(c_int, 1) });
+        }
 
         // Force a fresh redraw of the entire view hierarchy. orderOut may
         // discard the backing store; without an explicit invalidation, AppKit
@@ -301,18 +311,22 @@ pub const Panel = struct {
             self.hidden_y = hidden_y;
         }
 
-        const offscreen = NSRect{
-            .origin = .{ .x = target_x, .y = hidden_y },
-            .size = frame.size,
-        };
-        self.ns_panel.msgSend(void, "setFrame:display:animate:", .{ offscreen, @as(c_int, 1), @as(c_int, 1) });
+        if (self.instant_toggle) {
+            self.ns_panel.msgSend(void, "orderOut:", .{@as(?*anyopaque, null)});
+        } else {
+            const offscreen = NSRect{
+                .origin = .{ .x = target_x, .y = hidden_y },
+                .size = frame.size,
+            };
+            self.ns_panel.msgSend(void, "setFrame:display:animate:", .{ offscreen, @as(c_int, 1), @as(c_int, 1) });
 
-        self.ns_panel.msgSend(void, "orderOut:", .{@as(?*anyopaque, null)});
-        const restore = NSRect{
-            .origin = .{ .x = target_x, .y = visible_y },
-            .size = frame.size,
-        };
-        self.ns_panel.msgSend(void, "setFrame:display:", .{ restore, @as(c_int, 0) });
+            self.ns_panel.msgSend(void, "orderOut:", .{@as(?*anyopaque, null)});
+            const restore = NSRect{
+                .origin = .{ .x = target_x, .y = visible_y },
+                .size = frame.size,
+            };
+            self.ns_panel.msgSend(void, "setFrame:display:", .{ restore, @as(c_int, 0) });
+        }
 
         if (djinn_was_active and self.prev_app_pid != 0) {
             activateAppByPid(self.prev_app_pid);
@@ -340,6 +354,10 @@ pub const Panel = struct {
 
     pub fn toggle(self: *Panel) void {
         if (self.visible) self.hide() else self.show();
+    }
+
+    pub fn setInstantToggle(self: *Panel, instant: bool) void {
+        self.instant_toggle = instant;
     }
 
     pub fn setContentView(self: *Panel, view: objc.Object) void {
