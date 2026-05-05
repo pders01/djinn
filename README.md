@@ -286,6 +286,7 @@ window-position = top_center        # 9-grid anchor on the active screen
 # window-position-x = 100           # manual axis override, NSScreen coords
 # window-position-y = 200           # set window-position to clear these (named anchor wins)
 window-toggle-style = instant       # instant (pop in place) | minimize (slide animation)
+window-topmost = true               # bool — float above normal windows (NSFloatingWindowLevel)
 hide-on-blur = false                # bool — auto-hide when djinn loses key focus
 
 # Hotkey (see "Picking a hotkey that won't fight macOS")

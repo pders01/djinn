@@ -385,6 +385,7 @@ const default_config_skeleton =
     \\# window-position-x = 100           # manual override; takes effect when window-position is unset
     \\# window-position-y = 200           # or specifies the named anchor only (X,Y form clears these)
     \\window-toggle-style = instant       # instant | minimize
+    \\window-topmost = true               # bool — float above other windows
     \\hide-on-blur = false                # bool — auto-hide on losing key focus
     \\
     \\# ─── Toggle hotkey ───────────────────────────────────────────

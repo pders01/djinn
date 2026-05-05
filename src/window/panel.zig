@@ -403,6 +403,15 @@ pub const Panel = struct {
         self.position_y = position_y;
     }
 
+    /// Toggle NSFloatingWindowLevel (3, "always on top") vs NSNormalWindowLevel
+    /// (0, regular stacking). Off lets djinn coexist with normal app focus
+    /// order — the panel stops floating over other windows but still joins
+    /// all spaces and overlays fullscreen apps via collection behavior.
+    pub fn setTopmost(self: *Panel, topmost: bool) void {
+        const level: c_long = if (topmost) 3 else 0;
+        self.ns_panel.msgSend(void, "setLevel:", .{level});
+    }
+
     pub fn setContentView(self: *Panel, view: objc.Object) void {
         if (self.blur_view) |ve| {
             // Add the terminal view as a subview of the visual effect view so
