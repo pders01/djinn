@@ -621,6 +621,21 @@ pub fn main() !void {
     // a Terminal callback (terminal.zig retired in step 10).
     panel.setHideOnBlur(config.window.hide_on_blur);
     panel.setInstantToggle(config.window.toggle_style == .instant);
+    panel.setPosition(
+        switch (config.window.position) {
+            .top_left => .top_left,
+            .top_center => .top_center,
+            .top_right => .top_right,
+            .center_left => .center_left,
+            .center => .center,
+            .center_right => .center_right,
+            .bottom_left => .bottom_left,
+            .bottom_center => .bottom_center,
+            .bottom_right => .bottom_right,
+        },
+        config.window.position_x,
+        config.window.position_y,
+    );
     panel.setResizeEndHandler(&onPanelResize);
 
     // With blur on, the panel is fully transparent and the visual-effect view

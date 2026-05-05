@@ -279,6 +279,12 @@ start is a comment, inline `#` is a hex color. All keys optional:
 # Window
 window-width = 800                  # pixels
 window-height = 400                 # pixels
+window-position = top_center        # 9-grid anchor on the active screen
+#                                   # values: {top,center,bottom}_{left,center,right}
+#                                   # also accepts `X,Y` in NSScreen coords
+#                                   # (origin bottom-left of the active screen, +Y up)
+# window-position-x = 100           # manual axis override, NSScreen coords
+# window-position-y = 200           # set window-position to clear these (named anchor wins)
 window-toggle-style = instant       # instant (pop in place) | minimize (slide animation)
 hide-on-blur = false                # bool — auto-hide when djinn loses key focus
 

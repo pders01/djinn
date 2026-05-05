@@ -58,6 +58,22 @@ fn didEndLiveResizeImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callcon
 /// Quake-drop NSPanel: floats above other windows, joins all spaces, slides
 /// down from above the screen on show, slides up on hide.
 pub const Panel = struct {
+    /// 9-grid anchor on the active screen. Resolved at show-time against
+    /// the screen the cursor lives on (multi-monitor friendly). Manual
+    /// coords (`position_x` / `position_y`) override the corresponding
+    /// axis when non-null.
+    pub const Position = enum {
+        top_left,
+        top_center,
+        top_right,
+        center_left,
+        center,
+        center_right,
+        bottom_left,
+        bottom_center,
+        bottom_right,
+    };
+
     ns_app: objc.Object,
     ns_panel: objc.Object,
     blur_view: ?objc.Object = null,
@@ -70,6 +86,13 @@ pub const Panel = struct {
     /// When true, show/hide skip the slide animation and the panel pops in
     /// place. Wired from `window-toggle-style = instant`.
     instant_toggle: bool = false,
+    /// Anchor on the active screen. Wired from `window-position`.
+    position: Position = .top_center,
+    /// Manual override in NSScreen coords (origin bottom-left of the
+    /// active screen, +Y up). When non-null, replaces the enum-derived
+    /// value for that axis.
+    position_x: ?f64 = null,
+    position_y: ?f64 = null,
     /// PID of the application that was frontmost when the panel was last
     /// shown. Used to restore focus on hide so a Quake-style toggle behaves
     /// like Spotlight: pop in over your work, then disappear without leaving
@@ -217,8 +240,22 @@ pub const Panel = struct {
         var visible_y = self.visible_y;
         if (currentScreen()) |screen| {
             const sframe = screen.msgSend(NSRect, "frame", .{});
-            target_x = sframe.origin.x + (sframe.size.width - frame.size.width) / 2.0;
-            visible_y = sframe.origin.y + sframe.size.height - frame.size.height;
+            target_x = if (self.position_x) |px|
+                sframe.origin.x + px
+            else switch (self.position) {
+                .top_left, .center_left, .bottom_left => sframe.origin.x,
+                .top_center, .center, .bottom_center => sframe.origin.x + (sframe.size.width - frame.size.width) / 2.0,
+                .top_right, .center_right, .bottom_right => sframe.origin.x + sframe.size.width - frame.size.width,
+            };
+            visible_y = if (self.position_y) |py|
+                sframe.origin.y + py
+            else switch (self.position) {
+                .top_left, .top_center, .top_right => sframe.origin.y + sframe.size.height - frame.size.height,
+                .center_left, .center, .center_right => sframe.origin.y + (sframe.size.height - frame.size.height) / 2.0,
+                .bottom_left, .bottom_center, .bottom_right => sframe.origin.y,
+            };
+            // Slide-from anchor stays above the screen so the animation
+            // direction is consistent regardless of `position`.
             target_y = sframe.origin.y + sframe.size.height;
             self.hidden_y = target_y;
             self.visible_y = visible_y;
@@ -358,6 +395,12 @@ pub const Panel = struct {
 
     pub fn setInstantToggle(self: *Panel, instant: bool) void {
         self.instant_toggle = instant;
+    }
+
+    pub fn setPosition(self: *Panel, position: Position, position_x: ?f64, position_y: ?f64) void {
+        self.position = position;
+        self.position_x = position_x;
+        self.position_y = position_y;
     }
 
     pub fn setContentView(self: *Panel, view: objc.Object) void {

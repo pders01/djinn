@@ -380,6 +380,10 @@ const default_config_skeleton =
     \\# ─── Window ──────────────────────────────────────────────────
     \\window-width = 800                  # pixels
     \\window-height = 400                 # pixels
+    \\window-position = top_center        # 9-grid: {top,center,bottom}_{left,center,right}
+    \\#                                   # or `X,Y` in NSScreen coords (origin bottom-left, +Y up)
+    \\# window-position-x = 100           # manual override; takes effect when window-position is unset
+    \\# window-position-y = 200           # or specifies the named anchor only (X,Y form clears these)
     \\window-toggle-style = instant       # instant | minimize
     \\hide-on-blur = false                # bool — auto-hide on losing key focus
     \\

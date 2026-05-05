@@ -24,6 +24,12 @@ pub const Config = struct {
         width: ?u32 = null,
         height: ?u32 = null,
         position: Position = .top_center,
+        /// Manual override in NSScreen coords (origin bottom-left of the
+        /// active screen, +Y up). null = use `position`'s enum-derived
+        /// value for that axis. Set via `window-position-x` /
+        /// `window-position-y`, or via the `X,Y` form of `window-position`.
+        position_x: ?f64 = null,
+        position_y: ?f64 = null,
         // Legacy: kept for backward compat. Prefer `theme.opacity`.
         opacity: f64 = 0.95,
         // Legacy: kept for backward compat. Prefer `terminal.font_size`.
@@ -35,7 +41,17 @@ pub const Config = struct {
         /// who toggle frequently typically want the popup to stay put.
         hide_on_blur: bool = false,
 
-        pub const Position = enum { top_center, top_left, top_right, center };
+        pub const Position = enum {
+            top_left,
+            top_center,
+            top_right,
+            center_left,
+            center,
+            center_right,
+            bottom_left,
+            bottom_center,
+            bottom_right,
+        };
         pub const ToggleStyle = enum { instant, minimize };
     };
 
@@ -293,7 +309,25 @@ pub const Config = struct {
         } else if (eq(key, "window-height")) {
             config.window.height = try std.fmt.parseInt(u32, val, 10);
         } else if (eq(key, "window-position")) {
-            config.window.position = std.meta.stringToEnum(WindowConfig.Position, dashToUnder(val)) orelse return error.UnknownEnum;
+            // Two accepted forms: a named enum (e.g. `top_center`) or an
+            // `X,Y` coord pair in NSScreen units. The pair form sets
+            // position_x/y; the enum form clears them so the named anchor
+            // takes full effect even when `-x` / `-y` lines appeared
+            // earlier in the file (precedence by setting, not parse order).
+            if (std.meta.stringToEnum(WindowConfig.Position, dashToUnder(val))) |p| {
+                config.window.position = p;
+                config.window.position_x = null;
+                config.window.position_y = null;
+            } else if (std.mem.indexOfScalar(u8, val, ',')) |idx| {
+                const xs = std.mem.trim(u8, val[0..idx], " \t");
+                const ys = std.mem.trim(u8, val[idx + 1 ..], " \t");
+                config.window.position_x = try std.fmt.parseFloat(f64, xs);
+                config.window.position_y = try std.fmt.parseFloat(f64, ys);
+            } else return error.UnknownEnum;
+        } else if (eq(key, "window-position-x")) {
+            config.window.position_x = try std.fmt.parseFloat(f64, val);
+        } else if (eq(key, "window-position-y")) {
+            config.window.position_y = try std.fmt.parseFloat(f64, val);
         } else if (eq(key, "window-toggle-style")) {
             config.window.toggle_style = std.meta.stringToEnum(WindowConfig.ToggleStyle, dashToUnder(val)) orelse return error.UnknownEnum;
         } else if (eq(key, "window-topmost")) {
@@ -651,6 +685,39 @@ test "Config: parse log pane" {
 test "Config: window-position dash → enum" {
     const config = try Config.parse(std.testing.allocator, "window-position = top-left\n");
     try std.testing.expectEqual(Config.WindowConfig.Position.top_left, config.window.position);
+    try std.testing.expectEqual(@as(?f64, null), config.window.position_x);
+    try std.testing.expectEqual(@as(?f64, null), config.window.position_y);
+}
+
+test "Config: window-position 9-grid arms" {
+    inline for ([_][]const u8{ "bottom_right", "center_left", "center", "bottom-center" }) |name| {
+        const src = "window-position = " ++ name ++ "\n";
+        _ = try Config.parse(std.testing.allocator, src);
+    }
+}
+
+test "Config: window-position X,Y coord pair" {
+    const config = try Config.parse(std.testing.allocator, "window-position = 100,250\n");
+    try std.testing.expectEqual(@as(?f64, 100), config.window.position_x);
+    try std.testing.expectEqual(@as(?f64, 250), config.window.position_y);
+}
+
+test "Config: window-position-x / -y override" {
+    const config = try Config.parse(std.testing.allocator, "window-position-x = 50\nwindow-position-y = 75\n");
+    try std.testing.expectEqual(@as(?f64, 50), config.window.position_x);
+    try std.testing.expectEqual(@as(?f64, 75), config.window.position_y);
+}
+
+test "Config: window-position enum clears earlier manual coords" {
+    const src =
+        \\window-position-x = 100
+        \\window-position-y = 200
+        \\window-position = top_left
+    ;
+    const config = try Config.parse(std.testing.allocator, src);
+    try std.testing.expectEqual(Config.WindowConfig.Position.top_left, config.window.position);
+    try std.testing.expectEqual(@as(?f64, null), config.window.position_x);
+    try std.testing.expectEqual(@as(?f64, null), config.window.position_y);
 }
 
 test "Config: window-toggle-style enum" {
