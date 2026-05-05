@@ -1,6 +1,6 @@
 # djinn TODO
 
-State as of May 4, 2026. **0.1.0-alpha.1 cut**: signed `.app` bundle,
+State as of May 5, 2026. **0.1.0-alpha.1 cut**: signed `.app` bundle,
 GitHub Actions CI + release workflow, branded `.icns`, MIT LICENSE +
 NOTICES, multi-profile sessions, theme inheritance for `light:X,dark:Y`
 specs, dim-priority semantics for `state.json` vs config.
@@ -140,6 +140,38 @@ that don't apply to a Quake-drop panel. **Skip** — listed so nobody
 re-litigates.
 
 ## Recently shipped — current session
+
+### Config wiring + dead-code sweep
+
+- **Wired six previously-dead settings**: `window-toggle-style`,
+  `window-position`, `window-topmost`, `scrollback-size`,
+  `bell-visual`, `mcp-enabled`. Each had been parsed but never
+  consumed since the keys landed.
+- **Window position is now a 9-grid** anchor
+  (`{top,center,bottom}_{left,center,right}`) with optional per-axis
+  manual override (`window-position-x` / `-y`) or an `X,Y` shorthand
+  on `window-position`. NSScreen-native coords (origin bottom-left of
+  the active screen, +Y up). The enum form clears any earlier manual
+  coords, so the named anchor wins regardless of parse order.
+- **`scrollback-size` is now `?u32`** — null = inherit ghostty's 10M
+  default instead of clobbering it with djinn's historical 10K. The
+  override flows through a tmp ghostty config file loaded after
+  `~/.config/ghostty/config`.
+- **`bell-visual` is a brief alpha dim** (→0.4 for 80ms) on RING_BELL.
+  Restoration target is `expected_alpha`, tracked alongside
+  `setBackgroundColor` so theme flips keep it accurate.
+- **`mcp-enabled = false`** skips `McpServer.init`, the accept thread,
+  and `~/.config/djinn/mcp.json` writeback — no stale endpoint
+  pointing at a closed port after toggling off.
+- **Removed truly-dead lines** from the default config template:
+  `cursor-blink`, `cursor-style`, `render-backend`. None had parsers;
+  all emitted "unknown key" warnings on startup.
+- **Dropped unused fields**: `provider.args` (declared, never parsed,
+  never read), `app.g.font_family` / `font_size` (written by
+  `TerminalView.init`, never read; chrome reads `theme.font_*`
+  directly via `Style.fromTheme`).
+- **README config block** now lists option enums and value types
+  inline; `.gitignore` covers `.direnv` + `zig-pkg`.
 
 ### Cmd+Tab focus restoration
 - **`setHidesOnDeactivate:` for blur-hide** — replaces the
