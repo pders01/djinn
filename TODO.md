@@ -1,6 +1,6 @@
 # djinn TODO
 
-State as of May 5, 2026. **0.1.0-alpha.1 cut**: signed `.app` bundle,
+State as of May 6, 2026. **0.1.0-alpha.1 cut**: signed `.app` bundle,
 GitHub Actions CI + release workflow, branded `.icns`, MIT LICENSE +
 NOTICES, multi-profile sessions, theme inheritance for `light:X,dark:Y`
 specs, dim-priority semantics for `state.json` vs config.
@@ -28,23 +28,6 @@ the user's login keychain so every `install-app` keeps TCC grants
 across rebuilds. Local iteration no longer needs `tccutil reset`.
 
 ## Open work — pick from here
-
-### Restart current session / drop to shell *(asked, not started)*
-
-When the script-spawned child exits (Pi exits, agent crashes, user
-runs `exit`), ghostty currently shows "Process exited. Press any key
-to close the terminal." There's no in-app path to re-spawn the same
-profile or fall back to a plain shell.
-
-Sketch:
-- `restart_session` action — frees `app.g.session_manager.active().surface`
-  via `ghostty_surface_free`, then re-runs the spawn path against the
-  same `Session.surface_host` NSView. Bind to `Cmd+R` by default.
-- `shell_session` action — same path but overrides command to
-  `/bin/zsh` for the current session. Bind to `Cmd+Shift+R`.
-- Trickiest part: dispatching the re-spawn on the main queue after
-  `surface_free` returns — ghostty's IO mailbox needs a runloop turn
-  to unwind before a fresh surface binds to the same NSView.
 
 ### Per-profile env vars *(low priority — script subsumes)*
 
@@ -140,6 +123,49 @@ that don't apply to a Quake-drop panel. **Skip** — listed so nobody
 re-litigates.
 
 ## Recently shipped — current session
+
+### Theme reapply on panel show
+
+- **AppKit suppresses `viewDidChangeEffectiveAppearance` for offscreen
+  windows.** Light↔dark flip while the Quake panel is hidden left
+  djinn chrome (tab strip, log pane, find chip, panel bg) stuck on
+  the stale palette while ghostty's surface flipped on its own
+  pipeline — visible mismatch on next show.
+- **`Panel.show` now calls `reapplyThemeIfChanged`** before the
+  redraw recursion. The existing `last_appearance == current_tag`
+  guard inside `reapplyTheme` makes it a cheap no-op when nothing
+  changed; only does work when system actually flipped since last
+  reapply.
+
+### Config-wiring sweep follow-ups
+
+- **`wakeupStub` host_inited guard** — every other `host_storage`
+  accessor checked `host_inited` first; the wakeup path didn't.
+  A future caller skipping `setHost` in the startup path would
+  dereference uninitialized memory on the first ghostty IO wakeup.
+  Added the guard so the stub no-ops cleanly until `setHost`
+  runs.
+- **`dashToUnder` caller-supplied buffer** — replaced the
+  module-level `static var buf[N]` workaround with a caller-passed
+  buffer. The static-var idiom is Zig's way around no
+  function-static locals, but slice escape across calls = clobber
+  if any caller stores the result. No observable bug today (all
+  call sites were synchronous), but the lifetime trap is now
+  explicit at the type level.
+
+### Restart current session / drop to shell
+
+- **`restart_session` action** (Cmd+R) frees the active session's
+  ghostty surface and re-binds a fresh one against the same
+  `Session.surface_host` NSView. Survives "Process exited. Press
+  any key to close." after a script-spawned child exits.
+- **`shell_session` action** (Cmd+Shift+R) same path but overrides
+  the command to `/bin/zsh` — escape hatch when the configured
+  profile script is broken.
+- **Dispatch on next main-queue turn after `surface_free`** —
+  ghostty's IO mailbox needs a runloop cycle to unwind before the
+  same NSView can host a new surface; doing it synchronously
+  hangs the renderer.
 
 ### Config wiring + dead-code sweep
 
