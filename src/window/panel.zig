@@ -305,6 +305,17 @@ pub const Panel = struct {
             self.ns_panel.msgSend(void, "setFrame:display:animate:", .{ target, @as(c_int, 1), @as(c_int, 1) });
         }
 
+        // Re-resolve theme on show. AppKit suppresses
+        // viewDidChangeEffectiveAppearance for offscreen windows, so a
+        // system light↔dark flip while the panel is hidden leaves djinn
+        // chrome (tab strip, log pane, find bar, panel bg) stuck on the
+        // stale palette. Ghostty's surface has its own appearance
+        // pipeline and flips independently — that's why the terminal
+        // pane updates but the chrome around it lags. The internal
+        // `last_appearance == current_tag` guard makes this a no-op
+        // when nothing actually changed.
+        @import("../terminal/view.zig").reapplyThemeIfChanged();
+
         // Force a fresh redraw of the entire view hierarchy. orderOut may
         // discard the backing store; without an explicit invalidation, AppKit
         // can re-display stale or empty pixels after orderFront.

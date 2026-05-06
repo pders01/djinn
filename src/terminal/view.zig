@@ -2109,6 +2109,14 @@ pub fn reloadTheme() void {
     reapplyTheme();
 }
 
+/// Re-resolve theme only if system appearance has actually changed.
+/// Cheap no-op when stable — used by panel show path to recover from
+/// system flips that happened while the panel was offscreen and
+/// AppKit suppressed viewDidChangeEffectiveAppearance.
+pub fn reapplyThemeIfChanged() void {
+    reapplyTheme();
+}
+
 fn reapplyTheme() void {
     const allocator = app.g.allocator orelse return;
     const config = app.g.config orelse return;
