@@ -89,9 +89,25 @@ fn onPanelResize(w: u32, h: u32) void {
 /// and the strings are small (~hundreds of bytes). Avoiding the leak
 /// would mean tracking every duped slice, which the surrounding code
 /// doesn't need today.
+/// mtime cache for the two watched config files. The dispatch
+/// watch is parent-dir-granular (atomic-rename safe), so unrelated
+/// writes in the same dir — most notably djinn's own
+/// `~/.config/djinn/state.json` rewrites on every panel resize —
+/// also fire the FSEvents callback. Comparing against the
+/// previously-seen mtimes lets us short-circuit those before
+/// re-parsing the files + rebuilding chrome / ghostty config.
+var last_djinn_mtime: ?i128 = null;
+var last_ghostty_mtime: ?i128 = null;
+
 fn onConfigChanged() void {
     const allocator = app.g.allocator orelse return;
     const cfg_ptr = app.g.config orelse return;
+
+    // mtime guard: if neither config file has changed since the last
+    // reload, this FSEvent fired for a sibling write (state.json on
+    // resize is the common case). Bail before doing any work.
+    if (!configFilesChanged()) return;
+
     const old = cfg_ptr.*;
 
     // FSEvents may fire mid-rename when an atomic-write editor saves
@@ -281,6 +297,48 @@ fn eqOptStr(a: ?[]const u8, b: ?[]const u8) bool {
 }
 
 fn eqOptU32(a: ?u32, b: ?u32) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return a.? == b.?;
+}
+
+/// Probe djinn + ghostty config mtimes; return true when either
+/// changed since the last reload (or on the first call when the
+/// cache is unset). Updates the cache so subsequent calls compare
+/// against the latest seen values. Missing files (no ghostty
+/// config, deleted djinn config mid-edit) compare as null and only
+/// trigger a reload when the previously-seen value was non-null
+/// (i.e. the file existed and is now gone) — atomic-rename gaps
+/// where the file is briefly missing fall through to
+/// `loadConfigWithRetry`'s ENOENT retries.
+fn configFilesChanged() bool {
+    const home = std.posix.getenv("HOME") orelse return true;
+    var djinn_buf: [512]u8 = undefined;
+    var ghostty_buf: [512]u8 = undefined;
+
+    const djinn_path = std.fmt.bufPrint(&djinn_buf, "{s}/.config/djinn/config", .{home}) catch return true;
+    const ghostty_path = std.fmt.bufPrint(&ghostty_buf, "{s}/.config/ghostty/config", .{home}) catch return true;
+
+    const new_djinn_mt = fileMtime(djinn_path);
+    const new_ghostty_mt = fileMtime(ghostty_path);
+
+    const djinn_changed = !optI128Eq(last_djinn_mtime, new_djinn_mt);
+    const ghostty_changed = !optI128Eq(last_ghostty_mtime, new_ghostty_mt);
+
+    last_djinn_mtime = new_djinn_mt;
+    last_ghostty_mtime = new_ghostty_mt;
+
+    return djinn_changed or ghostty_changed;
+}
+
+fn fileMtime(path: []const u8) ?i128 {
+    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+    const stat = file.stat() catch return null;
+    return stat.mtime;
+}
+
+fn optI128Eq(a: ?i128, b: ?i128) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return a.? == b.?;

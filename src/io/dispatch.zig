@@ -62,7 +62,10 @@ fn fsEventCallback(
 /// idempotent, so dir-granular events are fine — handler ignores
 /// which path actually changed.
 pub fn watchPaths(paths: []const []const u8, handler: *const fn () void) ?*anyopaque {
-    if (paths.len == 0 or paths.len > 8) return null;
+    if (paths.len == 0 or paths.len > 8) {
+        std.debug.print("warning: live config reload disabled — empty or oversize watch list ({d} paths)\n", .{paths.len});
+        return null;
+    }
     fs_handler = handler;
 
     // Strip filename → parent dir, dedup. Two paths under the same
@@ -71,13 +74,22 @@ pub fn watchPaths(paths: []const []const u8, handler: *const fn () void) ?*anyop
     var parents: [8][]const u8 = undefined;
     var parent_count: usize = 0;
     outer: for (paths) |p| {
-        const sep = std.mem.lastIndexOfScalar(u8, p, '/') orelse return null;
+        const sep = std.mem.lastIndexOfScalar(u8, p, '/') orelse {
+            std.debug.print("warning: live config reload disabled — '{s}' has no parent dir\n", .{p});
+            return null;
+        };
         const parent = p[0..sep];
-        if (parent.len == 0 or parent.len >= parent_storage[0].len) return null;
+        if (parent.len == 0 or parent.len >= parent_storage[0].len) {
+            std.debug.print("warning: live config reload disabled — parent dir of '{s}' empty or too long\n", .{p});
+            return null;
+        }
         for (parents[0..parent_count]) |existing| {
             if (std.mem.eql(u8, existing, parent)) continue :outer;
         }
-        if (parent_count >= parents.len) return null;
+        if (parent_count >= parents.len) {
+            std.debug.print("warning: live config reload disabled — too many distinct parent dirs (>{d})\n", .{parents.len});
+            return null;
+        }
         @memcpy(parent_storage[parent_count][0..parent.len], parent);
         parents[parent_count] = parent_storage[parent_count][0..parent.len];
         parent_count += 1;
@@ -86,10 +98,16 @@ pub fn watchPaths(paths: []const []const u8, handler: *const fn () void) ?*anyop
     var cf_strs: [8]?*anyopaque = .{null} ** 8;
     var path_buf: [1024]u8 = undefined;
     for (parents[0..parent_count], 0..) |p, i| {
-        if (p.len >= path_buf.len) return null;
+        if (p.len >= path_buf.len) {
+            std.debug.print("warning: live config reload disabled — parent dir path too long ({d}b)\n", .{p.len});
+            return null;
+        }
         @memcpy(path_buf[0..p.len], p);
         path_buf[p.len] = 0;
-        const s = cf.CFStringCreateWithCString(null, &path_buf, cf.kCFStringEncodingUTF8) orelse return null;
+        const s = cf.CFStringCreateWithCString(null, &path_buf, cf.kCFStringEncodingUTF8) orelse {
+            std.debug.print("warning: live config reload disabled — CFStringCreateWithCString failed\n", .{});
+            return null;
+        };
         cf_strs[i] = @ptrCast(@constCast(s));
     }
 
@@ -98,7 +116,10 @@ pub fn watchPaths(paths: []const []const u8, handler: *const fn () void) ?*anyop
         @ptrCast(&cf_strs),
         @intCast(parent_count),
         &cf.kCFTypeArrayCallBacks,
-    ) orelse return null;
+    ) orelse {
+        std.debug.print("warning: live config reload disabled — CFArrayCreate failed\n", .{});
+        return null;
+    };
 
     const stream = FSEventStreamCreate(
         null,
@@ -108,9 +129,15 @@ pub fn watchPaths(paths: []const []const u8, handler: *const fn () void) ?*anyop
         fs_event_id_since_now,
         0.5,
         fs_flag_file_events,
-    ) orelse return null;
+    ) orelse {
+        std.debug.print("warning: live config reload disabled — FSEventStreamCreate failed\n", .{});
+        return null;
+    };
 
     FSEventStreamSetDispatchQueue(stream, c.dispatch_get_main_queue());
-    if (FSEventStreamStart(stream) == 0) return null;
+    if (FSEventStreamStart(stream) == 0) {
+        std.debug.print("warning: live config reload disabled — FSEventStreamStart failed\n", .{});
+        return null;
+    }
     return stream;
 }
