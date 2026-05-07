@@ -27,7 +27,7 @@ const max_rows: usize = 9;
 pub fn open() void {
     if (app.g.palette_mode) return;
     const sm = app.g.session_manager orelse return;
-    if (sm.sessions.len < 2) return; // nothing to switch between
+    if (sm.sessions.items.len < 2) return; // nothing to switch between
 
     app.g.palette_mode = true;
     app.g.palette_query_len = 0;
@@ -119,7 +119,7 @@ fn moveSelection(delta: i32) void {
     var sessions: usize = 0;
     var current_ordinal: usize = 0;
     var found_current = false;
-    for (sm.sessions, 0..) |sess, i| {
+    for (sm.sessions.items, 0..) |sess, i| {
         if (!matches(sess.profile.label())) continue;
         if (i == app.g.palette_selected) {
             current_ordinal = sessions;
@@ -140,7 +140,7 @@ fn moveSelection(delta: i32) void {
     };
 
     var seen: usize = 0;
-    for (sm.sessions, 0..) |sess, i| {
+    for (sm.sessions.items, 0..) |sess, i| {
         if (!matches(sess.profile.label())) continue;
         if (seen == next_ordinal) {
             app.g.palette_selected = i;
@@ -153,11 +153,11 @@ fn moveSelection(delta: i32) void {
 fn commitSelection() void {
     const sm = app.g.session_manager orelse return;
     const idx = app.g.palette_selected;
-    if (idx >= sm.sessions.len) {
+    if (idx >= sm.sessions.items.len) {
         close();
         return;
     }
-    if (!matches(sm.sessions[idx].profile.label())) {
+    if (!matches(sm.sessions.items[idx].profile.label())) {
         // Selection drifted out of the filter; fall through to first
         // matching row instead.
         const first = firstMatch() orelse {
@@ -173,7 +173,7 @@ fn commitSelection() void {
 
 fn firstMatch() ?usize {
     const sm = app.g.session_manager orelse return null;
-    for (sm.sessions, 0..) |sess, i| {
+    for (sm.sessions.items, 0..) |sess, i| {
         if (matches(sess.profile.label())) return i;
     }
     return null;
@@ -218,7 +218,7 @@ fn mountOverlay() void {
     registerClass();
     const cls = objc.getClass("DjinnPalette") orelse return;
     const sm = app.g.session_manager orelse return;
-    const visible_rows = @min(sm.sessions.len, max_rows);
+    const visible_rows = @min(sm.sessions.items.len, max_rows);
     const palette_h = header_h + @as(f64, @floatFromInt(visible_rows)) * row_h + 8;
     const x = (c_bounds.size.width - palette_w) / 2.0;
     const y = c_bounds.size.height - palette_h - 80; // anchored ~80pt below top edge
@@ -303,7 +303,7 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
     // Rows: one per matching profile, capped at max_rows.
     var y: f64 = header_h;
     var shown: usize = 0;
-    for (sm.sessions, 0..) |sess, i| {
+    for (sm.sessions.items, 0..) |sess, i| {
         if (shown >= max_rows) break;
         const label = sess.profile.label();
         if (!matches(label)) continue;

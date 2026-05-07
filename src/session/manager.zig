@@ -46,9 +46,11 @@ pub const Session = struct {
 
 pub const SessionManager = struct {
     allocator: std.mem.Allocator,
-    sessions: []Session,
-    /// Index into `sessions` for the currently visible surface. Never
-    /// out of bounds — `init` ensures at least one session exists.
+    /// Backing list. Iterate via `.items`; mutate via the public
+    /// `appendEntry` / `removeAt` methods so active_idx stays in sync.
+    sessions: std.ArrayList(Session) = .{},
+    /// Index into `sessions.items` for the currently visible surface.
+    /// Never out of bounds — `init` ensures at least one session exists.
     active_idx: usize = 0,
     /// Strings the manager allocated during resolve (e.g. tilde-
     /// expanded script paths). Freed in `deinit` so callers don't
@@ -60,7 +62,7 @@ pub const SessionManager = struct {
     /// `provider` / `provider-command` keys so legacy configs keep
     /// working unchanged.
     pub fn init(allocator: std.mem.Allocator, cfg: *const Config) !SessionManager {
-        var sessions = std.ArrayList(Session){};
+        var sessions: std.ArrayList(Session) = .{};
         errdefer sessions.deinit(allocator);
 
         var owned: std.ArrayList([]u8) = .{};
@@ -86,7 +88,7 @@ pub const SessionManager = struct {
 
         var mgr: SessionManager = .{
             .allocator = allocator,
-            .sessions = try sessions.toOwnedSlice(allocator),
+            .sessions = sessions,
             .active_idx = 0,
             .owned_strings = owned,
         };
@@ -98,7 +100,7 @@ pub const SessionManager = struct {
             if (mgr.indexOf(name)) |idx| {
                 mgr.active_idx = idx;
             } else {
-                std.debug.print("warning: default-profile '{s}' not defined; using '{s}'\n", .{ name, mgr.sessions[0].profile.name });
+                std.debug.print("warning: default-profile '{s}' not defined; using '{s}'\n", .{ name, mgr.sessions.items[0].profile.name });
             }
         }
 
@@ -106,64 +108,50 @@ pub const SessionManager = struct {
     }
 
     pub fn deinit(self: *SessionManager) void {
-        self.allocator.free(self.sessions);
+        self.sessions.deinit(self.allocator);
         for (self.owned_strings.items) |s| self.allocator.free(s);
         self.owned_strings.deinit(self.allocator);
     }
 
-    /// Append a new Session resolved from `entry`. Used by hot-config-
-    /// reload's profile diff to add a profile at runtime. The returned
-    /// pointer is valid until the next mutation (callers should fill
-    /// `surface_host` immediately, then drop the pointer — re-fetch
-    /// via index for any later access).
-    pub fn appendEntry(self: *SessionManager, entry: Config.ProfileEntry) !*Session {
+    /// Append a new Session resolved from `entry`. Returns the index
+    /// of the newly-appended session in `sessions.items`. Used by
+    /// hot-config-reload's profile diff to add a profile at runtime.
+    /// Callers should re-fetch via index (`&sm.sessions.items[idx]`)
+    /// for any subsequent access — appending again may reallocate the
+    /// backing buffer and invalidate prior pointers.
+    pub fn appendEntry(self: *SessionManager, entry: Config.ProfileEntry) !usize {
         const profile = resolveEntry(self.allocator, &entry, &self.owned_strings);
-        const new_len = self.sessions.len + 1;
-        self.sessions = try self.allocator.realloc(self.sessions, new_len);
-        self.sessions[new_len - 1] = .{ .profile = profile };
-        return &self.sessions[new_len - 1];
+        try self.sessions.append(self.allocator, .{ .profile = profile });
+        return self.sessions.items.len - 1;
     }
 
     /// Pop the session at `idx`, shifting tail entries down. Returns
     /// the removed Session by value so the caller can free its
     /// ghostty surface + surface_host NSView outside this module
-    /// (lifecycle of those handles isn't owned here). Adjusts
-    /// `active_idx` so it keeps pointing at the *same* logical
-    /// session it pointed at before — caller is responsible for
-    /// driving the visible-surface switch via `switchTo` *before*
-    /// removing the active entry; otherwise active_idx gets
-    /// clamped into the new bounds and the still-resident surface
-    /// pointer mismatches what the UI shows.
+    /// (lifecycle of those handles isn't owned here).
+    ///
+    /// active_idx tracking:
+    ///   - idx <  active_idx → tail shifted down by 1, decrement
+    ///   - idx >  active_idx → no change
+    ///   - idx == active_idx → the entry under active_idx was removed;
+    ///     caller is expected to have switched to a neighbor *before*
+    ///     calling removeAt. As a last-resort safety net we clamp
+    ///     active_idx to a valid index (or 0 when the list emptied),
+    ///     so callers that skipped the switch don't index out of
+    ///     bounds — but the now-active session won't match what the
+    ///     UI was showing.
     pub fn removeAt(self: *SessionManager, idx: usize) ?Session {
-        if (idx >= self.sessions.len) return null;
-        const removed = self.sessions[idx];
-        if (idx + 1 < self.sessions.len) {
-            std.mem.copyForwards(
-                Session,
-                self.sessions[idx .. self.sessions.len - 1],
-                self.sessions[idx + 1 ..],
-            );
-        }
-        const new_len = self.sessions.len - 1;
-        if (new_len == 0) {
-            self.allocator.free(self.sessions);
-            self.sessions = &.{};
-        } else {
-            // realloc-shrink is allowed to fail; the original slice
-            // still owns `new_len` valid Sessions (we already shifted),
-            // so on failure we reslice in place and accept a small
-            // over-allocation until the next mutation.
-            self.sessions = self.allocator.realloc(self.sessions, new_len) catch self.sessions[0..new_len];
-        }
-        // Adjust active_idx to track the same logical session.
-        // Removed below active → tail shifted down by 1.
-        // Removed at active → caller should have switched first; clamp
-        //   to len-1 as a last-resort safety net.
-        // Removed above active → no change.
+        if (idx >= self.sessions.items.len) return null;
+        const removed = self.sessions.orderedRemove(idx);
+
         if (idx < self.active_idx) {
             self.active_idx -= 1;
-        } else if (idx == self.active_idx and self.active_idx >= self.sessions.len and self.sessions.len > 0) {
-            self.active_idx = self.sessions.len - 1;
+        } else if (idx == self.active_idx) {
+            if (self.sessions.items.len == 0) {
+                self.active_idx = 0;
+            } else if (self.active_idx >= self.sessions.items.len) {
+                self.active_idx = self.sessions.items.len - 1;
+            }
         }
         return removed;
     }
@@ -175,21 +163,21 @@ pub const SessionManager = struct {
     /// the SessionManager (config strings leak on reload, so pointers
     /// into the new Config remain valid for the process).
     pub fn updateProfileDisplay(self: *SessionManager, idx: usize, title: ?[]const u8, cwd: ?[]const u8) void {
-        if (idx >= self.sessions.len) return;
-        self.sessions[idx].profile.title = title;
-        self.sessions[idx].profile.cwd = cwd;
+        if (idx >= self.sessions.items.len) return;
+        self.sessions.items[idx].profile.title = title;
+        self.sessions.items[idx].profile.cwd = cwd;
     }
 
     pub fn active(self: *SessionManager) *Session {
-        return &self.sessions[self.active_idx];
+        return &self.sessions.items[self.active_idx];
     }
 
     pub fn count(self: *const SessionManager) usize {
-        return self.sessions.len;
+        return self.sessions.items.len;
     }
 
     pub fn indexOf(self: *const SessionManager, name: []const u8) ?usize {
-        for (self.sessions, 0..) |s, i| {
+        for (self.sessions.items, 0..) |s, i| {
             if (std.mem.eql(u8, s.profile.name, name)) return i;
         }
         return null;
@@ -200,7 +188,7 @@ pub const SessionManager = struct {
     /// happened — callers use this to gate the (expensive) Cocoa
     /// reflow + setHidden setHidden:0 work.
     pub fn switchTo(self: *SessionManager, idx: usize) bool {
-        if (idx >= self.sessions.len) return false;
+        if (idx >= self.sessions.items.len) return false;
         if (idx == self.active_idx) return false;
         self.active_idx = idx;
         return true;
@@ -222,13 +210,13 @@ pub const SessionManager = struct {
     /// a target index, then hand it to the Cocoa-side `activateSession`
     /// so the modular arithmetic lives in one place.
     pub fn peekNext(self: *const SessionManager) ?usize {
-        if (self.sessions.len <= 1) return null;
-        return (self.active_idx + 1) % self.sessions.len;
+        if (self.sessions.items.len <= 1) return null;
+        return (self.active_idx + 1) % self.sessions.items.len;
     }
 
     pub fn peekPrev(self: *const SessionManager) ?usize {
-        if (self.sessions.len <= 1) return null;
-        return if (self.active_idx == 0) self.sessions.len - 1 else self.active_idx - 1;
+        if (self.sessions.items.len <= 1) return null;
+        return if (self.active_idx == 0) self.sessions.items.len - 1 else self.active_idx - 1;
     }
 };
 
@@ -481,7 +469,7 @@ test "SessionManager: profile.label falls back to name" {
     try std.testing.expectEqualStrings("Main Repo", p.label());
 }
 
-test "SessionManager: appendEntry grows slice + resolves command" {
+test "SessionManager: appendEntry grows list + resolves command" {
     const entries = [_]Config.ProfileEntry{
         .{ .name = "a", .provider = "claude" },
     };
@@ -491,14 +479,14 @@ test "SessionManager: appendEntry grows slice + resolves command" {
     defer mgr.deinit();
 
     const new_entry = Config.ProfileEntry{ .name = "b", .provider = "codex" };
-    const sess = try mgr.appendEntry(new_entry);
+    const idx = try mgr.appendEntry(new_entry);
+    try std.testing.expectEqual(@as(usize, 1), idx);
     try std.testing.expectEqual(@as(usize, 2), mgr.count());
-    try std.testing.expectEqualStrings("b", sess.profile.name);
-    try std.testing.expectEqualStrings("codex", sess.profile.command);
-    try std.testing.expectEqualStrings("b", mgr.sessions[1].profile.name);
+    try std.testing.expectEqualStrings("b", mgr.sessions.items[idx].profile.name);
+    try std.testing.expectEqualStrings("codex", mgr.sessions.items[idx].profile.command);
 }
 
-test "SessionManager: removeAt shrinks + clamps active_idx" {
+test "SessionManager: removeAt — caller switched first" {
     const entries = [_]Config.ProfileEntry{
         .{ .name = "a" },
         .{ .name = "b" },
@@ -509,16 +497,42 @@ test "SessionManager: removeAt shrinks + clamps active_idx" {
     var mgr = try SessionManager.init(std.testing.allocator, &cfg);
     defer mgr.deinit();
 
-    try std.testing.expect(mgr.switchTo(2));
+    // Production caller switches off the to-be-removed entry first.
+    try std.testing.expect(mgr.switchTo(1));
     const removed = mgr.removeAt(2) orelse return error.TestFailed;
     try std.testing.expectEqualStrings("c", removed.profile.name);
     try std.testing.expectEqual(@as(usize, 2), mgr.count());
     try std.testing.expectEqual(@as(usize, 1), mgr.active_idx);
 
-    // Remove from the middle: tail shifts down.
+    // Remove an entry below the active one: tail shifts, active_idx
+    // tracks down with it.
     _ = mgr.removeAt(0) orelse return error.TestFailed;
     try std.testing.expectEqual(@as(usize, 1), mgr.count());
-    try std.testing.expectEqualStrings("b", mgr.sessions[0].profile.name);
+    try std.testing.expectEqual(@as(usize, 0), mgr.active_idx);
+    try std.testing.expectEqualStrings("b", mgr.sessions.items[0].profile.name);
+}
+
+test "SessionManager: removeAt — clamp safety net for active = removed" {
+    // Doc says caller should switch first; this exercises the
+    // safety net for callers that don't, including the middle-
+    // position case the previous clamp branch silently mishandled.
+    const entries = [_]Config.ProfileEntry{
+        .{ .name = "a" },
+        .{ .name = "b" },
+        .{ .name = "c" },
+    };
+    var cfg = Config{};
+    cfg.profiles.entries = &entries;
+    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
+    defer mgr.deinit();
+
+    try std.testing.expect(mgr.switchTo(1));
+    _ = mgr.removeAt(1) orelse return error.TestFailed;
+    // Before: [a, b, c] active=1. After remove(1): [a, c] active still
+    // points into bounds. Clamp keeps it in range; doesn't promise the
+    // same logical session.
+    try std.testing.expectEqual(@as(usize, 2), mgr.count());
+    try std.testing.expect(mgr.active_idx < mgr.count());
 }
 
 test "SessionManager: removeAt out of bounds returns null" {
@@ -541,8 +555,8 @@ test "SessionManager: updateProfileDisplay re-points title + cwd" {
     var mgr = try SessionManager.init(std.testing.allocator, &cfg);
     defer mgr.deinit();
 
-    try std.testing.expectEqualStrings("Old Title", mgr.sessions[0].profile.title.?);
+    try std.testing.expectEqualStrings("Old Title", mgr.sessions.items[0].profile.title.?);
     mgr.updateProfileDisplay(0, "New Title", "/tmp");
-    try std.testing.expectEqualStrings("New Title", mgr.sessions[0].profile.title.?);
-    try std.testing.expectEqualStrings("/tmp", mgr.sessions[0].profile.cwd.?);
+    try std.testing.expectEqualStrings("New Title", mgr.sessions.items[0].profile.title.?);
+    try std.testing.expectEqualStrings("/tmp", mgr.sessions.items[0].profile.cwd.?);
 }

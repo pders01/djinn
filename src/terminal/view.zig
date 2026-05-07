@@ -685,7 +685,7 @@ fn applyLogLayout(container: objc.Object, term_w: f64, log_w: f64, height: f64) 
     // session_manager pointer is set before any caller of
     // applyLogLayout fires; no fallback path needed.
     if (app.g.session_manager) |sm| {
-        for (sm.sessions) |sess| {
+        for (sm.sessions.items) |sess| {
             if (sess.surface_host) |sid| {
                 objc.Object.fromId(sid).msgSend(void, "setFrame:", .{NSRect{
                     .origin = .{ .x = 0, .y = 0 },
@@ -1727,10 +1727,8 @@ fn actionToggleLogPane() void {
 /// Reads the current log width off the live frame so a user's
 /// drag-resize or Cmd+/ toggle isn't reset.
 pub fn relayout() void {
-    const view_id = app.g.view_id orelse return;
-    const term_view = objc.Object.fromId(view_id);
-    const container = term_view.msgSend(objc.Object, "superview", .{});
-    if (container.value == null) return;
+    const container_id = app.g.container_id orelse return;
+    const container = objc.Object.fromId(container_id);
     const c_bounds = container.msgSend(NSRect, "bounds", .{});
 
     var log_w: f64 = 0;

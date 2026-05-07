@@ -28,7 +28,6 @@ const brand_text: [:0]const u8 = "جن";
 pub const Menubar = struct {
     status_item: ?objc.Object = null,
     state_menu_item: ?objc.Object = null,
-    enabled: bool = true,
 
     pub fn init() Menubar {
         registerControllerClass();
@@ -62,7 +61,6 @@ pub const Menubar = struct {
     }
 
     pub fn updateState(self: *Menubar, state: AgentState, message: []const u8) void {
-        if (!self.enabled) return;
         const item = self.status_item orelse return;
         const button = item.msgSend(objc.Object, "button", .{});
         if (state == .idle) {
@@ -79,7 +77,7 @@ pub const Menubar = struct {
             // matters under multi-profile and is noise otherwise.
             var profile_label: []const u8 = "";
             if (app_state.g.session_manager) |sm| {
-                if (sm.sessions.len > 1) profile_label = sm.active().profile.label();
+                if (sm.sessions.items.len > 1) profile_label = sm.active().profile.label();
             }
             var buf: [256]u8 = undefined;
             const txt = std.fmt.bufPrintZ(&buf, "{s}{s}{s}{s}{s}", .{

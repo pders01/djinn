@@ -609,7 +609,7 @@ const c_dispatch = @cImport({
 fn handleChildExited(host: *HostContext, _: c.ghostty_app_t, target: c.ghostty_target_s, _: c.ghostty_action_s) bool {
     if (host.app_state.session_manager) |sm| {
         if (target.tag == c.GHOSTTY_TARGET_SURFACE) {
-            for (sm.sessions) |*sess| {
+            for (sm.sessions.items) |*sess| {
                 if (sess.surface) |sp| {
                     const surf: c.ghostty_surface_t = @ptrCast(sp);
                     if (surf == target.target.surface) {

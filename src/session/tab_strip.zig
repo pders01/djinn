@@ -106,7 +106,7 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
     const bounds = view.msgSend(NSRect, "bounds", .{});
     const style = app.g.chrome_style orelse return;
     const sm = app.g.session_manager orelse return;
-    if (sm.sessions.len < 2) return;
+    if (sm.sessions.items.len < 2) return;
 
     const NSColor = objc.getClass("NSColor") orelse return;
     const NSBezierPath = objc.getClass("NSBezierPath") orelse return;
@@ -123,7 +123,7 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
     bg.msgSend(void, "set", .{});
     NSBezierPath.msgSend(void, "fillRect:", .{bounds});
 
-    const tab_count: f64 = @floatFromInt(sm.sessions.len);
+    const tab_count: f64 = @floatFromInt(sm.sessions.items.len);
     const tab_w = bounds.size.width / tab_count;
 
     const font = chrome.chromeFont(NSFont, style.font_family, style.font_size_chip);
@@ -135,7 +135,7 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
     // No fills, no underlines — the strip recedes into chrome and
     // the active tab reads via contrast alone. Same idiom as the log
     // pane's per-entry header (`{client} · HH:MM` in dim, body in fg).
-    for (sm.sessions, 0..) |sess, i| {
+    for (sm.sessions.items, 0..) |sess, i| {
         const x = @as(f64, @floatFromInt(i)) * tab_w;
         const is_active = i == sm.active_idx;
 
@@ -169,7 +169,7 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
 
 fn mouseDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
     const sm = app.g.session_manager orelse return;
-    if (sm.sessions.len < 2) return;
+    if (sm.sessions.items.len < 2) return;
 
     const view = objc.Object.fromId(self_id);
     const event = objc.Object.fromId(event_id);
@@ -177,12 +177,12 @@ fn mouseDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callcon
     const local = view.msgSend(NSPoint, "convertPoint:fromView:", .{ win_pt, @as(?*anyopaque, null) });
     const bounds = view.msgSend(NSRect, "bounds", .{});
 
-    const tab_count: f64 = @floatFromInt(sm.sessions.len);
+    const tab_count: f64 = @floatFromInt(sm.sessions.items.len);
     const tab_w = bounds.size.width / tab_count;
     const idx_f = local.x / tab_w;
     if (idx_f < 0) return;
     const idx: usize = @intFromFloat(@floor(idx_f));
-    if (idx >= sm.sessions.len) return;
+    if (idx >= sm.sessions.items.len) return;
     if (idx == sm.active_idx) return;
 
     // Re-route through main.zig's activateSession so the surface

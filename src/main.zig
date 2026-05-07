@@ -184,7 +184,7 @@ fn reconcileProfiles(old: Config, new_cfg: Config) void {
     // earlier indices stay stable while we mutate.
     var remove_buf: [32]usize = undefined;
     var remove_count: usize = 0;
-    for (sm.sessions, 0..) |sess, i| {
+    for (sm.sessions.items, 0..) |sess, i| {
         var found = false;
         for (new_cfg.profiles.entries) |new_e| {
             if (std.mem.eql(u8, sess.profile.name, new_e.name)) {
@@ -211,7 +211,7 @@ fn reconcileProfiles(old: Config, new_cfg: Config) void {
     // session by name.
     for (new_cfg.profiles.entries) |new_e| {
         var found = false;
-        for (sm.sessions) |sess| {
+        for (sm.sessions.items) |sess| {
             if (std.mem.eql(u8, sess.profile.name, new_e.name)) {
                 found = true;
                 break;
@@ -438,7 +438,7 @@ fn applyKeymapOverrides(cfg: *const Config) void {
 /// / `prev_tab` action handlers in view.zig.
 pub fn activateSession(idx: usize) bool {
     const sm = app.g.session_manager orelse return false;
-    if (idx >= sm.sessions.len) return false;
+    if (idx >= sm.sessions.items.len) return false;
     if (idx == sm.active_idx) return false;
 
     // Capture the old index up front + index by slot so the `old` /
@@ -446,7 +446,7 @@ pub fn activateSession(idx: usize) bool {
     // flips `active_idx`. Both slots are reached via explicit array
     // index, never via `sm.active()` after the switch.
     const old_idx = sm.active_idx;
-    const old_sess: *Session = &sm.sessions[old_idx];
+    const old_sess: *Session = &sm.sessions.items[old_idx];
     if (old_sess.surface_host) |host| {
         objc.Object.fromId(host).msgSend(void, "setHidden:", .{@as(c_int, 1)});
     }
@@ -455,7 +455,7 @@ pub fn activateSession(idx: usize) bool {
     }
 
     _ = sm.switchTo(idx);
-    const new_sess: *Session = &sm.sessions[idx];
+    const new_sess: *Session = &sm.sessions.items[idx];
     const new_host = objc.Object.fromId(new_sess.surface_host orelse return false);
     new_host.msgSend(void, "setHidden:", .{@as(c_int, 0)});
 
@@ -634,7 +634,7 @@ fn addSessionLive(entry: Config.ProfileEntry) !void {
     const will_cross = sm.count() == 1;
     if (will_cross) ensureTabStripVisible(true);
 
-    const sess = try sm.appendEntry(entry);
+    const new_idx = try sm.appendEntry(entry);
 
     // Mirror the active host's frame + autoresizing mask so the new
     // host stays in lockstep with terminal/log/divider on container
@@ -654,7 +654,7 @@ fn addSessionLive(entry: Config.ProfileEntry) !void {
     // (eventual) active surface.
     const NSWindowBelow: c_long = -1;
     container.msgSend(void, "addSubview:positioned:relativeTo:", .{ sh, NSWindowBelow, template });
-    sess.surface_host = sh.value;
+    sm.sessions.items[new_idx].surface_host = sh.value;
 
     // Force AppKit to commit the new sibling subview into the
     // layer tree on this runloop turn. addSubview alone schedules
@@ -681,8 +681,8 @@ fn addSessionLive(entry: Config.ProfileEntry) !void {
 /// shrinks the session slice. Crossing 2→1 destroys the tab strip.
 fn removeSessionLive(idx: usize) void {
     const sm = app.g.session_manager orelse return;
-    if (idx >= sm.sessions.len) return;
-    if (sm.sessions.len <= 1) {
+    if (idx >= sm.sessions.items.len) return;
+    if (sm.sessions.items.len <= 1) {
         // Removing the last profile would leave the host with no
         // surface to show. Treat as restart-required.
         std.debug.print("config: cannot remove last profile at runtime; restart djinn after editing config\n", .{});
@@ -690,17 +690,23 @@ fn removeSessionLive(idx: usize) void {
     }
 
     if (idx == sm.active_idx) {
-        const fallback: usize = if (idx + 1 < sm.sessions.len) idx + 1 else 0;
+        const fallback: usize = if (idx + 1 < sm.sessions.items.len) idx + 1 else 0;
         _ = activateSession(fallback);
     }
 
-    var dying = sm.sessions[idx];
+    const dying = sm.sessions.items[idx];
     if (dying.surface) |sp| {
         if (app.g.ghostty_app) |ga| ga.surfaceFree(@ptrCast(sp));
-        dying.surface = null;
     }
     if (dying.surface_host) |sh_id| {
-        objc.Object.fromId(sh_id).msgSend(void, "removeFromSuperview", .{});
+        const sh = objc.Object.fromId(sh_id);
+        sh.msgSend(void, "removeFromSuperview", .{});
+        // removeFromSuperview drops the container's retain, but the
+        // +1 from `[NSView alloc]` in addSessionLive is still ours.
+        // Release it so the NSView (and its CAMetalLayer / backing
+        // store from the bound ghostty surface) actually deallocs
+        // instead of leaking on every profile removal.
+        sh.msgSend(void, "release", .{});
     }
     _ = sm.removeAt(idx);
 
@@ -796,7 +802,7 @@ fn buildContainer(
     const tab_strip = @import("session/tab_strip.zig");
     var tab_h: f64 = 0;
     if (app.g.session_manager) |sm| {
-        if (sm.sessions.len > 1) tab_h = tab_strip.tab_h;
+        if (sm.sessions.items.len > 1) tab_h = tab_strip.tab_h;
     }
     const term_h = @max(1.0, height - tab_h);
 
@@ -1028,7 +1034,7 @@ pub fn main() !void {
     // binds a CAMetalLayer to whichever NSView its `newSurface` call
     // points at, so each session gets its own host.
     const NSView_surface = objc.getClass("NSView") orelse unreachable;
-    for (session_manager.sessions, 0..) |*s, i| {
+    for (session_manager.sessions.items, 0..) |*s, i| {
         const sh_alloc = NSView_surface.msgSend(objc.Object, "alloc", .{});
         const sh = sh_alloc.msgSend(
             objc.Object,
@@ -1057,11 +1063,11 @@ pub fn main() !void {
     // them under TerminalView so the transparent overlay still captures
     // key + mouse events. Visibility is governed by setHidden:; switching
     // tabs flips it.
-    if (session_manager.sessions.len > 1) {
+    if (session_manager.sessions.items.len > 1) {
         const NSWindowBelow: c_long = -1;
         const term_frame = surface_host.msgSend(NSRect, "frame", .{});
         const term_mask = surface_host.msgSend(c_ulong, "autoresizingMask", .{});
-        for (session_manager.sessions, 0..) |s, i| {
+        for (session_manager.sessions.items, 0..) |s, i| {
             if (i == session_manager.active_idx) continue;
             const sh = objc.Object.fromId(s.surface_host.?);
             sh.msgSend(void, "setFrame:", .{term_frame});
@@ -1132,7 +1138,7 @@ pub fn main() !void {
     // bound are skipped (s.surface = null).
     defer {
         if (ghostty_app_opt) |*ga| {
-            for (session_manager.sessions) |sess| {
+            for (session_manager.sessions.items) |sess| {
                 if (sess.surface) |sp| ga.surfaceFree(@ptrCast(sp));
             }
         }
