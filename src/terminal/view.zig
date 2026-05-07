@@ -2133,7 +2133,17 @@ fn reapplyTheme() void {
         .dark => 2,
     };
     if (app.g.last_appearance == current_tag) return;
-    app.g.last_appearance = current_tag;
+
+    // Push the new appearance to ghostty + reload its Config BEFORE
+    // theme.resolve runs. theme.resolve reads `app.g.ghostty_config`
+    // via applyFromGhostty, so the chrome palette is sourced from
+    // whichever variant ghostty currently has resolved for `theme =
+    // light:X,dark:Y`. If we resolve first, chrome locks onto the
+    // pre-flip variant while the surface (which ghostty repaints on
+    // its own pipeline) flips correctly — produces the visible
+    // tab-strip / panel-bg mismatch reported on light↔dark flips.
+    ghostty_runtime.appSetColorScheme(current_appearance == .dark);
+    ghostty_runtime.reloadConfigFromDisk();
 
     var new_theme = theme_mod.resolve(allocator, .{
         .inherit_ghostty_config = config.theme.inherit_ghostty,
@@ -2149,10 +2159,6 @@ fn reapplyTheme() void {
     }) catch return;
     defer new_theme.deinit();
 
-    // Surface owns its own palette via its resolved Config; theme.resolve
-    // already pulled the latest values when run. Push log_pane + menubar
-    // colors so the host UI matches.
-
     const new_style = chrome_mod.Style.fromTheme(new_theme);
     app.g.chrome_style = new_style;
     if (app.g.log_view) |lv| lv.applyStyle(new_style);
@@ -2166,10 +2172,9 @@ fn reapplyTheme() void {
         p.setBackgroundColor(bg_r, bg_g, bg_b, new_theme.opacity);
     }
 
-    // Push the new appearance to ghostty so the surface re-resolves
-    // its conditional state (`theme = light:X,dark:Y`). Without this,
-    // chrome flips with the system but the terminal palette stays on
-    // whichever variant ghostty picked at boot.
-    ghostty_runtime.appSetColorScheme(current_appearance == .dark);
-    ghostty_runtime.reloadConfigFromDisk();
+    // Stamp last_appearance only after a successful apply. Pre-stamping
+    // and bailing on theme.resolve failure would poison the guard —
+    // every subsequent call would short-circuit until the system
+    // flipped a second time.
+    app.g.last_appearance = current_tag;
 }
