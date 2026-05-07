@@ -50,13 +50,42 @@ fn fsEventCallback(
 /// (caller doesn't need it for liveness — the stream stays scheduled
 /// until process exit). Returns null on any setup failure; callers
 /// should treat that as "live reload disabled" and continue.
+///
+/// Internally watches the *parent directory* of each path (deduped),
+/// not the file path itself. FSEventStreamCreate resolves paths to
+/// (device, inode) at create time; atomic-rename saves (vim/VSCode/
+/// Helix write a tmp file then rename over the target) swap the
+/// inode at the file path, and event delivery on the original
+/// per-file watch can stop after the first save. Parent-dir watch is
+/// on the dir's inode, which is stable across child rename-replace,
+/// so reloads keep firing on every save. Reload itself is fan-in +
+/// idempotent, so dir-granular events are fine — handler ignores
+/// which path actually changed.
 pub fn watchPaths(paths: []const []const u8, handler: *const fn () void) ?*anyopaque {
     if (paths.len == 0 or paths.len > 8) return null;
     fs_handler = handler;
 
+    // Strip filename → parent dir, dedup. Two paths under the same
+    // dir collapse to one watch.
+    var parent_storage: [8][512]u8 = undefined;
+    var parents: [8][]const u8 = undefined;
+    var parent_count: usize = 0;
+    outer: for (paths) |p| {
+        const sep = std.mem.lastIndexOfScalar(u8, p, '/') orelse return null;
+        const parent = p[0..sep];
+        if (parent.len == 0 or parent.len >= parent_storage[0].len) return null;
+        for (parents[0..parent_count]) |existing| {
+            if (std.mem.eql(u8, existing, parent)) continue :outer;
+        }
+        if (parent_count >= parents.len) return null;
+        @memcpy(parent_storage[parent_count][0..parent.len], parent);
+        parents[parent_count] = parent_storage[parent_count][0..parent.len];
+        parent_count += 1;
+    }
+
     var cf_strs: [8]?*anyopaque = .{null} ** 8;
     var path_buf: [1024]u8 = undefined;
-    for (paths, 0..) |p, i| {
+    for (parents[0..parent_count], 0..) |p, i| {
         if (p.len >= path_buf.len) return null;
         @memcpy(path_buf[0..p.len], p);
         path_buf[p.len] = 0;
@@ -67,7 +96,7 @@ pub fn watchPaths(paths: []const []const u8, handler: *const fn () void) ?*anyop
     const arr = cf.CFArrayCreate(
         null,
         @ptrCast(&cf_strs),
-        @intCast(paths.len),
+        @intCast(parent_count),
         &cf.kCFTypeArrayCallBacks,
     ) orelse return null;
 

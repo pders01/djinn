@@ -125,6 +125,25 @@ pub const Menubar = struct {
             status_bar.msgSend(void, "removeStatusItem:", .{item});
         }
     }
+
+    /// Toggle status-item presence at runtime. Used by config-reload
+    /// when `notifications.menubar-icon` flips. No-op when the
+    /// requested state already matches the current item presence.
+    /// Re-enable rebuilds the item via `init` — `g_show_hide_handler`
+    /// is global so the new menu inherits the existing handler.
+    pub fn setEnabled(self: *Menubar, on: bool) void {
+        if (on == (self.status_item != null)) return;
+        if (on) {
+            self.* = Menubar.init();
+        } else {
+            const NSStatusBar = objc.getClass("NSStatusBar") orelse return;
+            const status_bar = NSStatusBar.msgSend(objc.Object, "systemStatusBar", .{});
+            if (self.status_item) |item|
+                status_bar.msgSend(void, "removeStatusItem:", .{item});
+            self.status_item = null;
+            self.state_menu_item = null;
+        }
+    }
 };
 
 /// Render brand_text as a template NSImage using NSAttributedString. Uses

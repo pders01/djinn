@@ -92,6 +92,7 @@ fn onPanelResize(w: u32, h: u32) void {
 fn onConfigChanged() void {
     const allocator = app.g.allocator orelse return;
     const cfg_ptr = app.g.config orelse return;
+    const old = cfg_ptr.*;
 
     // FSEvents may fire mid-rename when an atomic-write editor saves
     // (vim, VS Code, Helix). Retry a few times with a short sleep so
@@ -106,10 +107,24 @@ fn onConfigChanged() void {
         if (app.g.hotkey) |hk| hk.setBinding(kb.keycode, kb.modifiers);
     } else |_| {}
 
-    if (app.g.panel) |p| p.setHideOnBlur(new_cfg.window.hide_on_blur);
+    if (app.g.panel) |p| {
+        p.setHideOnBlur(new_cfg.window.hide_on_blur);
+        p.setTopmost(new_cfg.window.topmost);
+        p.setInstantToggle(new_cfg.window.toggle_style == .instant);
+    }
 
     if (app.g.notifier) |n| n.enabled = new_cfg.notifications.system_notifications;
     if (app.g.tool_table) |tt| tt.attention_sound = new_cfg.notifications.attention_sound;
+    if (app.g.menubar) |mb| mb.setEnabled(new_cfg.notifications.menubar_icon);
+
+    // Log-pane visibility: only re-apply when the config value
+    // actually changed. `toggle_log_pane` (Cmd+/) flips the same
+    // state at runtime; resetting on every save would clobber the
+    // user's hotkey override every time they edit any unrelated
+    // config field.
+    if (new_cfg.log_pane.enabled != old.log_pane.enabled) {
+        view_mod.setLogPaneHidden(!new_cfg.log_pane.enabled);
+    }
 
     if (new_cfg.system.open_at_login) {
         loginitem.register() catch {};
@@ -126,12 +141,55 @@ fn onConfigChanged() void {
         _ = view_mod.rebind(entry.name, parsed.modifiers, parsed.keycode);
     }
 
-    // Push fresh ghostty config to the surface — picks up the user's
-    // ~/.config/ghostty/config edits (cursor-style, font, theme, …).
-    ghostty_runtime.reloadConfigFromDisk();
+    warnRestartRequired(old, new_cfg);
 
     cfg_ptr.* = new_cfg;
+    // reloadTheme → reapplyTheme already calls
+    // ghostty_runtime.reloadConfigFromDisk + appSetColorScheme as
+    // part of its path (see view.zig:reapplyTheme). Calling it
+    // explicitly here too would do the same file-read + parse twice
+    // on every save.
     view_mod.reloadTheme();
+}
+
+/// Emit one stderr warning per restart-required key whose value
+/// changed. These are config keys with no live-apply path today —
+/// users would otherwise edit + save + see no effect with no
+/// indication why. Stderr surfaces in `Console.app` for `.app`
+/// launches and the launching terminal for `just run`.
+fn warnRestartRequired(old: Config, new_cfg: Config) void {
+    if (old.mcp.enabled != new_cfg.mcp.enabled) {
+        std.debug.print("config: 'mcp-enabled' change requires restart\n", .{});
+    }
+    if (!eqOptStr(old.mcp.socket_path, new_cfg.mcp.socket_path)) {
+        std.debug.print("config: 'mcp-socket-path' change requires restart\n", .{});
+    }
+    if (!eqOptU32(old.scrollback.size, new_cfg.scrollback.size)) {
+        std.debug.print("config: 'scrollback-size' change requires restart\n", .{});
+    }
+    if (!std.mem.eql(u8, old.provider.name, new_cfg.provider.name) or
+        !eqOptStr(old.provider.command, new_cfg.provider.command))
+    {
+        std.debug.print("config: 'provider' / 'provider-command' change requires restart\n", .{});
+    }
+    if (!eqOptStr(old.profiles.default, new_cfg.profiles.default)) {
+        std.debug.print("config: 'default-profile' change requires restart\n", .{});
+    }
+    if (old.profiles.entries.len != new_cfg.profiles.entries.len) {
+        std.debug.print("config: 'profile.*' add/remove requires restart\n", .{});
+    }
+}
+
+fn eqOptStr(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn eqOptU32(a: ?u32, b: ?u32) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return a.? == b.?;
 }
 
 /// Reload the djinn config from disk with three short retries.
