@@ -157,6 +157,12 @@ pub const AppState = struct {
     /// otherwise. Action handlers + applyLogLayout consult this to
     /// decide whether to reserve `tab_strip.tab_h` at the top.
     tab_strip_id: ?objc.c.id = null,
+    /// Outer container NSView holding terminal / log / divider /
+    /// surface_host(s) / tab strip. Stashed for hot-reload's
+    /// runtime profile add path so `addSessionLive` can attach a new
+    /// surface_host without threading the container reference through
+    /// every caller. Set once in main() after `buildContainer`.
+    container_id: ?objc.c.id = null,
     /// Pointer to the 1px CALayer-backed subview that paints the tab
     /// strip's bottom hairline. Stable for the strip's lifetime so
     /// `applyStyle` can repaint it on theme flips without walking

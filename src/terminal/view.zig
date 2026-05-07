@@ -1718,6 +1718,30 @@ fn actionToggleLogPane() void {
     setLogPaneHidden(log_frame.size.width > 0);
 }
 
+/// Re-run the container's tab-aware reflow against the live log
+/// width, without changing log visibility. Used by hot-config-reload's
+/// session add/remove path: after building or removing the tab
+/// strip we need every child (terminal, log, divider, surface_hosts)
+/// to absorb / release `tab_strip.tab_h` of vertical space, and
+/// `applyLogLayout` is the canonical place where that math lives.
+/// Reads the current log width off the live frame so a user's
+/// drag-resize or Cmd+/ toggle isn't reset.
+pub fn relayout() void {
+    const view_id = app.g.view_id orelse return;
+    const term_view = objc.Object.fromId(view_id);
+    const container = term_view.msgSend(objc.Object, "superview", .{});
+    if (container.value == null) return;
+    const c_bounds = container.msgSend(NSRect, "bounds", .{});
+
+    var log_w: f64 = 0;
+    if (app.g.log_view) |lv| {
+        log_w = lv.view.msgSend(NSRect, "frame", .{}).size.width;
+    }
+    const eff_div_w: f64 = if (log_w > 0) divider_width else 0;
+    const term_w = @max(1.0, c_bounds.size.width - log_w - eff_div_w);
+    applyLogLayout(container, term_w, log_w, c_bounds.size.height);
+}
+
 /// Show or hide the log pane at runtime. Hidden state collapses log +
 /// divider frames to width 0 (Metal-layer compositor honors zero-pixel
 /// frames, unlike setHidden which left translucent leaks). Stays in

@@ -142,6 +142,7 @@ fn onConfigChanged() void {
     }
 
     warnRestartRequired(old, new_cfg);
+    reconcileProfiles(old, new_cfg);
 
     cfg_ptr.* = new_cfg;
     // reloadTheme → reapplyTheme already calls
@@ -150,6 +151,94 @@ fn onConfigChanged() void {
     // explicitly here too would do the same file-read + parse twice
     // on every save.
     view_mod.reloadTheme();
+}
+
+/// Diff old vs new profile entries against the running
+/// SessionManager. Drives the live-add / live-remove / live-update
+/// paths so users can manage sessions by editing config without a
+/// restart. The legacy single-profile path (zero entries on either
+/// side) is restart-required and skipped here — `warnRestartRequired`
+/// surfaces it.
+fn reconcileProfiles(old: Config, new_cfg: Config) void {
+    const sm = app.g.session_manager orelse return;
+    if (old.profiles.entries.len == 0 or new_cfg.profiles.entries.len == 0) return;
+
+    // Phase 1: collect indices of sessions whose name is no longer
+    // present in the new config. Removed in *descending* order so
+    // earlier indices stay stable while we mutate.
+    var remove_buf: [32]usize = undefined;
+    var remove_count: usize = 0;
+    for (sm.sessions, 0..) |sess, i| {
+        var found = false;
+        for (new_cfg.profiles.entries) |new_e| {
+            if (std.mem.eql(u8, sess.profile.name, new_e.name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            if (remove_count >= remove_buf.len) {
+                std.debug.print("config: too many profile removals in one save; restart for a clean slate\n", .{});
+                break;
+            }
+            remove_buf[remove_count] = i;
+            remove_count += 1;
+        }
+    }
+    var ri = remove_count;
+    while (ri > 0) {
+        ri -= 1;
+        removeSessionLive(remove_buf[ri]);
+    }
+
+    // Phase 2: append new entries that don't match any current
+    // session by name.
+    for (new_cfg.profiles.entries) |new_e| {
+        var found = false;
+        for (sm.sessions) |sess| {
+            if (std.mem.eql(u8, sess.profile.name, new_e.name)) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            addSessionLive(new_e) catch |err| {
+                std.debug.print("config: failed to add profile '{s}': {}\n", .{ new_e.name, err });
+            };
+        }
+    }
+
+    // Phase 3: re-point display fields on matched-name sessions +
+    // warn for spawn-affecting changes (command / script / provider).
+    // Match-by-name walk over the *new* config so post-add iterations
+    // see appended sessions too. We only re-point title/cwd because
+    // the spawn command is already baked into Session.profile by
+    // resolveEntry; changing it post-append would lie about what
+    // surface_free + re-spawn would do without an explicit user
+    // restart action.
+    for (new_cfg.profiles.entries) |new_e| {
+        const sess_idx = sm.indexOf(new_e.name) orelse continue;
+        sm.updateProfileDisplay(sess_idx, new_e.title, new_e.cwd);
+
+        var old_entry: ?Config.ProfileEntry = null;
+        for (old.profiles.entries) |oe| {
+            if (std.mem.eql(u8, oe.name, new_e.name)) {
+                old_entry = oe;
+                break;
+            }
+        }
+        if (old_entry) |oe| {
+            const cmd_changed =
+                !eqOptStr(oe.command, new_e.command) or
+                !eqOptStr(oe.script, new_e.script) or
+                !eqOptStr(oe.provider, new_e.provider);
+            if (cmd_changed) {
+                std.debug.print("config: profile '{s}' command/script/provider changed; Cmd+R to restart that session\n", .{new_e.name});
+            }
+        }
+    }
+
+    @import("session/tab_strip.zig").refresh();
 }
 
 /// Emit one stderr warning per restart-required key whose value
@@ -175,8 +264,13 @@ fn warnRestartRequired(old: Config, new_cfg: Config) void {
     if (!eqOptStr(old.profiles.default, new_cfg.profiles.default)) {
         std.debug.print("config: 'default-profile' change requires restart\n", .{});
     }
-    if (old.profiles.entries.len != new_cfg.profiles.entries.len) {
-        std.debug.print("config: 'profile.*' add/remove requires restart\n", .{});
+    // Crossing legacy↔multi-profile boundaries is restart-required.
+    // Mid-multi-profile add/remove is handled live by
+    // reconcileProfiles, so no warning fires for that case.
+    const legacy_old = old.profiles.entries.len == 0;
+    const legacy_new = new_cfg.profiles.entries.len == 0;
+    if (legacy_old != legacy_new) {
+        std.debug.print("config: switching between legacy single-profile and multi-profile mode requires restart\n", .{});
     }
 }
 
@@ -435,6 +529,126 @@ fn restartSurfaceCallback(ctx_opaque: ?*anyopaque) callconv(.c) void {
             mb.updateState(@enumFromInt(@intFromEnum(snap.state)), snap.message);
         }
     }
+}
+
+/// Build (when `visible` and absent) or tear down (when not `visible`
+/// and present) the multi-profile tab strip, then re-run the
+/// container reflow so every other child absorbs / releases
+/// `tab_strip.tab_h` of vertical space. Used by hot-config-reload's
+/// session add/remove path when the count crosses 1↔2.
+fn ensureTabStripVisible(visible: bool) void {
+    const cur = app.g.tab_strip_id != null;
+    if (visible == cur) return;
+
+    const container_id = app.g.container_id orelse return;
+    const container = objc.Object.fromId(container_id);
+    const tab_strip_mod = @import("session/tab_strip.zig");
+
+    if (visible) {
+        const c_bounds = container.msgSend(NSRect, "bounds", .{});
+        const strip = tab_strip_mod.create(c_bounds.size.width, c_bounds.size.height);
+        container.msgSend(void, "addSubview:", .{strip});
+        app.g.tab_strip_id = strip.value;
+        if (app.g.chrome_style) |s| tab_strip_mod.applyStyle(s);
+    } else {
+        const sid = app.g.tab_strip_id.?;
+        objc.Object.fromId(sid).msgSend(void, "removeFromSuperview", .{});
+        app.g.tab_strip_id = null;
+        app.g.tab_strip_separator_id = null;
+    }
+    view_mod.relayout();
+}
+
+/// Append a new profile at runtime. Allocates a hidden `surface_host`
+/// NSView (positioned BELOW the active host so TerminalView's input
+/// overlay stays on top), inherits the active host's frame +
+/// autoresizing mask, and refreshes the tab strip + menubar.
+/// ghostty surface is *not* spawned eagerly — first activation via
+/// `activateSession` (palette/Cmd+number/tab click) drives the spawn.
+fn addSessionLive(entry: Config.ProfileEntry) !void {
+    const sm = app.g.session_manager orelse return error.NoManager;
+    const container_id = app.g.container_id orelse return error.NoContainer;
+    const container = objc.Object.fromId(container_id);
+
+    // Build the strip first when crossing 1→2 so the new surface_host
+    // is sized to the post-strip terminal area (otherwise it'd be
+    // tab_h px too tall + cover the tab strip on first activate).
+    const will_cross = sm.count() == 1;
+    if (will_cross) ensureTabStripVisible(true);
+
+    const sess = try sm.appendEntry(entry);
+
+    // Mirror the active host's frame + autoresizing mask so the new
+    // host stays in lockstep with terminal/log/divider on container
+    // resize. The active host's frame already accounts for tab_h.
+    const NSView = objc.getClass("NSView") orelse return error.NSViewMissing;
+    const sh_alloc = NSView.msgSend(objc.Object, "alloc", .{});
+    const template_id = sm.active().surface_host orelse return error.NoTemplate;
+    const template = objc.Object.fromId(template_id);
+    const tmpl_frame = template.msgSend(NSRect, "frame", .{});
+    const tmpl_mask = template.msgSend(c_ulong, "autoresizingMask", .{});
+    const sh = sh_alloc.msgSend(objc.Object, "initWithFrame:", .{tmpl_frame});
+    sh.msgSend(void, "setAutoresizingMask:", .{tmpl_mask});
+    sh.msgSend(void, "setHidden:", .{@as(c_int, 1)});
+
+    // NSWindowBelow keeps the new host under TerminalView so the
+    // transparent overlay still captures key + mouse events for the
+    // (eventual) active surface.
+    const NSWindowBelow: c_long = -1;
+    container.msgSend(void, "addSubview:positioned:relativeTo:", .{ sh, NSWindowBelow, template });
+    sess.surface_host = sh.value;
+
+    // Force AppKit to commit the new sibling subview into the
+    // layer tree on this runloop turn. addSubview alone schedules
+    // layout for the next pass; without an explicit nudge, the
+    // first activateSession on this host can race with ghostty's
+    // CAMetalLayer attach + show a blank pane until the next
+    // unrelated event repaints.
+    container.msgSend(void, "setNeedsLayout:", .{@as(c_int, 1)});
+    container.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
+    container.msgSend(void, "layoutSubtreeIfNeeded", .{});
+
+    @import("session/tab_strip.zig").refresh();
+    if (app.g.menubar) |mb| if (app.g.agent_state) |st| {
+        const snap = st.snapshot();
+        mb.updateState(@enumFromInt(@intFromEnum(snap.state)), snap.message);
+    };
+}
+
+/// Remove the profile at `idx` at runtime. If the entry is currently
+/// active, switches to a neighbor *before* tearing down so the
+/// visible surface flip happens with the old session still in the
+/// slice (activateSession reaches via index). Frees the ghostty
+/// surface (if spawned), removes the surface_host NSView, then
+/// shrinks the session slice. Crossing 2→1 destroys the tab strip.
+fn removeSessionLive(idx: usize) void {
+    const sm = app.g.session_manager orelse return;
+    if (idx >= sm.sessions.len) return;
+    if (sm.sessions.len <= 1) {
+        // Removing the last profile would leave the host with no
+        // surface to show. Treat as restart-required.
+        std.debug.print("config: cannot remove last profile at runtime; restart djinn after editing config\n", .{});
+        return;
+    }
+
+    if (idx == sm.active_idx) {
+        const fallback: usize = if (idx + 1 < sm.sessions.len) idx + 1 else 0;
+        _ = activateSession(fallback);
+    }
+
+    var dying = sm.sessions[idx];
+    if (dying.surface) |sp| {
+        if (app.g.ghostty_app) |ga| ga.surfaceFree(@ptrCast(sp));
+        dying.surface = null;
+    }
+    if (dying.surface_host) |sh_id| {
+        objc.Object.fromId(sh_id).msgSend(void, "removeFromSuperview", .{});
+    }
+    _ = sm.removeAt(idx);
+
+    if (sm.count() <= 1) ensureTabStripVisible(false);
+
+    @import("session/tab_strip.zig").refresh();
 }
 
 /// Bind a persistent ghostty surface to `surface_host`. Returns null on
@@ -778,6 +992,7 @@ pub fn main() !void {
     // MCP `djinn_log` calls always update AgentState; the log view
     // observes regardless of visibility so reopening shows backlog.
     const container = buildContainer(w, h, &config, view.view, log_view.view, surface_host);
+    app.g.container_id = container.value;
 
     // Slot the inactive surface_hosts in as siblings of the active host,
     // pinned at the same frame + autoresizing mask. NSWindowBelow keeps

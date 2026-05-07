@@ -80,35 +80,7 @@ pub const SessionManager = struct {
             });
         } else {
             for (cfg.profiles.entries) |e| {
-                // Spawn-command precedence: `script` > `command` >
-                // `provider` shortcut > /bin/zsh fallback.
-                //
-                // `script` runs through resolveScript which expands a
-                // leading `~/` and verifies the file exists + has an
-                // execute bit. On failure we warn and fall through to
-                // the next layer, so a typo in a script path doesn't
-                // break the whole profile — the user still gets a
-                // working terminal.
-                const cmd = blk: {
-                    if (e.script) |s| {
-                        if (resolveScript(allocator, s, &owned)) |path| break :blk path else |err| {
-                            std.debug.print(
-                                "warning: profile '{s}' script '{s}' unusable ({}); falling back\n",
-                                .{ e.name, s, err },
-                            );
-                        }
-                    }
-                    if (e.command) |c| break :blk c;
-                    break :blk providerCommand(e.provider orelse "generic");
-                };
-                try sessions.append(allocator, .{
-                    .profile = .{
-                        .name = e.name,
-                        .command = cmd,
-                        .cwd = e.cwd,
-                        .title = e.title,
-                    },
-                });
+                try sessions.append(allocator, .{ .profile = resolveEntry(allocator, &e, &owned) });
             }
         }
 
@@ -137,6 +109,75 @@ pub const SessionManager = struct {
         self.allocator.free(self.sessions);
         for (self.owned_strings.items) |s| self.allocator.free(s);
         self.owned_strings.deinit(self.allocator);
+    }
+
+    /// Append a new Session resolved from `entry`. Used by hot-config-
+    /// reload's profile diff to add a profile at runtime. The returned
+    /// pointer is valid until the next mutation (callers should fill
+    /// `surface_host` immediately, then drop the pointer — re-fetch
+    /// via index for any later access).
+    pub fn appendEntry(self: *SessionManager, entry: Config.ProfileEntry) !*Session {
+        const profile = resolveEntry(self.allocator, &entry, &self.owned_strings);
+        const new_len = self.sessions.len + 1;
+        self.sessions = try self.allocator.realloc(self.sessions, new_len);
+        self.sessions[new_len - 1] = .{ .profile = profile };
+        return &self.sessions[new_len - 1];
+    }
+
+    /// Pop the session at `idx`, shifting tail entries down. Returns
+    /// the removed Session by value so the caller can free its
+    /// ghostty surface + surface_host NSView outside this module
+    /// (lifecycle of those handles isn't owned here). Adjusts
+    /// `active_idx` so it keeps pointing at the *same* logical
+    /// session it pointed at before — caller is responsible for
+    /// driving the visible-surface switch via `switchTo` *before*
+    /// removing the active entry; otherwise active_idx gets
+    /// clamped into the new bounds and the still-resident surface
+    /// pointer mismatches what the UI shows.
+    pub fn removeAt(self: *SessionManager, idx: usize) ?Session {
+        if (idx >= self.sessions.len) return null;
+        const removed = self.sessions[idx];
+        if (idx + 1 < self.sessions.len) {
+            std.mem.copyForwards(
+                Session,
+                self.sessions[idx .. self.sessions.len - 1],
+                self.sessions[idx + 1 ..],
+            );
+        }
+        const new_len = self.sessions.len - 1;
+        if (new_len == 0) {
+            self.allocator.free(self.sessions);
+            self.sessions = &.{};
+        } else {
+            // realloc-shrink is allowed to fail; the original slice
+            // still owns `new_len` valid Sessions (we already shifted),
+            // so on failure we reslice in place and accept a small
+            // over-allocation until the next mutation.
+            self.sessions = self.allocator.realloc(self.sessions, new_len) catch self.sessions[0..new_len];
+        }
+        // Adjust active_idx to track the same logical session.
+        // Removed below active → tail shifted down by 1.
+        // Removed at active → caller should have switched first; clamp
+        //   to len-1 as a last-resort safety net.
+        // Removed above active → no change.
+        if (idx < self.active_idx) {
+            self.active_idx -= 1;
+        } else if (idx == self.active_idx and self.active_idx >= self.sessions.len and self.sessions.len > 0) {
+            self.active_idx = self.sessions.len - 1;
+        }
+        return removed;
+    }
+
+    /// Re-point a profile's display fields (`title`, `cwd`) without
+    /// touching the spawn-side state. Used by hot-config-reload when
+    /// a matched-by-name profile entry has only display-affecting
+    /// changes — no surface restart needed. The slices must outlive
+    /// the SessionManager (config strings leak on reload, so pointers
+    /// into the new Config remain valid for the process).
+    pub fn updateProfileDisplay(self: *SessionManager, idx: usize, title: ?[]const u8, cwd: ?[]const u8) void {
+        if (idx >= self.sessions.len) return;
+        self.sessions[idx].profile.title = title;
+        self.sessions[idx].profile.cwd = cwd;
     }
 
     pub fn active(self: *SessionManager) *Session {
@@ -190,6 +231,39 @@ pub const SessionManager = struct {
         return if (self.active_idx == 0) self.sessions.len - 1 else self.active_idx - 1;
     }
 };
+
+/// Resolve a `ProfileEntry` (parsed from config) into a runtime
+/// `Profile`. Spawn-command precedence: `script` > `command` >
+/// `provider` shortcut > /bin/zsh fallback. Script paths run through
+/// `resolveScript` which expands `~/` and verifies execute-bit; on
+/// failure the resolution warns and falls through, so a typo in
+/// `script` doesn't break the whole profile — the user still gets a
+/// working terminal. Tilde-expanded paths are appended to `owned`
+/// so the manager frees them on deinit.
+fn resolveEntry(
+    allocator: std.mem.Allocator,
+    e: *const Config.ProfileEntry,
+    owned: *std.ArrayList([]u8),
+) Profile {
+    const cmd = blk: {
+        if (e.script) |s| {
+            if (resolveScript(allocator, s, owned)) |path| break :blk path else |err| {
+                std.debug.print(
+                    "warning: profile '{s}' script '{s}' unusable ({}); falling back\n",
+                    .{ e.name, s, err },
+                );
+            }
+        }
+        if (e.command) |c| break :blk c;
+        break :blk providerCommand(e.provider orelse "generic");
+    };
+    return .{
+        .name = e.name,
+        .command = cmd,
+        .cwd = e.cwd,
+        .title = e.title,
+    };
+}
 
 /// Expand a leading `~/` against `$HOME`, then stat the file and
 /// verify it's executable. Returns the resolved (possibly newly
@@ -405,4 +479,70 @@ test "SessionManager: profile.label falls back to name" {
     try std.testing.expectEqualStrings("main", p.label());
     p.title = "Main Repo";
     try std.testing.expectEqualStrings("Main Repo", p.label());
+}
+
+test "SessionManager: appendEntry grows slice + resolves command" {
+    const entries = [_]Config.ProfileEntry{
+        .{ .name = "a", .provider = "claude" },
+    };
+    var cfg = Config{};
+    cfg.profiles.entries = &entries;
+    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
+    defer mgr.deinit();
+
+    const new_entry = Config.ProfileEntry{ .name = "b", .provider = "codex" };
+    const sess = try mgr.appendEntry(new_entry);
+    try std.testing.expectEqual(@as(usize, 2), mgr.count());
+    try std.testing.expectEqualStrings("b", sess.profile.name);
+    try std.testing.expectEqualStrings("codex", sess.profile.command);
+    try std.testing.expectEqualStrings("b", mgr.sessions[1].profile.name);
+}
+
+test "SessionManager: removeAt shrinks + clamps active_idx" {
+    const entries = [_]Config.ProfileEntry{
+        .{ .name = "a" },
+        .{ .name = "b" },
+        .{ .name = "c" },
+    };
+    var cfg = Config{};
+    cfg.profiles.entries = &entries;
+    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
+    defer mgr.deinit();
+
+    try std.testing.expect(mgr.switchTo(2));
+    const removed = mgr.removeAt(2) orelse return error.TestFailed;
+    try std.testing.expectEqualStrings("c", removed.profile.name);
+    try std.testing.expectEqual(@as(usize, 2), mgr.count());
+    try std.testing.expectEqual(@as(usize, 1), mgr.active_idx);
+
+    // Remove from the middle: tail shifts down.
+    _ = mgr.removeAt(0) orelse return error.TestFailed;
+    try std.testing.expectEqual(@as(usize, 1), mgr.count());
+    try std.testing.expectEqualStrings("b", mgr.sessions[0].profile.name);
+}
+
+test "SessionManager: removeAt out of bounds returns null" {
+    const entries = [_]Config.ProfileEntry{ .{ .name = "a" } };
+    var cfg = Config{};
+    cfg.profiles.entries = &entries;
+    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
+    defer mgr.deinit();
+
+    try std.testing.expect(mgr.removeAt(5) == null);
+    try std.testing.expectEqual(@as(usize, 1), mgr.count());
+}
+
+test "SessionManager: updateProfileDisplay re-points title + cwd" {
+    const entries = [_]Config.ProfileEntry{
+        .{ .name = "main", .title = "Old Title" },
+    };
+    var cfg = Config{};
+    cfg.profiles.entries = &entries;
+    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
+    defer mgr.deinit();
+
+    try std.testing.expectEqualStrings("Old Title", mgr.sessions[0].profile.title.?);
+    mgr.updateProfileDisplay(0, "New Title", "/tmp");
+    try std.testing.expectEqualStrings("New Title", mgr.sessions[0].profile.title.?);
+    try std.testing.expectEqualStrings("/tmp", mgr.sessions[0].profile.cwd.?);
 }
