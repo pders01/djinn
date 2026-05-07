@@ -91,13 +91,23 @@ jobs:
             > "Djinn-pre-release-${{ runner.arch }}.zip.sha256"
           cp ../scripts/install-from-release.sh install.sh
 
-      - name: Move pre-release tag to HEAD
-        # softprops/action-gh-release creates the tag if it doesn't
-        # exist but doesn't move an existing tag. Force-push the
-        # tag here so the release attaches to the right commit.
+      - name: Delete prior pre-release + tag
+        # softprops/action-gh-release replaces assets in place on an
+        # existing release, but doesn't move an existing tag. The
+        # previous workflow force-pushed the tag first, then uploaded
+        # — leaving a window where the moved tag pointed at HEAD
+        # while GH Releases still served the prior run's zip
+        # (stable filename: `Djinn-pre-release-${ARCH}.zip`). A user
+        # running the curl|bash installer mid-window got a binary
+        # one commit behind the advertised tag.
+        #
+        # Pre-delete the release + tag so softprops re-creates both
+        # atomically alongside the fresh asset upload. Brief 404 in
+        # place of stale-serve; retried download succeeds.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git tag -f pre-release
-          git push --force origin refs/tags/pre-release
+          gh release delete pre-release --yes --cleanup-tag || true
 
       - name: Publish pre-release
         uses: softprops/action-gh-release@v2
