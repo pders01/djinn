@@ -24,11 +24,7 @@ pub const AppState = struct {
     term: Term = .{},
 
     // Agent surface observers ----------------------------------------
-    agent_state: ?*AgentState = null,
-    menubar: ?*Menubar = null,
-    log_view: ?*LogView = null,
-    last_state: Agent = .idle,
-    tick_count: u32 = 0,
+    agent: AgentSurface = .{},
 
     // Theme reload ---------------------------------------------------
     /// Allocator + config pointer used by the theme reloader on
@@ -93,6 +89,14 @@ pub const AppState = struct {
     // Declared after fields per Zig's container layout rule. Each
     // group is opt-in: callers reach `app.g.find.*`, `app.g.palette.*`,
     // etc. instead of the flat field sea this struct used to be.
+
+    pub const AgentSurface = struct {
+        state: ?*AgentState = null,
+        menubar: ?*Menubar = null,
+        log_view: ?*LogView = null,
+        last_state: Agent = .idle,
+        tick_count: u32 = 0,
+    };
 
     pub const Term = struct {
         /// NSView pointer for the terminal surface. Stored as raw id

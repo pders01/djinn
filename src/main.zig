@@ -131,7 +131,7 @@ fn onConfigChanged() void {
 
     if (app.g.notifier) |n| n.enabled = new_cfg.notifications.system_notifications;
     if (app.g.tool_table) |tt| tt.attention_sound = new_cfg.notifications.attention_sound;
-    if (app.g.menubar) |mb| mb.setEnabled(new_cfg.notifications.menubar_icon);
+    if (app.g.agent.menubar) |mb| mb.setEnabled(new_cfg.notifications.menubar_icon);
 
     // Log-pane visibility: only re-apply when the config value
     // actually changed. `toggle_log_pane` (Cmd+/) flips the same
@@ -302,7 +302,7 @@ fn hostWarn(comptime fmt: []const u8, args: anytype) void {
     var buf: [256]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..0];
     std.debug.print("{s}\n", .{msg});
-    if (app.g.agent_state) |st| st.appendLog(.warn, msg) catch {};
+    if (app.g.agent.state) |st| st.appendLog(.warn, msg) catch {};
 }
 
 fn eqOptStr(a: ?[]const u8, b: ?[]const u8) bool {
@@ -499,8 +499,8 @@ pub fn activateSession(idx: usize) bool {
 
     // Trigger menubar redraw — its dropdown subtitle reflects the
     // active profile name.
-    if (app.g.menubar) |mb| {
-        if (app.g.agent_state) |st| {
+    if (app.g.agent.menubar) |mb| {
+        if (app.g.agent.state) |st| {
             const snap = st.snapshot();
             mb.updateState(@enumFromInt(@intFromEnum(snap.state)), snap.message);
         }
@@ -596,8 +596,8 @@ fn restartSurfaceCallback(ctx_opaque: ?*anyopaque) callconv(.c) void {
 
     // Tab strip + menubar refresh.
     @import("session/tab_strip.zig").refresh();
-    if (app.g.menubar) |mb| {
-        if (app.g.agent_state) |st| {
+    if (app.g.agent.menubar) |mb| {
+        if (app.g.agent.state) |st| {
             const snap = st.snapshot();
             mb.updateState(@enumFromInt(@intFromEnum(snap.state)), snap.message);
         }
@@ -682,7 +682,7 @@ fn addSessionLive(entry: Config.ProfileEntry) !void {
     container.msgSend(void, "layoutSubtreeIfNeeded", .{});
 
     @import("session/tab_strip.zig").refresh();
-    if (app.g.menubar) |mb| if (app.g.agent_state) |st| {
+    if (app.g.agent.menubar) |mb| if (app.g.agent.state) |st| {
         const snap = st.snapshot();
         mb.updateState(@enumFromInt(@intFromEnum(snap.state)), snap.message);
     };

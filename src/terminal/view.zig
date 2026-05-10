@@ -173,13 +173,13 @@ pub const TerminalView = struct {
 
     pub fn observeAgent(self: *TerminalView, state: *AgentState, menubar: *Menubar) void {
         _ = self;
-        app.g.agent_state = state;
-        app.g.menubar = menubar;
+        app.g.agent.state = state;
+        app.g.agent.menubar = menubar;
     }
 
     pub fn observeLog(self: *TerminalView, log_view: *LogView) void {
         _ = self;
-        app.g.log_view = log_view;
+        app.g.agent.log_view = log_view;
     }
 };
 
@@ -406,7 +406,7 @@ fn dividerMouseDownImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) 
 fn dividerMouseUpImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
     // Persist the new fraction so subsequent toggles + resizes use it.
     const cfg = app.g.config orelse return;
-    const lv = app.g.log_view orelse return;
+    const lv = app.g.agent.log_view orelse return;
     const log_frame = lv.view.msgSend(NSRect, "frame", .{});
     const container = lv.view.msgSend(objc.Object, "superview", .{});
     if (container.value == null) return;
@@ -462,7 +462,7 @@ fn applyLogLayout(container: objc.Object, term_w: f64, log_w: f64, height: f64) 
             .size = .{ .width = if (log_w > 0) divider_width else 0, .height = term_h },
         }});
     }
-    if (app.g.log_view) |lv| {
+    if (app.g.agent.log_view) |lv| {
         const div_w: f64 = if (log_w > 0) divider_width else 0;
         lv.view.msgSend(void, "setFrame:", .{NSRect{
             .origin = .{ .x = term_w + div_w, .y = 0 },
@@ -763,7 +763,7 @@ fn tryDropImage(pb: objc.Object) bool {
 fn viewDidEndLiveResizeImpl(self_id: objc.c.id, _: objc.c.SEL) callconv(.c) void {
     const view = objc.Object.fromId(self_id);
     checkResize(view);
-    if (app.g.log_view) |lv| {
+    if (app.g.agent.log_view) |lv| {
         lv.view.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
         lv.scroll.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
         lv.text_view.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
@@ -795,7 +795,7 @@ fn checkResize(view: objc.Object) void {
     // propagate setNeedsDisplay down to the log pane's clip view +
     // text view; force them explicitly so the panel doesn't end up
     // with empty rectangles after the user lets go.
-    if (app.g.log_view) |lv| {
+    if (app.g.agent.log_view) |lv| {
         lv.view.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
         lv.scroll.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
         lv.text_view.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
@@ -836,7 +836,7 @@ fn startTickTimer() void {
 }
 
 fn tickImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
-    app.g.tick_count +%= 1;
+    app.g.agent.tick_count +%= 1;
 
     const view = objc.Object.fromId(self_id);
     checkResize(view);
@@ -849,13 +849,13 @@ fn tickImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
     // owns both.)
 
     // Poll agent state every 15 ticks (~250ms at 60Hz).
-    if (app.g.tick_count % 15 == 0) {
-        if (app.g.agent_state) |state| {
-            if (app.g.log_view) |lv| lv.syncFrom(state);
+    if (app.g.agent.tick_count % 15 == 0) {
+        if (app.g.agent.state) |state| {
+            if (app.g.agent.log_view) |lv| lv.syncFrom(state);
 
-            if (app.g.menubar) |menubar| {
+            if (app.g.agent.menubar) |menubar| {
                 const snap = state.snapshot();
-                if (snap.state != app.g.last_state or app.g.tick_count == 15) {
+                if (snap.state != app.g.agent.last_state or app.g.agent.tick_count == 15) {
                     const mb_state: MenubarAgentState = switch (snap.state) {
                         .idle => .idle,
                         .working => .working,
@@ -864,7 +864,7 @@ fn tickImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
                         .@"error" => .@"error",
                     };
                     menubar.updateState(mb_state, snap.message);
-                    app.g.last_state = snap.state;
+                    app.g.agent.last_state = snap.state;
                 }
             }
         }
@@ -1443,7 +1443,7 @@ fn actionOpenSettings() void {
 }
 
 fn actionToggleLogPane() void {
-    const lv = app.g.log_view orelse return;
+    const lv = app.g.agent.log_view orelse return;
     const log_frame = lv.view.msgSend(NSRect, "frame", .{});
     setLogPaneHidden(log_frame.size.width > 0);
 }
@@ -1462,7 +1462,7 @@ pub fn relayout() void {
     const c_bounds = container.msgSend(NSRect, "bounds", .{});
 
     var log_w: f64 = 0;
-    if (app.g.log_view) |lv| {
+    if (app.g.agent.log_view) |lv| {
         log_w = lv.view.msgSend(NSRect, "frame", .{}).size.width;
     }
     const eff_div_w: f64 = if (log_w > 0) divider_width else 0;
@@ -1783,7 +1783,7 @@ fn reapplyTheme() void {
 
     const new_style = chrome_mod.Style.fromTheme(new_theme);
     app.g.chrome_style = new_style;
-    if (app.g.log_view) |lv| lv.applyStyle(new_style);
+    if (app.g.agent.log_view) |lv| lv.applyStyle(new_style);
     find.applyOverlayStyle(new_style);
     @import("../session/tab_strip.zig").applyStyle(new_style);
 
