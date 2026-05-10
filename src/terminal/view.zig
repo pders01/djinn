@@ -448,7 +448,7 @@ fn dividerResetCursorRectsImpl(self: objc.c.id, _: objc.c.SEL) callconv(.c) void
 /// at the top when the multi-profile tab strip is present.
 fn applyLogLayout(container: objc.Object, term_w: f64, log_w: f64, height: f64) void {
     const tab_strip = @import("../session/tab_strip.zig");
-    const tab_h: f64 = if (app.g.tab_strip_id != null) tab_strip.tab_h else 0;
+    const tab_h: f64 = if (app.g.layout.tab_strip_id != null) tab_strip.tab_h else 0;
     const term_h = @max(1.0, height - tab_h);
     const view_id = app.g.view_id orelse return;
     const term_view = objc.Object.fromId(view_id);
@@ -456,7 +456,7 @@ fn applyLogLayout(container: objc.Object, term_w: f64, log_w: f64, height: f64) 
         .origin = .{ .x = 0, .y = 0 },
         .size = .{ .width = term_w, .height = term_h },
     }});
-    if (app.g.divider_view_id) |did| {
+    if (app.g.layout.divider_view_id) |did| {
         objc.Object.fromId(did).msgSend(void, "setFrame:", .{NSRect{
             .origin = .{ .x = term_w, .y = 0 },
             .size = .{ .width = if (log_w > 0) divider_width else 0, .height = term_h },
@@ -469,7 +469,7 @@ fn applyLogLayout(container: objc.Object, term_w: f64, log_w: f64, height: f64) 
             .size = .{ .width = log_w, .height = term_h },
         }});
     }
-    if (app.g.tab_strip_id) |tid| {
+    if (app.g.layout.tab_strip_id) |tid| {
         objc.Object.fromId(tid).msgSend(void, "setFrame:", .{NSRect{
             .origin = .{ .x = 0, .y = term_h },
             .size = .{ .width = container.msgSend(NSRect, "bounds", .{}).size.width, .height = tab_h },
@@ -1457,7 +1457,7 @@ fn actionToggleLogPane() void {
 /// Reads the current log width off the live frame so a user's
 /// drag-resize or Cmd+/ toggle isn't reset.
 pub fn relayout() void {
-    const container_id = app.g.container_id orelse return;
+    const container_id = app.g.layout.container_id orelse return;
     const container = objc.Object.fromId(container_id);
     const c_bounds = container.msgSend(NSRect, "bounds", .{});
 

@@ -92,16 +92,7 @@ pub const AppState = struct {
     chrome_style: ?@import("chrome.zig").Style = null,
 
     // Tier-5 surface migration --------------------------------------
-    /// Sibling NSView of `view_id` reserved for ghostty's surface.
-    /// ghostty owns this view's CAMetalLayer once a surface is bound.
-    /// Hidden when `render.backend != "ghostty"`. Step 4a allocates
-    /// the view but doesn't bind a surface yet — that's step 4b.
-    surface_host_id: ?objc.c.id = null,
-    /// Thin vertical divider between terminal and log pane. Stashed
-    /// here so the log-toggle path can resize/hide it without going
-    /// through container.subviews[idx], which is fragile (the index
-    /// shifts whenever buildContainer's subview order changes).
-    divider_view_id: ?objc.c.id = null,
+    layout: Layout = .{},
     ghostty: Ghostty = .{},
 
     // Sessions -------------------------------------------------------
@@ -114,27 +105,42 @@ pub const AppState = struct {
     // Palette switcher (Cmd+Shift+P) ---------------------------------
     palette: PaletteState = .{},
 
-    /// Optional NSView pointer for the multi-profile tab strip.
-    /// Present only when `session_manager.sessions.len >= 2`; null
-    /// otherwise. Action handlers + applyLogLayout consult this to
-    /// decide whether to reserve `tab_strip.tab_h` at the top.
-    tab_strip_id: ?objc.c.id = null,
-    /// Outer container NSView holding terminal / log / divider /
-    /// surface_host(s) / tab strip. Stashed for hot-reload's
-    /// runtime profile add path so `addSessionLive` can attach a new
-    /// surface_host without threading the container reference through
-    /// every caller. Set once in main() after `buildContainer`.
-    container_id: ?objc.c.id = null,
-    /// Pointer to the 1px CALayer-backed subview that paints the tab
-    /// strip's bottom hairline. Stable for the strip's lifetime so
-    /// `applyStyle` can repaint it on theme flips without walking
-    /// the strip's subview list.
-    tab_strip_separator_id: ?objc.c.id = null,
 
     // ─── Sub-state types ───────────────────────────────────────────
     // Declared after fields per Zig's container layout rule. Each
     // group is opt-in: callers reach `app.g.find.*`, `app.g.palette.*`,
     // etc. instead of the flat field sea this struct used to be.
+
+    pub const Layout = struct {
+        /// Outer container NSView holding terminal / log / divider /
+        /// surface_host(s) / tab strip. Stashed for hot-reload's
+        /// runtime profile add path so `addSessionLive` can attach a
+        /// new surface_host without threading the container reference
+        /// through every caller. Set once in main() after
+        /// `buildContainer`.
+        container_id: ?objc.c.id = null,
+        /// Sibling NSView of `view_id` reserved for ghostty's surface.
+        /// ghostty owns this view's CAMetalLayer once a surface is
+        /// bound.
+        surface_host_id: ?objc.c.id = null,
+        /// Thin vertical divider between terminal and log pane.
+        /// Stashed here so the log-toggle path can resize/hide it
+        /// without going through container.subviews[idx], which is
+        /// fragile (the index shifts whenever buildContainer's
+        /// subview order changes).
+        divider_view_id: ?objc.c.id = null,
+        /// Optional NSView pointer for the multi-profile tab strip.
+        /// Present only when `session_manager.sessions.len >= 2`;
+        /// null otherwise. Action handlers + applyLogLayout consult
+        /// this to decide whether to reserve `tab_strip.tab_h` at
+        /// the top.
+        tab_strip_id: ?objc.c.id = null,
+        /// Pointer to the 1px CALayer-backed subview that paints the
+        /// tab strip's bottom hairline. Stable for the strip's
+        /// lifetime so `applyStyle` can repaint it on theme flips
+        /// without walking the strip's subview list.
+        tab_strip_separator_id: ?objc.c.id = null,
+    };
 
     pub const Ghostty = struct {
         /// Stable pointer to the ghostty App so the lazy-spawn path in

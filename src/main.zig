@@ -492,7 +492,7 @@ pub fn activateSession(idx: usize) bool {
     // surface in app.g (reapplyTheme + updateSearchCountLabel both
     // read app.g.ghostty.surface).
     app.g.ghostty.surface = new_sess.surface;
-    app.g.surface_host_id = if (new_sess.surface_host) |h| @ptrCast(@alignCast(h)) else null;
+    app.g.layout.surface_host_id = if (new_sess.surface_host) |h| @ptrCast(@alignCast(h)) else null;
     if (new_sess.surface) |sp| {
         ghostty_runtime.surfaceSetFocus(@ptrCast(sp), true);
     }
@@ -581,7 +581,7 @@ fn restartSurfaceCallback(ctx_opaque: ?*anyopaque) callconv(.c) void {
     active.spawned = true;
     active.exited = false;
     app.g.ghostty.surface = active.surface;
-    app.g.surface_host_id = if (active.surface_host) |h| @ptrCast(@alignCast(h)) else null;
+    app.g.layout.surface_host_id = if (active.surface_host) |h| @ptrCast(@alignCast(h)) else null;
 
     // Re-anchor keyboard focus on the new surface's view. Without
     // this, AppKit may have lost the responder chain during the
@@ -610,10 +610,10 @@ fn restartSurfaceCallback(ctx_opaque: ?*anyopaque) callconv(.c) void {
 /// `tab_strip.tab_h` of vertical space. Used by hot-config-reload's
 /// session add/remove path when the count crosses 1↔2.
 fn ensureTabStripVisible(visible: bool) void {
-    const cur = app.g.tab_strip_id != null;
+    const cur = app.g.layout.tab_strip_id != null;
     if (visible == cur) return;
 
-    const container_id = app.g.container_id orelse return;
+    const container_id = app.g.layout.container_id orelse return;
     const container = objc.Object.fromId(container_id);
     const tab_strip_mod = @import("session/tab_strip.zig");
 
@@ -621,13 +621,13 @@ fn ensureTabStripVisible(visible: bool) void {
         const c_bounds = container.msgSend(NSRect, "bounds", .{});
         const strip = tab_strip_mod.create(c_bounds.size.width, c_bounds.size.height);
         container.msgSend(void, "addSubview:", .{strip});
-        app.g.tab_strip_id = strip.value;
+        app.g.layout.tab_strip_id = strip.value;
         if (app.g.chrome_style) |s| tab_strip_mod.applyStyle(s);
     } else {
-        const sid = app.g.tab_strip_id.?;
+        const sid = app.g.layout.tab_strip_id.?;
         objc.Object.fromId(sid).msgSend(void, "removeFromSuperview", .{});
-        app.g.tab_strip_id = null;
-        app.g.tab_strip_separator_id = null;
+        app.g.layout.tab_strip_id = null;
+        app.g.layout.tab_strip_separator_id = null;
     }
     view_mod.relayout();
 }
@@ -640,7 +640,7 @@ fn ensureTabStripVisible(visible: bool) void {
 /// `activateSession` (palette/Cmd+number/tab click) drives the spawn.
 fn addSessionLive(entry: Config.ProfileEntry) !void {
     const sm = app.g.session_manager orelse return error.NoManager;
-    const container_id = app.g.container_id orelse return error.NoContainer;
+    const container_id = app.g.layout.container_id orelse return error.NoContainer;
     const container = objc.Object.fromId(container_id);
 
     // Build the strip first when crossing 1→2 so the new surface_host
@@ -850,7 +850,7 @@ fn buildContainer(
     // so the line still reads as a hairline.
     const divider = view_mod.createDivider(term_w, term_h);
     container.msgSend(void, "addSubview:", .{divider});
-    app.g.divider_view_id = divider.value;
+    app.g.layout.divider_view_id = divider.value;
 
     log.msgSend(void, "setFrame:", .{NSRect{
         .origin = .{ .x = term_w + divider_w, .y = 0 },
@@ -864,7 +864,7 @@ fn buildContainer(
     if (tab_h > 0) {
         const strip = tab_strip.create(width, height);
         container.msgSend(void, "addSubview:", .{strip});
-        app.g.tab_strip_id = strip.value;
+        app.g.layout.tab_strip_id = strip.value;
         if (app.g.chrome_style) |s| tab_strip.applyStyle(s);
     }
 
@@ -1062,7 +1062,7 @@ pub fn main() !void {
     const active_session = session_manager.active();
     const active_host_id: objc.c.id = @ptrCast(@alignCast(active_session.surface_host.?));
     const surface_host = objc.Object.fromId(active_host_id);
-    app.g.surface_host_id = active_host_id;
+    app.g.layout.surface_host_id = active_host_id;
 
     // Always build the dual-pane container so the runtime toggle
     // (Cmd+/ → toggle_log_pane) only flips visibility, no view-tree
@@ -1071,7 +1071,7 @@ pub fn main() !void {
     // MCP `djinn_log` calls always update AgentState; the log view
     // observes regardless of visibility so reopening shows backlog.
     const container = buildContainer(w, h, &config, view.view, log_view.view, surface_host);
-    app.g.container_id = container.value;
+    app.g.layout.container_id = container.value;
 
     // Slot the inactive surface_hosts in as siblings of the active host,
     // pinned at the same frame + autoresizing mask. NSWindowBelow keeps

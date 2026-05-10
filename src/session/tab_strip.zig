@@ -54,7 +54,7 @@ pub fn create(width: f64, container_h: f64) objc.Object {
     // doesn't affect autoresizing math; that uses parent-relative
     // bottom-up coords.
     sep.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, 1 << 1)});
-    app.g.tab_strip_separator_id = sep.value;
+    app.g.layout.tab_strip_separator_id = sep.value;
     view.msgSend(void, "addSubview:", .{sep});
 
     return view;
@@ -63,7 +63,7 @@ pub fn create(width: f64, container_h: f64) objc.Object {
 /// Re-skin the bottom hairline. Called from `reapplyTheme` so the
 /// strip's border tracks chip.border across appearance flips.
 pub fn applyStyle(style: chrome.Style) void {
-    const sid = app.g.tab_strip_separator_id orelse return;
+    const sid = app.g.layout.tab_strip_separator_id orelse return;
     const NSColor = objc.getClass("NSColor") orelse return;
     const sep = objc.Object.fromId(sid);
     const sep_layer = sep.msgSend(objc.Object, "layer", .{});
@@ -77,7 +77,7 @@ pub fn applyStyle(style: chrome.Style) void {
 /// Schedule a redraw — call after the active index changes so the
 /// highlight follows the tab switch.
 pub fn refresh() void {
-    const id = app.g.tab_strip_id orelse return;
+    const id = app.g.layout.tab_strip_id orelse return;
     objc.Object.fromId(id).msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
 }
 
