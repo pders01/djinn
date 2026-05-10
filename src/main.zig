@@ -194,7 +194,7 @@ fn reconcileProfiles(old: Config, new_cfg: Config) void {
         }
         if (!found) {
             if (remove_count >= remove_buf.len) {
-                std.debug.print("config: too many profile removals in one save; restart for a clean slate\n", .{});
+                hostWarn("config: too many profile removals in one save; restart for a clean slate", .{});
                 break;
             }
             remove_buf[remove_count] = i;
@@ -219,7 +219,7 @@ fn reconcileProfiles(old: Config, new_cfg: Config) void {
         }
         if (!found) {
             addSessionLive(new_e) catch |err| {
-                std.debug.print("config: failed to add profile '{s}': {}\n", .{ new_e.name, err });
+                hostWarn("config: failed to add profile '{s}': {}", .{ new_e.name, err });
             };
         }
     }
@@ -249,7 +249,7 @@ fn reconcileProfiles(old: Config, new_cfg: Config) void {
                 !eqOptStr(oe.script, new_e.script) or
                 !eqOptStr(oe.provider, new_e.provider);
             if (cmd_changed) {
-                std.debug.print("config: profile '{s}' command/script/provider changed; Cmd+R to restart that session\n", .{new_e.name});
+                hostWarn("config: profile '{s}' command/script/provider changed; Cmd+R to restart that session", .{new_e.name});
             }
         }
     }
@@ -264,21 +264,21 @@ fn reconcileProfiles(old: Config, new_cfg: Config) void {
 /// launches and the launching terminal for `just run`.
 fn warnRestartRequired(old: Config, new_cfg: Config) void {
     if (old.mcp.enabled != new_cfg.mcp.enabled) {
-        std.debug.print("config: 'mcp-enabled' change requires restart\n", .{});
+        hostWarn("config: 'mcp-enabled' change requires restart", .{});
     }
     if (!eqOptStr(old.mcp.socket_path, new_cfg.mcp.socket_path)) {
-        std.debug.print("config: 'mcp-socket-path' change requires restart\n", .{});
+        hostWarn("config: 'mcp-socket-path' change requires restart", .{});
     }
     if (!eqOptU32(old.scrollback.size, new_cfg.scrollback.size)) {
-        std.debug.print("config: 'scrollback-size' change requires restart\n", .{});
+        hostWarn("config: 'scrollback-size' change requires restart", .{});
     }
     if (!std.mem.eql(u8, old.provider.name, new_cfg.provider.name) or
         !eqOptStr(old.provider.command, new_cfg.provider.command))
     {
-        std.debug.print("config: 'provider' / 'provider-command' change requires restart\n", .{});
+        hostWarn("config: 'provider' / 'provider-command' change requires restart", .{});
     }
     if (!eqOptStr(old.profiles.default, new_cfg.profiles.default)) {
-        std.debug.print("config: 'default-profile' change requires restart\n", .{});
+        hostWarn("config: 'default-profile' change requires restart", .{});
     }
     // Crossing legacy↔multi-profile boundaries is restart-required.
     // Mid-multi-profile add/remove is handled live by
@@ -286,8 +286,21 @@ fn warnRestartRequired(old: Config, new_cfg: Config) void {
     const legacy_old = old.profiles.entries.len == 0;
     const legacy_new = new_cfg.profiles.entries.len == 0;
     if (legacy_old != legacy_new) {
-        std.debug.print("config: switching between legacy single-profile and multi-profile mode requires restart\n", .{});
+        hostWarn("config: switching between legacy single-profile and multi-profile mode requires restart", .{});
     }
+}
+
+/// Fan a warning to stderr (Console.app for `.app`, terminal for
+/// `just run`) AND to the agent log pane so users running the bundle
+/// — who typically don't watch Console.app — see the message in the
+/// already-open side panel. Bounded 256-byte format buffer; longer
+/// formats truncate. Caller-side: if the log append fails (OOM in
+/// AgentState's bounded ring), we still emitted on stderr.
+fn hostWarn(comptime fmt: []const u8, args: anytype) void {
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..0];
+    std.debug.print("{s}\n", .{msg});
+    if (app.g.agent_state) |st| st.appendLog(.warn, msg) catch {};
 }
 
 fn eqOptStr(a: ?[]const u8, b: ?[]const u8) bool {
@@ -685,7 +698,7 @@ fn removeSessionLive(idx: usize) void {
     if (sm.sessions.items.len <= 1) {
         // Removing the last profile would leave the host with no
         // surface to show. Treat as restart-required.
-        std.debug.print("config: cannot remove last profile at runtime; restart djinn after editing config\n", .{});
+        hostWarn("config: cannot remove last profile at runtime; restart djinn after editing config", .{});
         return;
     }
 
