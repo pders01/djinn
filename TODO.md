@@ -122,7 +122,133 @@ Mostly window-manager actions (new_window, new_tab, toggle_fullscreen)
 that don't apply to a Quake-drop panel. **Skip** — listed so nobody
 re-litigates.
 
+### Post-refactor leftovers *(low priority — view.zig is no longer a god-module)*
+
+Module split + AppState grouping wave landed (commits `1c62051`
+through `d49ba5a`). Below is what remains, ranked by ROI.
+
+1. **`view.applyLogLayout` + `checkResize` → `window/layout.zig`**
+   `divider.zig` currently back-imports `view.applyLogLayout` for the
+   drag-resize reflow. Moving `applyLogLayout` (+ its `checkResize`
+   helper) into `window/layout.zig` — already home to `buildContainer`
+   + `computeLogWidth` — drops the cyclic edge. Make `checkResize`
+   pub on view.zig, layout calls it back. ~120 LOC moved.
+
+2. **`bindGhosttySurface` per-session arena**
+   Today every `restartActiveSession` dupeZ-leaks cmd + cwd. Per-session
+   `std.heap.ArenaAllocator` freed in `removeSessionLive` would cap the
+   leak at "active sessions × current spawn args". Cheap; well-bounded
+   to `ghostty/surface_lifecycle.zig`.
+
+3. **Tests for find / palette key handlers**
+   `terminal/find.zig` `handleKey` and `session/palette.zig` filter
+   logic are pure state machines on `app.g.find.*` / `app.g.palette.*`.
+   Same testing ROI as the keymap unit tests — exercise needle
+   manipulation, prefix-match scoring, selection-cycling without
+   spinning Cocoa.
+
+4. **Drag-drop callbacks → `terminal/dragdrop.zig`** *(~150 LOC)*
+   `draggingEnteredImpl` + `performDragOperationImpl` + `tryDropImage`
+   form a self-contained NSDraggingDestination surface inside view.zig.
+   No responder-chain coupling. Extractable when next change touches
+   drag handling.
+
+5. **Theme reapply → `terminal/theme_apply.zig`** *(~150 LOC)*
+   `reapplyTheme` + `reapplyThemeIfChanged` + `reloadTheme` cross
+   chrome + log_view + tab_strip + find overlay; centralizing the
+   "reskin everything" path makes the fan-out explicit. Worth doing
+   when adding any new chrome surface that reskins on appearance flip.
+
+6. **`RetainedView` ownership helper** *(NSObject manual ref-count)*
+   `removeSessionLive` calls `release` to balance the +1 from
+   `[NSView alloc]`. Open question: which other paths take alloc'd
+   views to a place where `removeFromSuperview` doesn't drop the last
+   retain? A small `RetainedView` wrapper struct that pairs alloc +
+   manual release would catch new occurrences at the type level.
+
+None are urgent. Each addresses real friction; the codebase no longer
+has a god-module at the center, so prioritize features over more
+extraction.
+
 ## Recently shipped — current session
+
+### Architecture wave: god-module split + AppState grouping + low-hanging fixes
+*(commits `1c62051` → `d49ba5a`, 18 commits, build + tests green throughout)*
+
+Driven by the architectural assessment in the same session. Each
+commit independently revertible; per-step build + test green.
+
+**Security / robustness (3 commits):**
+- **MCP token compare constant-time** (`src/mcp/server.zig`).
+  `std.mem.eql` short-circuits and leaks position to a local timing
+  observer; replaced with byte-folding `constantTimeEql`. Loopback-
+  only, but the right correctness baseline.
+- **MCP accept-loop backoff 1ms→200ms** with reset on success.
+  Persistent `accept()` failure (fd exhaustion, kernel hiccup)
+  previously busy-looped at ~100% CPU.
+- **Reconcile remove buffer heap-sized** to current session count.
+  Stack `[32]usize` cap silently truncated diffs at 32 entries.
+- **`hostWarn` fans config-reload warnings to the agent log pane**
+  in addition to stderr. `.app` users (no Console.app open) now see
+  restart-required + reconcile-failure messages on screen.
+
+**view.zig god-module split (5 modules, 1057 LOC pulled out):**
+- `terminal/keymap.zig` (154 LOC) — `Action` struct, mod constants,
+  `dispatch`, `matchIndex`, `rebind`. **+7 unit tests** for mask
+  logic, mods disambiguation on shared keycodes, ignored non-target
+  modifier bits, rebind-by-name. First tests for the user input
+  layer.
+- `terminal/find.zig` (398 LOC) — find overlay UI, NSTextField
+  setup, `DjinnChipCell` class, `handleKey` / `actionOpen/Next/Prev`.
+  Plus the `forwardBindingAction` helper duplicated locally to
+  avoid back-importing view.zig.
+- `terminal/font.zig` (190 LOC) — CoreText resolution + cell
+  metrics. Owns its own `cg` cImport scope.
+- `terminal/divider.zig` (106 LOC) — `DjinnDivider` class +
+  drag-resize handlers + `width` constant.
+- `terminal/ime.zig` (209 LOC) — 11 NSTextInputClient impls +
+  preedit buffer + composition state. `view.keyDownImpl` /
+  `flagsChangedImpl` now gate on `ime.preedit_len` /
+  `ime.current_keydown` / `ime.handled_during_interpret`.
+
+**main.zig over-bridging split (3 modules, 496 LOC pulled out):**
+- `session/live.zig` (249 LOC) — `reconcileProfiles`,
+  `addSessionLive`, `removeSessionLive`, `ensureTabStripVisible`.
+  Hot-config-reload glue; `main.hostWarn` made pub so `live.zig` +
+  future modules can fan warnings to the log pane.
+- `window/layout.zig` (109 LOC) — `buildContainer` +
+  `computeLogWidth`. NSSplitView's auto-layout glitches inside
+  NSVisualEffectView during live resize, so the explicit-frame
+  layout math lives here.
+- `ghostty/surface_lifecycle.zig` (241 LOC) — `activateSession`,
+  `restartActiveSession`, `restartSurfaceCallback`,
+  `bindGhosttySurface`, `RestartCtx`, `isShell`. view.zig +
+  tab_strip.zig + palette.zig + live.zig now reach the lifecycle
+  module directly instead of round-tripping through main.zig.
+
+**AppState field-sprawl regrouping (7 commits, 8 substructs):**
+50+ flat fields collapsed into named substructs. Each field group
+has obvious shared concern + lifetime. Top-level pointers
+(`allocator`, `config`, `notifier`, `hotkey`, `tool_table`,
+`session_manager`) stayed flat — single pointer with no peer state.
+- `app.g.find.*` — find_mode, query_buf/len, total, selected, field_id
+- `app.g.palette.*` — same pattern for the Cmd+Shift+P switcher
+- `app.g.ghostty.*` — app, surface, config (the opaque-handle trio)
+- `app.g.layout.*` — container_id, surface_host_id, divider_view_id,
+  tab_strip_id, tab_strip_separator_id (the container subview tree)
+- `app.g.term.*` — view_id, font, cell_w/h, baseline, padding_x/y,
+  bg_alpha (the terminal view's glyph-metric state)
+- `app.g.agent.*` — state, menubar, log_view, last_state, tick_count
+- `app.g.theme.*` — chrome_style, last_appearance
+- `app.g.window.*` — panel, hide_on_blur, resize_handler
+
+**Net impact:**
+- view.zig: 2202 → 1360 LOC (−38%)
+- main.zig: 1262 → 766 LOC (−39%)
+- app.zig: 180 flat fields → 219 LOC of grouped substructs
+- 8 new modules under terminal/, session/, window/, ghostty/
+- 7 keymap unit tests added (was: 0 for input layer)
+- module-to-module direct imports replace main.zig back-import hub
 
 ### Theme reapply on panel show
 
