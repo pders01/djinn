@@ -1483,8 +1483,8 @@ pub fn setLogPaneHidden(hide: bool) void {
 
     const c_bounds = container.msgSend(NSRect, "bounds", .{});
     const cfg = app.g.config orelse return;
-    const main_mod = @import("../main.zig");
-    const log_baseline_w: f64 = main_mod.computeLogWidth(c_bounds.size.width, cfg);
+    const layout = @import("../window/layout.zig");
+    const log_baseline_w: f64 = layout.computeLogWidth(c_bounds.size.width, cfg);
     const log_w: f64 = if (hide) 0 else log_baseline_w;
     const eff_div_w: f64 = if (hide) 0 else divider_width;
     const term_w: f64 = @max(1.0, c_bounds.size.width - log_w - eff_div_w);
