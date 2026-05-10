@@ -105,14 +105,14 @@ pub const TerminalView = struct {
         // backingScaleFactor so glyph runs hit native pixels.
         view.msgSend(void, "setWantsLayer:", .{@as(c_int, 1)});
 
-        app.g.font = @ptrCast(metrics.font);
-        app.g.view_id = view.value;
-        app.g.cell_w = metrics.cell_w;
-        app.g.cell_h = metrics.cell_h;
-        app.g.baseline = metrics.baseline;
-        app.g.padding_x = padding_x;
-        app.g.padding_y = padding_y;
-        app.g.bg_alpha = bg_alpha;
+        app.g.term.font = @ptrCast(metrics.font);
+        app.g.term.view_id = view.value;
+        app.g.term.cell_w = metrics.cell_w;
+        app.g.term.cell_h = metrics.cell_h;
+        app.g.term.baseline = metrics.baseline;
+        app.g.term.padding_x = padding_x;
+        app.g.term.padding_y = padding_y;
+        app.g.term.bg_alpha = bg_alpha;
 
         // Drag-drop types: file URLs (Finder), and raw image data (PNG/
         // TIFF) so screenshots / Photos / browser image drags also reach
@@ -159,8 +159,8 @@ pub const TerminalView = struct {
     }
 
     pub fn gridSize(self: TerminalView, width: f64, height: f64) struct { cols: u16, rows: u16 } {
-        const usable_w = @max(1.0, width - 2 * app.g.padding_x);
-        const usable_h = @max(1.0, height - 2 * app.g.padding_y);
+        const usable_w = @max(1.0, width - 2 * app.g.term.padding_x);
+        const usable_h = @max(1.0, height - 2 * app.g.term.padding_y);
         const cols: u16 = @max(1, @as(u16, @intFromFloat(@floor(usable_w / self.cell_w))));
         const rows: u16 = @max(1, @as(u16, @intFromFloat(@floor(usable_h / self.cell_h))));
         return .{ .cols = cols, .rows = rows };
@@ -450,7 +450,7 @@ fn applyLogLayout(container: objc.Object, term_w: f64, log_w: f64, height: f64) 
     const tab_strip = @import("../session/tab_strip.zig");
     const tab_h: f64 = if (app.g.layout.tab_strip_id != null) tab_strip.tab_h else 0;
     const term_h = @max(1.0, height - tab_h);
-    const view_id = app.g.view_id orelse return;
+    const view_id = app.g.term.view_id orelse return;
     const term_view = objc.Object.fromId(view_id);
     term_view.msgSend(void, "setFrame:", .{NSRect{
         .origin = .{ .x = 0, .y = 0 },
@@ -810,7 +810,7 @@ fn checkResize(view: objc.Object) void {
 /// the panel ends up blank afterward, because the post-resize PTY redraw from
 /// the shell never gets drained.
 fn startTickTimer() void {
-    const view_id = app.g.view_id orelse return;
+    const view_id = app.g.term.view_id orelse return;
     const NSTimer = objc.getClass("NSTimer") orelse return;
     const NSRunLoop = objc.getClass("NSRunLoop") orelse return;
     const NSString = objc.getClass("NSString") orelse return;
@@ -972,10 +972,10 @@ fn eventToCell(view: objc.Object, event: objc.Object) struct { col: i32, row: i3
     const view_pt = view.msgSend(NSPoint, "convertPoint:fromView:", .{ win_pt, @as(?*anyopaque, null) });
     const bounds = view.msgSend(NSRect, "bounds", .{});
 
-    const x = view_pt.x - app.g.padding_x;
-    const y_top = (bounds.size.height - app.g.padding_y) - view_pt.y;
-    const col = @as(i32, @intFromFloat(@floor(x / app.g.cell_w)));
-    const row = @as(i32, @intFromFloat(@floor(y_top / app.g.cell_h)));
+    const x = view_pt.x - app.g.term.padding_x;
+    const y_top = (bounds.size.height - app.g.term.padding_y) - view_pt.y;
+    const col = @as(i32, @intFromFloat(@floor(x / app.g.term.cell_w)));
+    const row = @as(i32, @intFromFloat(@floor(y_top / app.g.term.cell_h)));
     return .{ .col = col, .row = row };
 }
 
@@ -1476,7 +1476,7 @@ pub fn relayout() void {
 /// the view tree to keep responder-chain + key-window state intact on
 /// borderless NSPanels.
 pub fn setLogPaneHidden(hide: bool) void {
-    const view_id = app.g.view_id orelse return;
+    const view_id = app.g.term.view_id orelse return;
     const term_view = objc.Object.fromId(view_id);
     const container = term_view.msgSend(objc.Object, "superview", .{});
     if (container.value == null) return;
@@ -1694,14 +1694,14 @@ fn firstRectForCharacterRangeImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRange,
 
     var x: f64 = 0;
     var y: f64 = 0;
-    var width: f64 = app.g.cell_w;
-    var height: f64 = app.g.cell_h;
+    var width: f64 = app.g.term.cell_w;
+    var height: f64 = app.g.term.cell_h;
     ghostty_runtime.c.ghostty_surface_ime_point(surf, &x, &y, &width, &height);
 
     const frame = view.msgSend(NSRect, "frame", .{});
     const view_rect = NSRect{
         .origin = .{ .x = x, .y = frame.size.height - y },
-        .size = .{ .width = width, .height = @max(height, app.g.cell_h) },
+        .size = .{ .width = width, .height = @max(height, app.g.term.cell_h) },
     };
     const win_rect = view.msgSend(NSRect, "convertRect:toView:", .{ view_rect, @as(?*anyopaque, null) });
     const window = view.msgSend(objc.Object, "window", .{});

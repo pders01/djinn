@@ -318,7 +318,7 @@ fn exitMode(end_search: bool) void {
     // path blocks main on Search.deinit's thread.join; AppKit can
     // shuffle event/responder state during that pause and stop
     // delivering keyDown back to us. Force the responder back.
-    if (app.g.view_id) |vid| {
+    if (app.g.term.view_id) |vid| {
         const view = objc.Object.fromId(vid);
         const window = view.msgSend(objc.Object, "window", .{});
         if (window.value != null) {

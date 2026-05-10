@@ -47,7 +47,7 @@ pub fn close() void {
     }
     // Re-anchor first responder on the terminal view; AppKit can
     // shuffle responder state when modal-style overlays come and go.
-    if (app.g.view_id) |tid| {
+    if (app.g.term.view_id) |tid| {
         const term = objc.Object.fromId(tid);
         const window = term.msgSend(objc.Object, "window", .{});
         if (window.value != null) {
@@ -209,7 +209,7 @@ fn refresh() void {
 }
 
 fn mountOverlay() void {
-    const term_id = app.g.view_id orelse return;
+    const term_id = app.g.term.view_id orelse return;
     const term = objc.Object.fromId(term_id);
     const container = term.msgSend(objc.Object, "superview", .{});
     if (container.value == null) return;

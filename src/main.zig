@@ -586,7 +586,7 @@ fn restartSurfaceCallback(ctx_opaque: ?*anyopaque) callconv(.c) void {
     // Re-anchor keyboard focus on the new surface's view. Without
     // this, AppKit may have lost the responder chain during the
     // surface_free → newSurface gap.
-    if (app.g.view_id) |vid| {
+    if (app.g.term.view_id) |vid| {
         const term = objc.Object.fromId(vid);
         const window = term.msgSend(objc.Object, "window", .{});
         if (window.value != null) {

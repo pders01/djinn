@@ -20,25 +20,8 @@ const ToolTable = @import("mcp/tools.zig").ToolTable;
 /// loop starts and cleared on exit. Reads inside callbacks are safe since
 /// the run loop and callbacks share the main thread.
 pub const AppState = struct {
-    // IO -------------------------------------------------------------
-    /// NSView pointer for the terminal surface. Stored as raw id since
-    /// callbacks reach for it via objc message dispatch.
-    view_id: ?objc.c.id = null,
-
-    // Font + cell metrics --------------------------------------------
-    /// CTFontRef as opaque pointer — keeping CoreText's `@cImport` out of
-    /// app.zig avoids duplicate-opaque-type conflicts. Callers cast to
-    /// the cg.CTFontRef alias they already have in scope.
-    font: ?*const anyopaque = null,
-    cell_w: f64 = 8,
-    cell_h: f64 = 16,
-    baseline: f64 = 4,
-    padding_x: f64 = 8,
-    padding_y: f64 = 8,
-    /// Bg alpha for the terminal layer. `< 1.0` when an NSVisualEffectView
-    /// blur sits underneath (bg drawn translucent so the blur shows
-    /// through); `1.0` otherwise.
-    bg_alpha: f64 = 1.0,
+    // Terminal view + font/cell metrics ------------------------------
+    term: Term = .{},
 
     // Agent surface observers ----------------------------------------
     agent_state: ?*AgentState = null,
@@ -110,6 +93,26 @@ pub const AppState = struct {
     // Declared after fields per Zig's container layout rule. Each
     // group is opt-in: callers reach `app.g.find.*`, `app.g.palette.*`,
     // etc. instead of the flat field sea this struct used to be.
+
+    pub const Term = struct {
+        /// NSView pointer for the terminal surface. Stored as raw id
+        /// since callbacks reach for it via objc message dispatch.
+        view_id: ?objc.c.id = null,
+        /// CTFontRef as opaque pointer — keeping CoreText's `@cImport`
+        /// out of app.zig avoids duplicate-opaque-type conflicts.
+        /// Callers cast to the cg.CTFontRef alias they already have
+        /// in scope.
+        font: ?*const anyopaque = null,
+        cell_w: f64 = 8,
+        cell_h: f64 = 16,
+        baseline: f64 = 4,
+        padding_x: f64 = 8,
+        padding_y: f64 = 8,
+        /// Bg alpha for the terminal layer. `< 1.0` when an
+        /// NSVisualEffectView blur sits underneath (bg drawn
+        /// translucent so the blur shows through); `1.0` otherwise.
+        bg_alpha: f64 = 1.0,
+    };
 
     pub const Layout = struct {
         /// Outer container NSView holding terminal / log / divider /

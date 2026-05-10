@@ -298,7 +298,7 @@ pub const Panel = struct {
         // initialFirstResponder (defaults to contentView, which is the
         // blur NSVisualEffectView — has no keyDown). Push it back to
         // the TerminalView so keystrokes reach our forwarding path.
-        if (app_state.g.view_id) |vid| {
+        if (app_state.g.term.view_id) |vid| {
             _ = self.ns_panel.msgSend(c_int, "makeFirstResponder:", .{objc.Object.fromId(vid)});
         }
         if (!self.instant_toggle) {
