@@ -648,14 +648,14 @@ fn handleRingBell(host: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s,
 
 fn handleSearchTotal(host: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, action: c.ghostty_action_s) bool {
     const total = action.action.search_total.total;
-    host.app_state.search_total = if (total < 0) null else @intCast(total);
+    host.app_state.find.total = if (total < 0) null else @intCast(total);
     @import("../terminal/find.zig").updateCountLabel();
     return true;
 }
 
 fn handleSearchSelected(host: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, action: c.ghostty_action_s) bool {
     const sel = action.action.search_selected.selected;
-    host.app_state.search_selected = if (sel < 0) null else @intCast(sel);
+    host.app_state.find.selected = if (sel < 0) null else @intCast(sel);
     @import("../terminal/find.zig").updateCountLabel();
     return true;
 }

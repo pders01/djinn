@@ -1197,7 +1197,7 @@ fn keyDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(
     // Find mode owns the keyboard: route into the needle buffer
     // instead of the surface. Cmd / Ctrl chords still fall through
     // (so Cmd+G can navigate without entering "G" into the needle).
-    if (app.g.find_mode and (flags & (mod_cmd | mod_control)) == 0) {
+    if (app.g.find.mode and (flags & (mod_cmd | mod_control)) == 0) {
         find.handleKey(event, keycode);
         return;
     }

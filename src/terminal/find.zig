@@ -6,9 +6,9 @@ const chrome_mod = @import("../chrome.zig");
 
 // ─── Find on page ────────────────────────────────────────────────────
 //
-// Cmd+F enters find mode. While `app.g.find_mode` is true, view.zig's
+// Cmd+F enters find mode. While `app.g.find.mode` is true, view.zig's
 // keyDownImpl routes printable keys into the needle buffer
-// (`app.g.search_query_buf`) instead of the ghostty surface and
+// (`app.g.find.query_buf`) instead of the ghostty surface and
 // `pushNeedle()` fires `search:<needle>` via the binding-action API;
 // backspace shrinks the needle; Esc / Return exit + clear; Cmd+F
 // again toggles off. The display NSTextField is read-only —
@@ -34,7 +34,7 @@ fn forwardBindingAction(action_str: []const u8) void {
 
 /// Build the find-overlay NSTextField + DjinnChipCell, wire it as a
 /// subview of `parent` (the terminal view), stash it on
-/// `app.g.search_field_id`. Hidden until Cmd+F flips `find_mode`.
+/// `app.g.find.field_id`. Hidden until Cmd+F flips `find_mode`.
 /// Width auto-sizes in `updateCountLabel` — initial frame just
 /// reserves a slot in the responder chain + an initial position.
 pub fn createOverlay(parent: objc.Object, width: f64, height: f64, style: chrome_mod.Style) !void {
@@ -87,7 +87,7 @@ pub fn createOverlay(parent: objc.Object, width: f64, height: f64, style: chrome
         tf_layer.msgSend(void, "setBorderColor:", .{border_ns.msgSend(?*anyopaque, "CGColor", .{})});
     }
     parent.msgSend(void, "addSubview:", .{tf});
-    app.g.search_field_id = tf.value;
+    app.g.find.field_id = tf.value;
     applyFindOverlayFont(tf, style);
 }
 
@@ -96,19 +96,19 @@ pub fn createOverlay(parent: objc.Object, width: f64, height: f64, style: chrome
 /// echoes the log-pane "ACTIVITY" header idiom so the find overlay
 /// reads as the same chrome family rather than a stray native field.
 pub fn updateCountLabel() void {
-    const fid = app.g.search_field_id orelse return;
+    const fid = app.g.find.field_id orelse return;
     const tf = objc.Object.fromId(fid);
-    if (!app.g.find_mode) {
+    if (!app.g.find.mode) {
         tf.msgSend(void, "setHidden:", .{@as(c_int, 1)});
         return;
     }
     const style = app.g.chrome_style orelse return;
 
-    const needle = app.g.search_query_buf[0..app.g.search_query_len];
+    const needle = app.g.find.query_buf[0..app.g.find.query_len];
     var count_buf: [32]u8 = undefined;
     const count_str: []const u8 = blk: {
-        if (app.g.search_total) |total| {
-            const sel_disp: u32 = if (app.g.search_selected) |s| s + 1 else 0;
+        if (app.g.find.total) |total| {
+            const sel_disp: u32 = if (app.g.find.selected) |s| s + 1 else 0;
             break :blk std.fmt.bufPrint(&count_buf, "{d}/{d}", .{ sel_disp, total }) catch "";
         }
         break :blk "";
@@ -221,7 +221,7 @@ fn applyFindOverlayFont(tf: objc.Object, style: chrome_mod.Style) void {
 /// pick up `style.chip.*` automatically since updateCountLabel reads
 /// `app.g.chrome_style` on every call.
 pub fn applyOverlayStyle(style: chrome_mod.Style) void {
-    const fid = app.g.search_field_id orelse return;
+    const fid = app.g.find.field_id orelse return;
     const tf = objc.Object.fromId(fid);
     const NSColor = objc.getClass("NSColor") orelse return;
     tf.msgSend(void, "setBackgroundColor:", .{chrome_mod.nsColorFromRgb(NSColor, style.chip.bg)});
@@ -234,7 +234,7 @@ pub fn applyOverlayStyle(style: chrome_mod.Style) void {
     }
 
     applyFindOverlayFont(tf, style);
-    if (app.g.find_mode) updateCountLabel();
+    if (app.g.find.mode) updateCountLabel();
 }
 
 /// Register `DjinnChipCell : NSTextFieldCell` once. The override
@@ -282,30 +282,30 @@ fn pushNeedle() void {
     var buf: [160]u8 = undefined;
     const prefix = "search:";
     @memcpy(buf[0..prefix.len], prefix);
-    const n = app.g.search_query_len;
-    @memcpy(buf[prefix.len .. prefix.len + n], app.g.search_query_buf[0..n]);
+    const n = app.g.find.query_len;
+    @memcpy(buf[prefix.len .. prefix.len + n], app.g.find.query_buf[0..n]);
     forwardBindingAction(buf[0 .. prefix.len + n]);
-    app.g.search_total = null;
-    app.g.search_selected = null;
+    app.g.find.total = null;
+    app.g.find.selected = null;
     updateCountLabel();
 }
 
 fn enterMode() void {
-    if (app.g.find_mode) return;
-    app.g.find_mode = true;
-    app.g.search_query_len = 0;
-    app.g.search_total = null;
-    app.g.search_selected = null;
+    if (app.g.find.mode) return;
+    app.g.find.mode = true;
+    app.g.find.query_len = 0;
+    app.g.find.total = null;
+    app.g.find.selected = null;
     updateCountLabel();
     forwardBindingAction("start_search");
 }
 
 fn exitMode(end_search: bool) void {
-    if (!app.g.find_mode) return;
-    app.g.find_mode = false;
-    app.g.search_query_len = 0;
-    app.g.search_total = null;
-    app.g.search_selected = null;
+    if (!app.g.find.mode) return;
+    app.g.find.mode = false;
+    app.g.find.query_len = 0;
+    app.g.find.total = null;
+    app.g.find.selected = null;
     updateCountLabel();
     if (end_search) {
         // end_search calls Search.deinit which joins the search thread.
@@ -330,24 +330,24 @@ fn exitMode(end_search: bool) void {
 /// Public UI-sync entry point for ghostty's end_search action.
 /// Hides UI without re-emitting the binding (would recurse).
 pub fn closeOverlayUiOnly() void {
-    if (!app.g.find_mode) return;
-    app.g.find_mode = false;
-    app.g.search_query_len = 0;
-    app.g.search_total = null;
-    app.g.search_selected = null;
+    if (!app.g.find.mode) return;
+    app.g.find.mode = false;
+    app.g.find.query_len = 0;
+    app.g.find.total = null;
+    app.g.find.selected = null;
     updateCountLabel();
 }
 
 /// Public UI-sync entry point for ghostty's start_search action.
 pub fn openOverlayUiOnly() void {
-    if (app.g.find_mode) return;
-    app.g.find_mode = true;
-    app.g.search_query_len = 0;
+    if (app.g.find.mode) return;
+    app.g.find.mode = true;
+    app.g.find.query_len = 0;
     updateCountLabel();
 }
 
 pub fn actionOpen() void {
-    if (app.g.find_mode) {
+    if (app.g.find.mode) {
         exitMode(true);
         return;
     }
@@ -366,8 +366,8 @@ pub fn handleKey(event: objc.Object, keycode: u16) void {
     // Backspace — shrink needle. Re-pushes (empty needle stops search
     // per ghostty semantics, but UI stays in find mode).
     if (keycode == 51) {
-        if (app.g.search_query_len > 0) {
-            app.g.search_query_len -= 1;
+        if (app.g.find.query_len > 0) {
+            app.g.find.query_len -= 1;
             pushNeedle();
         }
         return;
@@ -382,10 +382,10 @@ pub fn handleKey(event: objc.Object, keycode: u16) void {
     // Skip control chars (< 0x20) — covers Tab, Ctrl combos that AppKit
     // delivers via characters even when not intended as text.
     if (s.len == 1 and s[0] < 0x20) return;
-    const room = app.g.search_query_buf.len - app.g.search_query_len;
+    const room = app.g.find.query_buf.len - app.g.find.query_len;
     const take = @min(s.len, room);
-    @memcpy(app.g.search_query_buf[app.g.search_query_len .. app.g.search_query_len + take], s[0..take]);
-    app.g.search_query_len += take;
+    @memcpy(app.g.find.query_buf[app.g.find.query_len .. app.g.find.query_len + take], s[0..take]);
+    app.g.find.query_len += take;
     pushNeedle();
 }
 

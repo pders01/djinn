@@ -82,23 +82,7 @@ pub const AppState = struct {
     tool_table: ?*ToolTable = null,
 
     // Find on page ----------------------------------------------------
-    /// True while Cmd+F is active. Routes keystrokes from keyDownImpl
-    /// into the needle buffer instead of the ghostty surface. Borderless
-    /// NSPanel + NSTextField + ghostty surface don't compose into a
-    /// working field editor — we own input anyway, so just intercept.
-    find_mode: bool = false,
-    /// Current needle. Empty = no active search.
-    search_query_buf: [128]u8 = [_]u8{0} ** 128,
-    search_query_len: usize = 0,
-    /// Total match count + current selected index, both reported by
-    /// ghostty via the search_total / search_selected actions.
-    search_total: ?u32 = null,
-    search_selected: ?u32 = null,
-    /// Inline find-overlay NSTextField (read-only, display-only).
-    /// Shows the current needle + count. Hidden when find_mode is
-    /// false. Stored as id so callback handlers can retrieve it
-    /// without capturing closure state (Cocoa C-ABI restriction).
-    search_field_id: ?objc.c.id = null,
+    find: FindState = .{},
 
     // Chrome ---------------------------------------------------------
     /// Active chrome style — derived from theme on startup + every
@@ -172,6 +156,31 @@ pub const AppState = struct {
     /// session switcher can call `ga.newSurface` without re-importing
     /// the runtime module from inside view.zig.
     ghostty_app: ?*@import("ghostty/runtime.zig").App = null,
+
+    // ─── Sub-state types ───────────────────────────────────────────
+    // Declared after fields per Zig's container layout rule. Each
+    // group is opt-in: callers reach `app.g.find.*`, `app.g.palette.*`,
+    // etc. instead of the flat field sea this struct used to be.
+
+    pub const FindState = struct {
+        /// True while Cmd+F is active. Routes keystrokes from keyDownImpl
+        /// into the needle buffer instead of the ghostty surface. Borderless
+        /// NSPanel + NSTextField + ghostty surface don't compose into a
+        /// working field editor — we own input anyway, so just intercept.
+        mode: bool = false,
+        /// Current needle. Empty = no active search.
+        query_buf: [128]u8 = [_]u8{0} ** 128,
+        query_len: usize = 0,
+        /// Total match count + current selected index, both reported by
+        /// ghostty via the search_total / search_selected actions.
+        total: ?u32 = null,
+        selected: ?u32 = null,
+        /// Inline find-overlay NSTextField (read-only, display-only).
+        /// Shows the current needle + count. Hidden when find.mode is
+        /// false. Stored as id so callback handlers can retrieve it
+        /// without capturing closure state (Cocoa C-ABI restriction).
+        field_id: ?objc.c.id = null,
+    };
 };
 
 /// Global handle. Code paths that need app state read this directly.
