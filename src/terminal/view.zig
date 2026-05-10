@@ -13,6 +13,7 @@ const chrome_mod = @import("../chrome.zig");
 const keymap = @import("keymap.zig");
 const find = @import("find.zig");
 const font_mod = @import("font.zig");
+const divider_mod = @import("divider.zig");
 
 const cg = @cImport({
     @cInclude("CoreGraphics/CoreGraphics.h");
@@ -34,12 +35,8 @@ const ns_not_found: c_ulong = (@as(c_ulong, 1) << 63) - 1;
 // they're implementation details of view-class registration / drain — no
 // other module reads them.
 var g_class_registered: bool = false;
-var g_divider_class_registered: bool = false;
 
-/// Visible + grabbable width of the log/terminal divider. Wide enough
-/// for a reliable mouse hit (1px is too narrow on dense displays);
-/// alpha keeps the visible band reading as a hairline.
-pub const divider_width: f64 = 4.0;
+pub const divider_width = divider_mod.width;
 
 /// Forward a UTF-8 text blob to the ghostty surface (paste / drop /
 /// IME commit / unmapped-key fallback path). Returns false when the
@@ -182,99 +179,13 @@ pub const TerminalView = struct {
     }
 };
 
-/// Build the resizable divider NSView between terminal + log pane.
-/// Subclasses NSView as `DjinnDivider` to host mouseDown/Dragged/Up
-/// + resetCursorRects so the user can drag-to-resize the log column.
-pub fn createDivider(term_w: f64, height: f64) objc.Object {
-    registerDividerClass();
-    const cls = objc.getClass("DjinnDivider") orelse unreachable;
-    const alloc = cls.msgSend(objc.Object, "alloc", .{});
-    const div = alloc.msgSend(objc.Object, "initWithFrame:", .{NSRect{
-        .origin = .{ .x = term_w, .y = 0 },
-        .size = .{ .width = divider_width, .height = height },
-    }});
-    div.msgSend(void, "setWantsLayer:", .{@as(c_int, 1)});
-    // Divider is a transparent hit-target — the visible boundary
-    // between terminal + log pane is the log pane's 1px chip.border
-    // separator. Painting the divider with white@5% alpha left a
-    // white-tinted fringe next to the chrome border on translucent
-    // panels.
-    // MinXMargin | HeightSizable — divider tracks its x relative to the
-    // right edge as the panel resizes.
-    div.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, (1 << 0) | (1 << 4))});
-    return div;
-}
-
-fn registerDividerClass() void {
-    if (g_divider_class_registered) return;
-    g_divider_class_registered = true;
-    const NSView = objc.getClass("NSView") orelse return;
-    const cls = objc.allocateClassPair(NSView, "DjinnDivider") orelse return;
-    _ = cls.addMethod("mouseDown:", dividerMouseDownImpl);
-    _ = cls.addMethod("mouseDragged:", dividerMouseDraggedImpl);
-    _ = cls.addMethod("mouseUp:", dividerMouseUpImpl);
-    _ = cls.addMethod("resetCursorRects", dividerResetCursorRectsImpl);
-    _ = cls.addMethod("acceptsFirstMouse:", dividerAcceptsFirstMouseImpl);
-    objc.registerClassPair(cls);
-}
-
-fn dividerAcceptsFirstMouseImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) c_int {
-    // Return YES so the first click on a non-key window starts the drag
-    // immediately, instead of being consumed by the window-activation
-    // hit-test. Borderless NSPanel can lose key state on focus shifts.
-    return 1;
-}
-
-fn dividerMouseDownImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
-    // No-op — `mouseDragged:` does the actual layout work each tick.
-    // Implementing the selector at all is what tells AppKit we want
-    // mouse events; without it the divider is transparent to clicks.
-}
-
-fn dividerMouseUpImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
-    // Persist the new fraction so subsequent toggles + resizes use it.
-    const cfg = app.g.config orelse return;
-    const lv = app.g.agent.log_view orelse return;
-    const log_frame = lv.view.msgSend(NSRect, "frame", .{});
-    const container = lv.view.msgSend(objc.Object, "superview", .{});
-    if (container.value == null) return;
-    const c_bounds = container.msgSend(NSRect, "bounds", .{});
-    if (c_bounds.size.width <= 0) return;
-    cfg.log_pane.width_fraction = log_frame.size.width / c_bounds.size.width;
-}
-
-fn dividerMouseDraggedImpl(self: objc.c.id, _: objc.c.SEL, event: objc.c.id) callconv(.c) void {
-    const div = objc.Object.fromId(self);
-    const container = div.msgSend(objc.Object, "superview", .{});
-    if (container.value == null) return;
-    const ev = objc.Object.fromId(event);
-    const win_loc = ev.msgSend(NSPoint, "locationInWindow", .{});
-    const cont_loc = container.msgSend(NSPoint, "convertPoint:fromView:", .{ win_loc, @as(?*anyopaque, null) });
-
-    const c_bounds = container.msgSend(NSRect, "bounds", .{});
-    const cfg = app.g.config orelse return;
-
-    // Cursor x in container coords = the new term_w boundary. Log
-    // takes whatever is right of that (minus the divider band).
-    var new_log_w = c_bounds.size.width - cont_loc.x - divider_width;
-    new_log_w = @max(cfg.log_pane.width_min, @min(cfg.log_pane.width_max, new_log_w));
-    const new_term_w = @max(1.0, c_bounds.size.width - new_log_w - divider_width);
-    applyLogLayout(container, new_term_w, new_log_w, c_bounds.size.height);
-}
-
-fn dividerResetCursorRectsImpl(self: objc.c.id, _: objc.c.SEL) callconv(.c) void {
-    const div = objc.Object.fromId(self);
-    const NSCursor = objc.getClass("NSCursor") orelse return;
-    const cursor = NSCursor.msgSend(objc.Object, "resizeLeftRightCursor", .{});
-    const bounds = div.msgSend(NSRect, "bounds", .{});
-    div.msgSend(void, "addCursorRect:cursor:", .{ bounds, cursor });
-}
+pub const createDivider = divider_mod.create;
 
 /// Reflow terminal + divider + log + surface_host frames to a new
 /// split. Shared between drag-to-resize + log-pane toggle so the
 /// layout invariants live in one place. Reserves `tab_strip.tab_h`
 /// at the top when the multi-profile tab strip is present.
-fn applyLogLayout(container: objc.Object, term_w: f64, log_w: f64, height: f64) void {
+pub fn applyLogLayout(container: objc.Object, term_w: f64, log_w: f64, height: f64) void {
     const tab_strip = @import("../session/tab_strip.zig");
     const tab_h: f64 = if (app.g.layout.tab_strip_id != null) tab_strip.tab_h else 0;
     const term_h = @max(1.0, height - tab_h);
