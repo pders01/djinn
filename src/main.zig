@@ -178,12 +178,21 @@ fn onConfigChanged() void {
 fn reconcileProfiles(old: Config, new_cfg: Config) void {
     const sm = app.g.session_manager orelse return;
     if (old.profiles.entries.len == 0 or new_cfg.profiles.entries.len == 0) return;
+    const allocator = app.g.allocator orelse return;
 
     // Phase 1: collect indices of sessions whose name is no longer
     // present in the new config. Removed in *descending* order so
-    // earlier indices stay stable while we mutate.
-    var remove_buf: [32]usize = undefined;
-    var remove_count: usize = 0;
+    // earlier indices stay stable while we mutate. Heap-backed list
+    // sized to the current session count: a removal can't exceed
+    // existing sessions, so ensureTotalCapacity is the high-water mark.
+    // Previous stack cap silently truncated large diffs (32-entry
+    // limit hit = surprise data loss).
+    var remove_buf: std.ArrayList(usize) = .{};
+    defer remove_buf.deinit(allocator);
+    remove_buf.ensureTotalCapacity(allocator, sm.sessions.items.len) catch {
+        hostWarn("config: profile reconcile OOM; skipping diff", .{});
+        return;
+    };
     for (sm.sessions.items, 0..) |sess, i| {
         var found = false;
         for (new_cfg.profiles.entries) |new_e| {
@@ -192,19 +201,12 @@ fn reconcileProfiles(old: Config, new_cfg: Config) void {
                 break;
             }
         }
-        if (!found) {
-            if (remove_count >= remove_buf.len) {
-                hostWarn("config: too many profile removals in one save; restart for a clean slate", .{});
-                break;
-            }
-            remove_buf[remove_count] = i;
-            remove_count += 1;
-        }
+        if (!found) remove_buf.appendAssumeCapacity(i);
     }
-    var ri = remove_count;
+    var ri = remove_buf.items.len;
     while (ri > 0) {
         ri -= 1;
-        removeSessionLive(remove_buf[ri]);
+        removeSessionLive(remove_buf.items[ri]);
     }
 
     // Phase 2: append new entries that don't match any current
