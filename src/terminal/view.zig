@@ -1500,11 +1500,12 @@ fn actionClearScrollback() void {
     _ = forwardText("\x1b[H\x1b[2J\x1b[3J");
 }
 
-// Tab switching — thin wrappers around `main.activateSession(idx)`.
-// Generated explicitly (no `comptime` lambda) so each handler has a
-// distinct function pointer the action table can dispatch through.
+// Tab switching — thin wrappers around
+// `ghostty.surface_lifecycle.activateSession(idx)`. Generated
+// explicitly (no `comptime` lambda) so each handler has a distinct
+// function pointer the action table can dispatch through.
 fn activateSessionByIndex(idx: usize) void {
-    _ = @import("../main.zig").activateSession(idx);
+    _ = @import("../ghostty/surface_lifecycle.zig").activateSession(idx);
 }
 fn actionTab1() void { activateSessionByIndex(0); }
 fn actionTab2() void { activateSessionByIndex(1); }
@@ -1531,11 +1532,11 @@ fn actionPaletteOpen() void {
 }
 
 fn actionRestartSession() void {
-    @import("../main.zig").restartActiveSession(null);
+    @import("../ghostty/surface_lifecycle.zig").restartActiveSession(null);
 }
 
 fn actionShellSession() void {
-    @import("../main.zig").restartActiveSession("/bin/zsh");
+    @import("../ghostty/surface_lifecycle.zig").restartActiveSession("/bin/zsh");
 }
 
 // ─── NSTextInputClient (IME) ────────────────────────────────────────

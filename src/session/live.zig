@@ -19,6 +19,7 @@ const app = @import("../app.zig");
 const Config = @import("../config.zig").Config;
 const main_mod = @import("../main.zig");
 const tab_strip = @import("tab_strip.zig");
+const surface_lifecycle = @import("../ghostty/surface_lifecycle.zig");
 
 const NSPoint = extern struct { x: f64, y: f64 };
 const NSSize = extern struct { width: f64, height: f64 };
@@ -127,7 +128,7 @@ pub fn removeSessionLive(idx: usize) void {
 
     if (idx == sm.active_idx) {
         const fallback: usize = if (idx + 1 < sm.sessions.items.len) idx + 1 else 0;
-        _ = main_mod.activateSession(fallback);
+        _ = surface_lifecycle.activateSession(fallback);
     }
 
     const dying = sm.sessions.items[idx];

@@ -164,9 +164,9 @@ fn commitSelection() void {
             close();
             return;
         };
-        _ = @import("../main.zig").activateSession(first);
+        _ = @import("../ghostty/surface_lifecycle.zig").activateSession(first);
     } else {
-        _ = @import("../main.zig").activateSession(idx);
+        _ = @import("../ghostty/surface_lifecycle.zig").activateSession(idx);
     }
     close();
 }

@@ -185,8 +185,8 @@ fn mouseDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callcon
     if (idx >= sm.sessions.items.len) return;
     if (idx == sm.active_idx) return;
 
-    // Re-route through main.zig's activateSession so the surface
-    // swap, focus push, and menubar refresh all run.
-    const main_mod = @import("../main.zig");
-    _ = main_mod.activateSession(idx);
+    // Re-route through surface_lifecycle.activateSession so the
+    // surface swap, focus push, and menubar refresh all run.
+    const surface_lifecycle = @import("../ghostty/surface_lifecycle.zig");
+    _ = surface_lifecycle.activateSession(idx);
 }
