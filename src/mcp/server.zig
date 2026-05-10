@@ -57,12 +57,25 @@ pub const McpServer = struct {
     }
 
     /// Accept loop — run on its own thread.
+    ///
+    /// Backoff schedule: doubles 1ms → 2 → 4 → … → 200ms after each
+    /// `accept()` failure that isn't a listener teardown. Resets on
+    /// any successful accept. Without this, a persistent failure (fd
+    /// exhaustion, kernel hiccup) busy-loops the thread at ~100% CPU
+    /// and floods stderr if we logged each one.
     pub fn run(self: *McpServer) void {
+        var backoff_ms: u64 = 1;
         while (!self.stop_flag.load(.acquire)) {
             const conn = self.listener.accept() catch |err| switch (err) {
                 error.SocketNotListening => return,
-                else => continue,
+                else => {
+                    std.debug.print("warning: mcp accept failed: {} (backoff {d}ms)\n", .{ err, backoff_ms });
+                    std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
+                    backoff_ms = @min(backoff_ms * 2, 200);
+                    continue;
+                },
             };
+            backoff_ms = 1;
             self.handleConnection(conn);
         }
     }
@@ -237,9 +250,22 @@ fn checkAuth(head: []const u8, token: []const u8) bool {
         const val = std.mem.trim(u8, line[colon + 1 ..], " \t");
         const prefix = "Bearer ";
         if (!std.mem.startsWith(u8, val, prefix)) return false;
-        return std.mem.eql(u8, val[prefix.len..], token);
+        return constantTimeEql(val[prefix.len..], token);
     }
     return false;
+}
+
+/// Constant-time byte-slice equality. Length mismatch short-circuits
+/// (length is not secret); content compare folds every byte into the
+/// accumulator before returning, so the loop's wall time depends only
+/// on `min(a.len, b.len)`. `std.mem.eql` short-circuits on first
+/// mismatch — fine for general use, leaks position to a local timing
+/// observer when used on bearer tokens.
+fn constantTimeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= x ^ y;
+    return diff == 0;
 }
 
 fn writeStatus(stream: net.Stream, code: u16, reason: []const u8, body: []const u8) void {
