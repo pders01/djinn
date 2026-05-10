@@ -649,28 +649,24 @@ fn handleRingBell(host: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s,
 fn handleSearchTotal(host: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, action: c.ghostty_action_s) bool {
     const total = action.action.search_total.total;
     host.app_state.search_total = if (total < 0) null else @intCast(total);
-    const view_mod = @import("../terminal/view.zig");
-    view_mod.updateSearchCountLabel();
+    @import("../terminal/find.zig").updateCountLabel();
     return true;
 }
 
 fn handleSearchSelected(host: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, action: c.ghostty_action_s) bool {
     const sel = action.action.search_selected.selected;
     host.app_state.search_selected = if (sel < 0) null else @intCast(sel);
-    const view_mod = @import("../terminal/view.zig");
-    view_mod.updateSearchCountLabel();
+    @import("../terminal/find.zig").updateCountLabel();
     return true;
 }
 
 fn handleStartSearch(_: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, _: c.ghostty_action_s) bool {
-    const view_mod = @import("../terminal/view.zig");
-    view_mod.openOverlayUiOnly();
+    @import("../terminal/find.zig").openOverlayUiOnly();
     return true;
 }
 
 fn handleEndSearch(_: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, _: c.ghostty_action_s) bool {
-    const view_mod = @import("../terminal/view.zig");
-    view_mod.closeOverlayUiOnly();
+    @import("../terminal/find.zig").closeOverlayUiOnly();
     return true;
 }
 
