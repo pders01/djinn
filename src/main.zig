@@ -1274,4 +1274,5 @@ test {
     _ = @import("chrome.zig");
     _ = @import("mcp/dispatch.zig");
     _ = @import("session/manager.zig");
+    _ = @import("terminal/keymap.zig");
 }

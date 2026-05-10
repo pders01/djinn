@@ -10,6 +10,7 @@ const MenubarAgentState = @import("../notify/menubar.zig").AgentState;
 const menubar_mod = @import("../notify/menubar.zig");
 const tis = @import("tis.zig");
 const chrome_mod = @import("../chrome.zig");
+const keymap = @import("keymap.zig");
 
 const cg = @cImport({
     @cInclude("CoreGraphics/CoreGraphics.h");
@@ -1422,10 +1423,10 @@ fn pasteFromClipboard() void {
 }
 
 // NSEventModifierFlag bits (high bits of NSUInteger).
-const mod_shift: u64 = 1 << 17;
-const mod_control: u64 = 1 << 18;
-const mod_alt: u64 = 1 << 19;
-const mod_cmd: u64 = 1 << 20;
+const mod_shift = keymap.mod_shift;
+const mod_control = keymap.mod_control;
+const mod_alt = keymap.mod_alt;
+const mod_cmd = keymap.mod_cmd;
 
 fn keyDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
     const event = objc.Object.fromId(event_id);
@@ -1593,21 +1594,10 @@ fn pressureChangeImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv
 // the rest of the keyDown pipeline. Adding a new shortcut is one line
 // here + a function — no more growing the if-chain in keyDownImpl.
 
-const Action = struct {
-    /// Stable name for config-driven keymap overrides. Must match the
-    /// `keymap` object key in user config; see `pub fn rebind` below.
-    name: []const u8,
-    /// Required modifier set (exact match against mods masked out of flags).
-    mods: u64,
-    /// macOS hardware keycode (kVK_*).
-    keycode: u16,
-    handler: *const fn () void,
-};
-
 /// Mutable so user keymap overrides can rebind individual entries at
 /// startup without rebuilding the table. Length stays fixed; we only
 /// swap mods/keycode, never add/remove handlers.
-var actions = [_]Action{
+var actions = [_]keymap.Action{
     // Selection / clipboard
     .{ .name = "paste", .mods = mod_cmd, .keycode = 9, .handler = pasteFromClipboard }, // Cmd+V
     // Scrollback
@@ -1658,26 +1648,11 @@ var actions = [_]Action{
 /// startup for each user keymap entry. Unknown names log + are
 /// ignored — a typo in config shouldn't crash djinn.
 pub fn rebind(name: []const u8, mods: u64, keycode: u16) bool {
-    for (&actions) |*a| {
-        if (std.mem.eql(u8, a.name, name)) {
-            a.mods = mods;
-            a.keycode = keycode;
-            return true;
-        }
-    }
-    return false;
+    return keymap.rebind(&actions, name, mods, keycode);
 }
 
 fn dispatchAction(flags: u64, keycode: u16) bool {
-    const mod_mask = mod_shift | mod_control | mod_alt | mod_cmd;
-    const masked = flags & mod_mask;
-    inline for (actions) |a| {
-        if (a.keycode == keycode and a.mods == masked) {
-            a.handler();
-            return true;
-        }
-    }
-    return false;
+    return keymap.dispatch(&actions, flags, keycode);
 }
 
 fn actionScrollPageUp() void {
