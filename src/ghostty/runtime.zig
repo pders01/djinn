@@ -95,14 +95,14 @@ pub fn reloadConfigFromDisk() void {
     }
     c.ghostty_config_finalize(new_cfg);
     c.ghostty_app_update_config(app_handle, new_cfg);
-    if (host_storage.app_state.ghostty_surface) |surf_ptr| {
+    if (host_storage.app_state.ghostty.surface) |surf_ptr| {
         const surf: c.ghostty_surface_t = @ptrCast(surf_ptr);
         c.ghostty_surface_update_config(surf, new_cfg);
     }
-    if (host_storage.app_state.ghostty_config) |old| {
+    if (host_storage.app_state.ghostty.config) |old| {
         c.ghostty_config_free(@ptrCast(old));
     }
-    host_storage.app_state.ghostty_config = @ptrCast(new_cfg);
+    host_storage.app_state.ghostty.config = @ptrCast(new_cfg);
 }
 
 /// Peek the user's `~/.config/ghostty/config`, find the `theme = ...`
@@ -915,7 +915,7 @@ fn readClipboardImpl(
     state: ?*anyopaque,
 ) callconv(.c) bool {
     _ = clipboard;
-    const surf_ptr = host_storage.app_state.ghostty_surface orelse return false;
+    const surf_ptr = host_storage.app_state.ghostty.surface orelse return false;
     _ = userdata;
     const surf: c.ghostty_surface_t = @ptrCast(surf_ptr);
 

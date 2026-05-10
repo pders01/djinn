@@ -477,7 +477,7 @@ pub fn activateSession(idx: usize) bool {
     // Lazy spawn — only the active-at-startup session was bound during
     // boot. Secondary profiles get their surface here on first activate.
     if (!new_sess.spawned) {
-        const ga = app.g.ghostty_app orelse return false;
+        const ga = app.g.ghostty.app orelse return false;
         const allocator = app.g.allocator orelse return false;
         const surf = bindGhosttySurface(allocator, ga, new_host, new_sess.profile.command, new_sess.profile.cwd) orelse {
             std.debug.print("error: lazy surface spawn failed for profile '{s}'\n", .{new_sess.profile.name});
@@ -490,8 +490,8 @@ pub fn activateSession(idx: usize) bool {
     // Update the global pointer + AppState slot BEFORE re-focus so any
     // re-entrant Cocoa callback fired during setFocus sees the new
     // surface in app.g (reapplyTheme + updateSearchCountLabel both
-    // read app.g.ghostty_surface).
-    app.g.ghostty_surface = new_sess.surface;
+    // read app.g.ghostty.surface).
+    app.g.ghostty.surface = new_sess.surface;
     app.g.surface_host_id = if (new_sess.surface_host) |h| @ptrCast(@alignCast(h)) else null;
     if (new_sess.surface) |sp| {
         ghostty_runtime.surfaceSetFocus(@ptrCast(sp), true);
@@ -528,7 +528,7 @@ const RestartCtx = struct {
 /// IO mailbox has a runloop turn to unwind.
 pub fn restartActiveSession(override_cmd: ?[]const u8) void {
     const sm = app.g.session_manager orelse return;
-    const ga = app.g.ghostty_app orelse return;
+    const ga = app.g.ghostty.app orelse return;
     const allocator = app.g.allocator orelse return;
     const active = sm.active();
 
@@ -540,7 +540,7 @@ pub fn restartActiveSession(override_cmd: ?[]const u8) void {
         active.surface = null;
         active.spawned = false;
         active.exited = false;
-        app.g.ghostty_surface = null;
+        app.g.ghostty.surface = null;
     }
 
     const ctx = allocator.create(RestartCtx) catch return;
@@ -565,7 +565,7 @@ fn restartSurfaceCallback(ctx_opaque: ?*anyopaque) callconv(.c) void {
     const allocator = app.g.allocator orelse return;
     defer allocator.destroy(ctx);
 
-    const ga = app.g.ghostty_app orelse return;
+    const ga = app.g.ghostty.app orelse return;
     const sm = app.g.session_manager orelse return;
     const active = sm.active();
 
@@ -580,7 +580,7 @@ fn restartSurfaceCallback(ctx_opaque: ?*anyopaque) callconv(.c) void {
     active.surface = @ptrCast(surf);
     active.spawned = true;
     active.exited = false;
-    app.g.ghostty_surface = active.surface;
+    app.g.ghostty.surface = active.surface;
     app.g.surface_host_id = if (active.surface_host) |h| @ptrCast(@alignCast(h)) else null;
 
     // Re-anchor keyboard focus on the new surface's view. Without
@@ -711,7 +711,7 @@ fn removeSessionLive(idx: usize) void {
 
     const dying = sm.sessions.items[idx];
     if (dying.surface) |sp| {
-        if (app.g.ghostty_app) |ga| ga.surfaceFree(@ptrCast(sp));
+        if (app.g.ghostty.app) |ga| ga.surfaceFree(@ptrCast(sp));
     }
     if (dying.surface_host) |sh_id| {
         const sh = objc.Object.fromId(sh_id);
@@ -947,7 +947,7 @@ pub fn main() !void {
     // re-parse. ghostty already loaded + finalized the config during
     // App.init.
     const ghostty_cfg_opaque: ?*anyopaque = if (ghostty_app_opt) |*ga| @ptrCast(ga.config) else null;
-    app.g.ghostty_config = ghostty_cfg_opaque;
+    app.g.ghostty.config = ghostty_cfg_opaque;
     var theme = resolveTheme(allocator, &config, ghostty_cfg_opaque);
     defer theme.deinit();
 
@@ -1136,14 +1136,14 @@ pub fn main() !void {
     // and forwards them via ghostty_surface_key / mouse_*.
     var ghostty_surface_handle: ?ghostty_runtime.c.ghostty_surface_t = null;
     if (ghostty_app_opt) |*ga| {
-        app.g.ghostty_app = ga;
+        app.g.ghostty.app = ga;
         ghostty_surface_handle = bindGhosttySurface(allocator, ga, surface_host, cmd, active_session.profile.cwd) orelse {
             std.debug.print("error: ghostty surface_new returned null\n", .{});
             std.process.exit(1);
         };
         active_session.surface = @ptrCast(ghostty_surface_handle.?);
         active_session.spawned = true;
-        app.g.ghostty_surface = active_session.surface;
+        app.g.ghostty.surface = active_session.surface;
     } else {
         std.debug.print("error: ghostty App init failed; cannot continue\n", .{});
         std.process.exit(1);

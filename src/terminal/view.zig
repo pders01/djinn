@@ -47,7 +47,7 @@ var g_font_resolved_logged: bool = false;
 /// surface isn't bound yet — caller decides whether that's a hard
 /// failure (drag-drop) or silent (key fallback).
 fn forwardText(text: []const u8) bool {
-    const surf_ptr = app.g.ghostty_surface orelse return false;
+    const surf_ptr = app.g.ghostty.surface orelse return false;
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     ghostty_runtime.c.ghostty_surface_text(surf, text.ptr, text.len);
     return true;
@@ -57,7 +57,7 @@ fn forwardText(text: []const u8) bool {
 /// surface so it paints the underline overlay at the cursor cell.
 /// Empty slice clears the composition.
 fn forwardPreedit(text: []const u8) void {
-    const surf_ptr = app.g.ghostty_surface orelse return;
+    const surf_ptr = app.g.ghostty.surface orelse return;
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     ghostty_runtime.c.ghostty_surface_preedit(surf, text.ptr, text.len);
 }
@@ -65,7 +65,7 @@ fn forwardPreedit(text: []const u8) void {
 /// Trigger a ghostty binding action by its parsed string form
 /// (e.g. "search:foo", "navigate_search:next", "end_search").
 fn forwardBindingAction(action_str: []const u8) void {
-    const surf_ptr = app.g.ghostty_surface orelse return;
+    const surf_ptr = app.g.ghostty.surface orelse return;
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     _ = ghostty_runtime.c.ghostty_surface_binding_action(surf, action_str.ptr, action_str.len);
 }
@@ -781,7 +781,7 @@ fn checkResize(view: objc.Object) void {
     // surface_host's bounds tracks `view`'s frame (sibling, same
     // autoresize mask), so we use this view's bounds + window scale.
     // ghostty's CADisplayLink handles the actual refresh tick.
-    if (app.g.ghostty_surface) |surf_ptr| {
+    if (app.g.ghostty.surface) |surf_ptr| {
         const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
         const window = view.msgSend(objc.Object, "window", .{});
         const scale: f64 = if (window.value != null) window.msgSend(f64, "backingScaleFactor", .{}) else 1.0;
@@ -887,7 +887,7 @@ fn acceptsFirstResponderImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
 /// device-specific bit so left + right shift don't masquerade as the
 /// same key.
 fn flagsChangedImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
-    const surf_ptr = app.g.ghostty_surface orelse return;
+    const surf_ptr = app.g.ghostty.surface orelse return;
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     const event = objc.Object.fromId(event_id);
     const ghostty_input = @import("../ghostty/input.zig");
@@ -949,7 +949,7 @@ fn flagsChangedImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.
 /// "unfocused"), and apps that subscribe to focus reports
 /// (`\e[I`/`\e[O`, mode 1004) never see anything.
 fn becomeFirstResponderImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
-    if (app.g.ghostty_surface) |surf_ptr| {
+    if (app.g.ghostty.surface) |surf_ptr| {
         const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
         ghostty_runtime.surfaceSetFocus(surf, true);
     }
@@ -957,7 +957,7 @@ fn becomeFirstResponderImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
 }
 
 fn resignFirstResponderImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
-    if (app.g.ghostty_surface) |surf_ptr| {
+    if (app.g.ghostty.surface) |surf_ptr| {
         const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
         ghostty_runtime.surfaceSetFocus(surf, false);
     }
@@ -984,7 +984,7 @@ fn eventToCell(view: objc.Object, event: objc.Object) struct { col: i32, row: i3
 /// `ghostty_surface_mouse_pos` call — ghostty tracks button state
 /// independently, so the same body handles every drag variant.
 fn forwardMousePos(self_id: objc.c.id, event_id: objc.c.id) void {
-    const surf_ptr = app.g.ghostty_surface orelse return;
+    const surf_ptr = app.g.ghostty.surface orelse return;
     const view = objc.Object.fromId(self_id);
     const event = objc.Object.fromId(event_id);
     const ghostty_input = @import("../ghostty/input.zig");
@@ -1001,7 +1001,7 @@ fn forwardMousePos(self_id: objc.c.id, event_id: objc.c.id) void {
 /// right, "other" = middle/4/5+); ghostty's `mouse_button` API takes
 /// a single button enum, so the handlers all funnel through here.
 fn forwardMouseButton(event: objc.Object, state: ghostty_runtime.c.ghostty_input_mouse_state_e) void {
-    const surf_ptr = app.g.ghostty_surface orelse return;
+    const surf_ptr = app.g.ghostty.surface orelse return;
     const ghostty_input = @import("../ghostty/input.zig");
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     const button_num: c_long = event.msgSend(c_long, "buttonNumber", .{});
@@ -1057,7 +1057,7 @@ fn mouseEnteredImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) call
 }
 
 fn mouseExitedImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
-    const surf_ptr = app.g.ghostty_surface orelse return;
+    const surf_ptr = app.g.ghostty.surface orelse return;
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     const event = objc.Object.fromId(event_id);
 
@@ -1116,7 +1116,7 @@ fn updateTrackingAreasImpl(self_id: objc.c.id, _: objc.c.SEL) callconv(.c) void 
 fn scrollWheelImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
     const event = objc.Object.fromId(event_id);
 
-    const surf_ptr = app.g.ghostty_surface orelse return;
+    const surf_ptr = app.g.ghostty.surface orelse return;
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     var dx: f64 = event.msgSend(f64, "scrollingDeltaX", .{});
     var dy: f64 = event.msgSend(f64, "scrollingDeltaY", .{});
@@ -1234,7 +1234,7 @@ fn keyDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(
     // the text/codepoint fields for character semantics. Special keys
     // (arrows, enter, function keys, Ctrl-combos) all reach ghostty
     // through this single path.
-    if (app.g.ghostty_surface) |surf_ptr| {
+    if (app.g.ghostty.surface) |surf_ptr| {
         const ghostty_input = @import("../ghostty/input.zig");
         const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
 
@@ -1305,7 +1305,7 @@ fn keyDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(
 /// releases. Cheap to forward unconditionally — ghostty's key encoder
 /// drops the event when the surface isn't in keyboard-protocol mode.
 fn keyUpImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
-    const surf_ptr = app.g.ghostty_surface orelse return;
+    const surf_ptr = app.g.ghostty.surface orelse return;
     const event = objc.Object.fromId(event_id);
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     const ghostty_input = @import("../ghostty/input.zig");
@@ -1328,7 +1328,7 @@ fn keyUpImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void
 /// data. We forward the raw values; quicklook itself is unimplemented
 /// host-side, so stage-2 force clicks are no-ops for now.
 fn pressureChangeImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
-    const surf_ptr = app.g.ghostty_surface orelse return;
+    const surf_ptr = app.g.ghostty.surface orelse return;
     const event = objc.Object.fromId(event_id);
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     const stage: c_long = event.msgSend(c_long, "stage", .{});
@@ -1606,7 +1606,7 @@ fn doCommandBySelectorImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.SEL) callconv(
     // surface_key path so the wire format matches a non-IME keypress.
     g_handled_during_interpret = true;
     const event_id = g_current_keydown orelse return;
-    const surf_ptr = app.g.ghostty_surface orelse return;
+    const surf_ptr = app.g.ghostty.surface orelse return;
     const ghostty_input = @import("../ghostty/input.zig");
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     const event = objc.Object.fromId(event_id);
@@ -1689,7 +1689,7 @@ fn firstRectForCharacterRangeImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRange,
     // to window → screen coords.
     const empty = NSRect{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0, .height = 0 } };
     const view = objc.Object.fromId(self_id);
-    const surf_ptr = app.g.ghostty_surface orelse return empty;
+    const surf_ptr = app.g.ghostty.surface orelse return empty;
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
 
     var x: f64 = 0;
@@ -1757,7 +1757,7 @@ fn reapplyTheme() void {
     if (app.g.last_appearance == current_tag) return;
 
     // Push the new appearance to ghostty + reload its Config BEFORE
-    // theme.resolve runs. theme.resolve reads `app.g.ghostty_config`
+    // theme.resolve runs. theme.resolve reads `app.g.ghostty.config`
     // via applyFromGhostty, so the chrome palette is sourced from
     // whichever variant ghostty currently has resolved for `theme =
     // light:X,dark:Y`. If we resolve first, chrome locks onto the
@@ -1769,7 +1769,7 @@ fn reapplyTheme() void {
 
     var new_theme = theme_mod.resolve(allocator, .{
         .inherit_ghostty_config = config.theme.inherit_ghostty,
-        .ghostty_cfg = app.g.ghostty_config,
+        .ghostty_cfg = app.g.ghostty.config,
         .font_family = config.terminal.font_family,
         .font_size = config.terminal.font_size,
         .padding_x = config.terminal.padding_x,

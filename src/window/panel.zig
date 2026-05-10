@@ -331,7 +331,7 @@ pub const Panel = struct {
         // it owns input. setFocus(true) wakes the surface's renderer
         // out of low-frequency idle. set_occlusion(true) tells the
         // surface it's visible so CADisplayLink runs at full cadence.
-        if (app_state.g.ghostty_surface) |surf_ptr| {
+        if (app_state.g.ghostty.surface) |surf_ptr| {
             const ghostty_runtime = @import("../ghostty/runtime.zig");
             const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
             ghostty_runtime.surfaceSetOcclusion(surf, true);
@@ -408,7 +408,7 @@ pub const Panel = struct {
         self.prev_app_pid = 0;
         self.visible = false;
 
-        if (app_state.g.ghostty_surface) |surf_ptr| {
+        if (app_state.g.ghostty.surface) |surf_ptr| {
             const ghostty_runtime = @import("../ghostty/runtime.zig");
             const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
             ghostty_runtime.surfaceSetFocus(surf, false);

@@ -27,7 +27,7 @@ var g_chip_cell_class_registered: bool = false;
 /// module doesn't have to back-import view.zig; the call surface is
 /// trivially small (3 lines).
 fn forwardBindingAction(action_str: []const u8) void {
-    const surf_ptr = app.g.ghostty_surface orelse return;
+    const surf_ptr = app.g.ghostty.surface orelse return;
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     _ = ghostty_runtime.c.ghostty_surface_binding_action(surf, action_str.ptr, action_str.len);
 }

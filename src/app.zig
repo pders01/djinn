@@ -102,15 +102,7 @@ pub const AppState = struct {
     /// through container.subviews[idx], which is fragile (the index
     /// shifts whenever buildContainer's subview order changes).
     divider_view_id: ?objc.c.id = null,
-    /// Persistent ghostty surface handle. Bound to `surface_host_id`
-    /// when `render.backend == "ghostty"`. Step 4b sets this; step 5
-    /// drives its render trigger. Stored as `?*anyopaque` to avoid
-    /// pulling ghostty.h into app.zig (`@cImport` collisions).
-    ghostty_surface: ?*anyopaque = null,
-    /// `ghostty_config_t` from App.init. Theme reload paths read it so
-    /// they can call `ghostty_config_get` without going back through
-    /// main(). Same opacity rationale as `ghostty_surface`.
-    ghostty_config: ?*anyopaque = null,
+    ghostty: Ghostty = .{},
 
     // Sessions -------------------------------------------------------
     /// Multi-profile session manager. Holds one Session per declared
@@ -138,15 +130,27 @@ pub const AppState = struct {
     /// `applyStyle` can repaint it on theme flips without walking
     /// the strip's subview list.
     tab_strip_separator_id: ?objc.c.id = null,
-    /// Stable pointer to the ghostty App so the lazy-spawn path in the
-    /// session switcher can call `ga.newSurface` without re-importing
-    /// the runtime module from inside view.zig.
-    ghostty_app: ?*@import("ghostty/runtime.zig").App = null,
 
     // ─── Sub-state types ───────────────────────────────────────────
     // Declared after fields per Zig's container layout rule. Each
     // group is opt-in: callers reach `app.g.find.*`, `app.g.palette.*`,
     // etc. instead of the flat field sea this struct used to be.
+
+    pub const Ghostty = struct {
+        /// Stable pointer to the ghostty App so the lazy-spawn path in
+        /// the session switcher can call `ga.newSurface` without
+        /// re-importing the runtime module from inside view.zig.
+        app: ?*@import("ghostty/runtime.zig").App = null,
+        /// Persistent ghostty surface handle. Bound to `surface_host_id`
+        /// when `render.backend == "ghostty"`. Stored as `?*anyopaque`
+        /// to avoid pulling ghostty.h into app.zig (`@cImport`
+        /// collisions otherwise force every consumer to re-import).
+        surface: ?*anyopaque = null,
+        /// `ghostty_config_t` from App.init. Theme reload paths read it
+        /// so they can call `ghostty_config_get` without going back
+        /// through main(). Same opacity rationale as `surface`.
+        config: ?*anyopaque = null,
+    };
 
     pub const PaletteState = struct {
         /// True while the palette overlay is up. Routes printable keys
