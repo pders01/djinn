@@ -14,6 +14,7 @@ const keymap = @import("keymap.zig");
 const find = @import("find.zig");
 const font_mod = @import("font.zig");
 const divider_mod = @import("divider.zig");
+const ime = @import("ime.zig");
 
 const cg = @cImport({
     @cInclude("CoreGraphics/CoreGraphics.h");
@@ -24,11 +25,6 @@ pub const NSPoint = extern struct { x: f64, y: f64 };
 pub const NSSize = extern struct { width: f64, height: f64 };
 pub const NSRect = extern struct { origin: NSPoint, size: NSSize };
 pub const NSRange = extern struct { location: c_ulong, length: c_ulong };
-
-/// Sentinel returned by NSTextInputClient methods when there's no value
-/// (e.g. markedRange when nothing's composing). `kCFNotFound`/`NSNotFound`
-/// = NSIntegerMax = (1 << 63) - 1 on 64-bit darwin.
-const ns_not_found: c_ulong = (@as(c_ulong, 1) << 63) - 1;
 
 // Module-private state lives here; everything cross-callback flows through
 // `app.g`. `g_class_registered` and the PTY read buffer stay local because
@@ -47,15 +43,6 @@ fn forwardText(text: []const u8) bool {
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     ghostty_runtime.c.ghostty_surface_text(surf, text.ptr, text.len);
     return true;
-}
-
-/// Forward IME preedit (in-progress composition) to the ghostty
-/// surface so it paints the underline overlay at the cursor cell.
-/// Empty slice clears the composition.
-fn forwardPreedit(text: []const u8) void {
-    const surf_ptr = app.g.ghostty.surface orelse return;
-    const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
-    ghostty_runtime.c.ghostty_surface_preedit(surf, text.ptr, text.len);
 }
 
 /// Trigger a ghostty binding action by its parsed string form
@@ -275,17 +262,17 @@ fn registerClass() void {
     // back into these in response to inputContext.handleEvent: from
     // keyDownImpl. Without these the view is invisible to input
     // sources (Korean/Japanese/Chinese), pinyin candidates, dead keys.
-    _ = cls.addMethod("insertText:replacementRange:", insertTextImpl);
-    _ = cls.addMethod("doCommandBySelector:", doCommandBySelectorImpl);
-    _ = cls.addMethod("setMarkedText:selectedRange:replacementRange:", setMarkedTextImpl);
-    _ = cls.addMethod("unmarkText", unmarkTextImpl);
-    _ = cls.addMethod("selectedRange", selectedRangeImpl);
-    _ = cls.addMethod("markedRange", markedRangeImpl);
-    _ = cls.addMethod("hasMarkedText", hasMarkedTextImpl);
-    _ = cls.addMethod("attributedSubstringForProposedRange:actualRange:", attributedSubstringForProposedRangeImpl);
-    _ = cls.addMethod("validAttributesForMarkedText", validAttributesForMarkedTextImpl);
-    _ = cls.addMethod("firstRectForCharacterRange:actualRange:", firstRectForCharacterRangeImpl);
-    _ = cls.addMethod("characterIndexForPoint:", characterIndexForPointImpl);
+    _ = cls.addMethod("insertText:replacementRange:", ime.insertTextImpl);
+    _ = cls.addMethod("doCommandBySelector:", ime.doCommandBySelectorImpl);
+    _ = cls.addMethod("setMarkedText:selectedRange:replacementRange:", ime.setMarkedTextImpl);
+    _ = cls.addMethod("unmarkText", ime.unmarkTextImpl);
+    _ = cls.addMethod("selectedRange", ime.selectedRangeImpl);
+    _ = cls.addMethod("markedRange", ime.markedRangeImpl);
+    _ = cls.addMethod("hasMarkedText", ime.hasMarkedTextImpl);
+    _ = cls.addMethod("attributedSubstringForProposedRange:actualRange:", ime.attributedSubstringForProposedRangeImpl);
+    _ = cls.addMethod("validAttributesForMarkedText", ime.validAttributesForMarkedTextImpl);
+    _ = cls.addMethod("firstRectForCharacterRange:actualRange:", ime.firstRectForCharacterRangeImpl);
+    _ = cls.addMethod("characterIndexForPoint:", ime.characterIndexForPointImpl);
     // NSControl text-field delegate methods for the find-overlay
     // NSTextField. controlTextDidChange:: live-updates matches; the
     // command-by-selector hook swallows Esc / Return so we hide the
@@ -645,7 +632,7 @@ fn flagsChangedImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.
         else => return,
     };
 
-    if (g_preedit_len > 0) return; // mid-IME composition; modifier flicks aren't ours
+    if (ime.preedit_len > 0) return; // mid-IME composition; modifier flicks aren't ours
 
     const mods_g = ghostty_input.modsFromNS(flags);
 
@@ -954,16 +941,16 @@ fn keyDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(
     // setMarkedText / doCommandBySelector get a chance to run. Skip
     // when Cmd / Ctrl is held — those are bindings, not text input.
     const has_command_mods = (flags & (mod_cmd | mod_control)) != 0;
-    const want_ime_route = !has_command_mods and (!tis.isLatin() or g_preedit_len > 0);
+    const want_ime_route = !has_command_mods and (!tis.isLatin() or ime.preedit_len > 0);
     if (want_ime_route) {
         const view = objc.Object.fromId(self_id);
         const NSArray = objc.getClass("NSArray") orelse return;
         const arr = NSArray.msgSend(objc.Object, "arrayWithObject:", .{event_id});
-        g_current_keydown = event_id;
-        g_handled_during_interpret = false;
+        ime.current_keydown = event_id;
+        ime.handled_during_interpret = false;
         view.msgSend(void, "interpretKeyEvents:", .{arr.value});
-        g_current_keydown = null;
-        if (g_handled_during_interpret) return;
+        ime.current_keydown = null;
+        if (ime.handled_during_interpret) return;
         // No IME callback fired (e.g. dead-key partial state) — fall
         // through to surface_key so the keypress isn't swallowed.
     }
@@ -1278,180 +1265,11 @@ fn actionShellSession() void {
     @import("../ghostty/surface_lifecycle.zig").restartActiveSession("/bin/zsh");
 }
 
-// ─── NSTextInputClient (IME) ────────────────────────────────────────
-//
-// We forward keyDown to NSTextInputContext.handleEvent: when no Cmd /
-// Ctrl / Alt is held. AppKit then dispatches back into these methods:
-//
-//   insertText            → final committed text (typed ASCII or IME
-//                            commit) — write to PTY
-//   doCommandBySelector   → AppKit translated the key to an NSResponder
-//                            selector (insertNewline:, moveLeft:, etc.).
-//                            Re-encode via stashed event through the
-//                            ghostty key encoder.
-//   setMarkedText         → composition in progress (preedit). Push
-//                            to ghostty_surface_preedit so the surface
-//                            paints the underline overlay at the cursor.
-//   unmarkText            → composition committed or canceled; clear
-//                            surface preedit.
-//
-// The remaining read-side methods exist to satisfy the protocol; we
-// don't keep a buffer of past output so most return empty / NotFound.
-// `g_preedit_len` is retained as the protocol-side query state
-// (markedRange / hasMarkedText) and as the tis fast-path gate; the
-// buffer storage no longer drives any paint — the surface owns that.
-
-const preedit_buf_size: usize = 256;
-var g_preedit_buf: [preedit_buf_size]u8 = undefined;
-var g_preedit_len: usize = 0;
-
-/// Stashed by keyDownImpl while interpretKeyEvents: runs so
-/// doCommandBySelector can recover the original NSEvent and re-encode
-/// it via the ghostty key encoder. Reset to null when interpretKeyEvents
-/// returns.
-var g_current_keydown: ?objc.c.id = null;
-
-/// Set by insertTextImpl / setMarkedTextImpl / doCommandBySelectorImpl
-/// when called inside interpretKeyEvents:. Lets keyDownImpl skip its
-/// fall-through `ghostty_surface_key` call so AppKit-handled events
-/// don't get encoded twice.
-var g_handled_during_interpret: bool = false;
-
-fn insertTextImpl(self_id: objc.c.id, _: objc.c.SEL, str_id: objc.c.id, _: NSRange) callconv(.c) void {
-    g_handled_during_interpret = true;
-    g_preedit_len = 0;
-    forwardPreedit(&[_]u8{});
-
-    // `string` is NSString or NSAttributedString. Both respond to
-    // -UTF8String, but NSAttributedString returns the attributed
-    // representation; pull plain via -string when present.
-    var s = objc.Object.fromId(str_id);
-    if (s.value == null) return;
-    if (s.msgSend(bool, "respondsToSelector:", .{objc.sel("string")})) {
-        s = s.msgSend(objc.Object, "string", .{});
-        if (s.value == null) return;
-    }
-    const utf8_ptr = s.msgSend([*c]const u8, "UTF8String", .{});
-    if (utf8_ptr == null) return;
-    const text = std.mem.sliceTo(utf8_ptr, 0);
-    if (text.len > 0) {
-        _ = forwardText(text);
-    }
-    _ = self_id;
-}
-
-fn doCommandBySelectorImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.SEL) callconv(.c) void {
-    // AppKit recognized the key as a command (arrows, Tab, Enter, Esc,
-    // Backspace, …). Re-issue the original NSEvent through ghostty's
-    // surface_key path so the wire format matches a non-IME keypress.
-    g_handled_during_interpret = true;
-    const event_id = g_current_keydown orelse return;
-    const surf_ptr = app.g.ghostty.surface orelse return;
-    const ghostty_input = @import("../ghostty/input.zig");
-    const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
-    const event = objc.Object.fromId(event_id);
-    const flags: u64 = @intCast(event.msgSend(c_ulong, "modifierFlags", .{}));
-    const keycode: u16 = event.msgSend(c_ushort, "keyCode", .{});
-
-    const mods_g = ghostty_input.modsFromNS(flags);
-    const key_event = ghostty_runtime.c.ghostty_input_key_s{
-        .action = ghostty_runtime.c.GHOSTTY_ACTION_PRESS,
-        .mods = mods_g,
-        .consumed_mods = mods_g,
-        .keycode = keycode,
-        .text = null,
-        .unshifted_codepoint = 0,
-        .composing = false,
-    };
-    _ = ghostty_runtime.c.ghostty_surface_key(surf, key_event);
-}
-
-fn setMarkedTextImpl(_: objc.c.id, _: objc.c.SEL, str_id: objc.c.id, _: NSRange, _: NSRange) callconv(.c) void {
-    g_handled_during_interpret = true;
-    var s = objc.Object.fromId(str_id);
-    if (s.value == null) {
-        g_preedit_len = 0;
-    } else {
-        if (s.msgSend(bool, "respondsToSelector:", .{objc.sel("string")})) {
-            s = s.msgSend(objc.Object, "string", .{});
-        }
-        if (s.value == null) {
-            g_preedit_len = 0;
-        } else {
-            const utf8_ptr = s.msgSend([*c]const u8, "UTF8String", .{});
-            if (utf8_ptr == null) {
-                g_preedit_len = 0;
-            } else {
-                const text = std.mem.sliceTo(utf8_ptr, 0);
-                const take = @min(text.len, preedit_buf_size);
-                @memcpy(g_preedit_buf[0..take], text[0..take]);
-                g_preedit_len = take;
-            }
-        }
-    }
-    forwardPreedit(g_preedit_buf[0..g_preedit_len]);
-}
-
-fn unmarkTextImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) void {
-    g_preedit_len = 0;
-    forwardPreedit(&[_]u8{});
-}
-
-fn selectedRangeImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) NSRange {
-    // Terminal has no "document" with a stable range — report zero.
-    return .{ .location = 0, .length = 0 };
-}
-
-fn markedRangeImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) NSRange {
-    if (g_preedit_len == 0) return .{ .location = ns_not_found, .length = 0 };
-    return .{ .location = 0, .length = @intCast(g_preedit_len) };
-}
-
-fn hasMarkedTextImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
-    return g_preedit_len > 0;
-}
-
-fn attributedSubstringForProposedRangeImpl(_: objc.c.id, _: objc.c.SEL, _: NSRange, _: ?*NSRange) callconv(.c) objc.c.id {
-    return null;
-}
-
-fn validAttributesForMarkedTextImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) objc.c.id {
-    const NSArray = objc.getClass("NSArray") orelse return null;
-    const arr = NSArray.msgSend(objc.Object, "array", .{});
-    return arr.value;
-}
-
-fn firstRectForCharacterRangeImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRange, _: ?*NSRange) callconv(.c) NSRect {
-    // IME UI (candidate window etc.) anchors to this rect. Query
-    // ghostty for the cursor position via ghostty_surface_ime_point;
-    // returned coords are view-local pixels with top-left origin, so
-    // we flip y to NSView's bottom-left convention before converting
-    // to window → screen coords.
-    const empty = NSRect{ .origin = .{ .x = 0, .y = 0 }, .size = .{ .width = 0, .height = 0 } };
-    const view = objc.Object.fromId(self_id);
-    const surf_ptr = app.g.ghostty.surface orelse return empty;
-    const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
-
-    var x: f64 = 0;
-    var y: f64 = 0;
-    var width: f64 = app.g.term.cell_w;
-    var height: f64 = app.g.term.cell_h;
-    ghostty_runtime.c.ghostty_surface_ime_point(surf, &x, &y, &width, &height);
-
-    const frame = view.msgSend(NSRect, "frame", .{});
-    const view_rect = NSRect{
-        .origin = .{ .x = x, .y = frame.size.height - y },
-        .size = .{ .width = width, .height = @max(height, app.g.term.cell_h) },
-    };
-    const win_rect = view.msgSend(NSRect, "convertRect:toView:", .{ view_rect, @as(?*anyopaque, null) });
-    const window = view.msgSend(objc.Object, "window", .{});
-    if (window.value == null) return empty;
-    return window.msgSend(NSRect, "convertRectToScreen:", .{win_rect});
-}
-
-fn characterIndexForPointImpl(_: objc.c.id, _: objc.c.SEL, _: NSPoint) callconv(.c) c_ulong {
-    return ns_not_found;
-}
+// IME (NSTextInputClient) bindings live in `terminal/ime.zig`. The
+// Cocoa view class registration above wires `ime.*Impl` into AppKit;
+// keyDownImpl + flagsChangedImpl read `ime.preedit_len` /
+// `ime.current_keydown` / `ime.handled_during_interpret` to gate the
+// fall-through to ghostty_surface_key.
 
 // ─── Theme reload ────────────────────────────────────────────────────
 //
