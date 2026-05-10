@@ -1204,7 +1204,7 @@ fn keyDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(
 
     // Palette mode is modal too — same Cmd/Ctrl fall-through as
     // find_mode so Cmd+Shift+P toggling stays reachable.
-    if (app.g.palette_mode and (flags & (mod_cmd | mod_control)) == 0) {
+    if (app.g.palette.mode and (flags & (mod_cmd | mod_control)) == 0) {
         @import("../session/palette.zig").handleKey(event, keycode);
         return;
     }

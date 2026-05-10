@@ -120,21 +120,7 @@ pub const AppState = struct {
     /// app.g + call back into main.zig for the spawn / focus glue.
     session_manager: ?*@import("session/manager.zig").SessionManager = null,
     // Palette switcher (Cmd+Shift+P) ---------------------------------
-    /// True while the palette overlay is up. Routes printable keys
-    /// from `keyDownImpl` into the palette's filter buffer instead of
-    /// the ghostty surface (same idiom as `find_mode`).
-    palette_mode: bool = false,
-    /// Live filter buffer + length. Indexed against
-    /// `session_manager.sessions[*].profile.label()` to derive the
-    /// shown rows.
-    palette_query_buf: [128]u8 = [_]u8{0} ** 128,
-    palette_query_len: usize = 0,
-    /// Selected row in the *filtered* list. Up/Down move it; Return
-    /// activates the underlying session.
-    palette_selected: usize = 0,
-    /// Overlay NSView. Stashed so close() can pull it from the view
-    /// tree without indexing into `container.subviews`.
-    palette_view_id: ?objc.c.id = null,
+    palette: PaletteState = .{},
 
     /// Optional NSView pointer for the multi-profile tab strip.
     /// Present only when `session_manager.sessions.len >= 2`; null
@@ -161,6 +147,24 @@ pub const AppState = struct {
     // Declared after fields per Zig's container layout rule. Each
     // group is opt-in: callers reach `app.g.find.*`, `app.g.palette.*`,
     // etc. instead of the flat field sea this struct used to be.
+
+    pub const PaletteState = struct {
+        /// True while the palette overlay is up. Routes printable keys
+        /// from `keyDownImpl` into the palette's filter buffer instead of
+        /// the ghostty surface (same idiom as `find.mode`).
+        mode: bool = false,
+        /// Live filter buffer + length. Indexed against
+        /// `session_manager.sessions[*].profile.label()` to derive the
+        /// shown rows.
+        query_buf: [128]u8 = [_]u8{0} ** 128,
+        query_len: usize = 0,
+        /// Selected row in the *filtered* list. Up/Down move it; Return
+        /// activates the underlying session.
+        selected: usize = 0,
+        /// Overlay NSView. Stashed so close() can pull it from the view
+        /// tree without indexing into `container.subviews`.
+        view_id: ?objc.c.id = null,
+    };
 
     pub const FindState = struct {
         /// True while Cmd+F is active. Routes keystrokes from keyDownImpl

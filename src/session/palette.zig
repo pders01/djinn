@@ -2,7 +2,7 @@
 //! sessions. Type-to-filter, Up/Down to move selection, Return to
 //! switch, Esc to dismiss.
 //!
-//! Owns input via `app.g.palette_mode` while open: keyDownImpl routes
+//! Owns input via `app.g.palette.mode` while open: keyDownImpl routes
 //! printable keys here instead of the ghostty surface, mirroring the
 //! find-mode pattern. Borderless NSPanel + NSTextField + ghostty
 //! surface don't compose into a working field editor — host-owned
@@ -25,25 +25,25 @@ const header_h: f64 = 32;
 const max_rows: usize = 9;
 
 pub fn open() void {
-    if (app.g.palette_mode) return;
+    if (app.g.palette.mode) return;
     const sm = app.g.session_manager orelse return;
     if (sm.sessions.items.len < 2) return; // nothing to switch between
 
-    app.g.palette_mode = true;
-    app.g.palette_query_len = 0;
-    app.g.palette_selected = sm.active_idx;
+    app.g.palette.mode = true;
+    app.g.palette.query_len = 0;
+    app.g.palette.selected = sm.active_idx;
 
     mountOverlay();
 }
 
 pub fn close() void {
-    if (!app.g.palette_mode) return;
-    app.g.palette_mode = false;
-    app.g.palette_query_len = 0;
-    if (app.g.palette_view_id) |vid| {
+    if (!app.g.palette.mode) return;
+    app.g.palette.mode = false;
+    app.g.palette.query_len = 0;
+    if (app.g.palette.view_id) |vid| {
         const view = objc.Object.fromId(vid);
         view.msgSend(void, "removeFromSuperview", .{});
-        app.g.palette_view_id = null;
+        app.g.palette.view_id = null;
     }
     // Re-anchor first responder on the terminal view; AppKit can
     // shuffle responder state when modal-style overlays come and go.
@@ -71,7 +71,7 @@ pub fn handleKey(event: objc.Object, keycode: u16) void {
     }
     // Up / Down — move selection within the filtered list.
     if (keycode == 126) {
-        if (app.g.palette_selected > 0) {
+        if (app.g.palette.selected > 0) {
             // Walk filtered list to the previous match. Convert
             // "selected" from absolute idx to ordinal position
             // among matches, decrement, walk back.
@@ -87,10 +87,10 @@ pub fn handleKey(event: objc.Object, keycode: u16) void {
     }
     // Backspace — shrink filter.
     if (keycode == 51) {
-        if (app.g.palette_query_len > 0) {
-            app.g.palette_query_len -= 1;
+        if (app.g.palette.query_len > 0) {
+            app.g.palette.query_len -= 1;
             // Re-clamp selection to a still-matching row.
-            if (firstMatch()) |idx| app.g.palette_selected = idx;
+            if (firstMatch()) |idx| app.g.palette.selected = idx;
         }
         refresh();
         return;
@@ -104,11 +104,11 @@ pub fn handleKey(event: objc.Object, keycode: u16) void {
     if (s.len == 0) return;
     if (s.len == 1 and s[0] < 0x20) return;
 
-    const room = app.g.palette_query_buf.len - app.g.palette_query_len;
+    const room = app.g.palette.query_buf.len - app.g.palette.query_len;
     const take = @min(s.len, room);
-    @memcpy(app.g.palette_query_buf[app.g.palette_query_len .. app.g.palette_query_len + take], s[0..take]);
-    app.g.palette_query_len += take;
-    if (firstMatch()) |idx| app.g.palette_selected = idx;
+    @memcpy(app.g.palette.query_buf[app.g.palette.query_len .. app.g.palette.query_len + take], s[0..take]);
+    app.g.palette.query_len += take;
+    if (firstMatch()) |idx| app.g.palette.selected = idx;
     refresh();
 }
 
@@ -121,7 +121,7 @@ fn moveSelection(delta: i32) void {
     var found_current = false;
     for (sm.sessions.items, 0..) |sess, i| {
         if (!matches(sess.profile.label())) continue;
-        if (i == app.g.palette_selected) {
+        if (i == app.g.palette.selected) {
             current_ordinal = sessions;
             found_current = true;
         }
@@ -143,7 +143,7 @@ fn moveSelection(delta: i32) void {
     for (sm.sessions.items, 0..) |sess, i| {
         if (!matches(sess.profile.label())) continue;
         if (seen == next_ordinal) {
-            app.g.palette_selected = i;
+            app.g.palette.selected = i;
             return;
         }
         seen += 1;
@@ -152,7 +152,7 @@ fn moveSelection(delta: i32) void {
 
 fn commitSelection() void {
     const sm = app.g.session_manager orelse return;
-    const idx = app.g.palette_selected;
+    const idx = app.g.palette.selected;
     if (idx >= sm.sessions.items.len) {
         close();
         return;
@@ -181,7 +181,7 @@ fn firstMatch() ?usize {
 
 /// Case-insensitive substring match — palette UX, not ranked search.
 fn matches(label: []const u8) bool {
-    const q = app.g.palette_query_buf[0..app.g.palette_query_len];
+    const q = app.g.palette.query_buf[0..app.g.palette.query_len];
     if (q.len == 0) return true;
     if (q.len > label.len) return false;
     var i: usize = 0;
@@ -204,7 +204,7 @@ fn matches(label: []const u8) bool {
 }
 
 fn refresh() void {
-    const id = app.g.palette_view_id orelse return;
+    const id = app.g.palette.view_id orelse return;
     objc.Object.fromId(id).msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
 }
 
@@ -248,7 +248,7 @@ fn mountOverlay() void {
     }
 
     container.msgSend(void, "addSubview:", .{view});
-    app.g.palette_view_id = view.value;
+    app.g.palette.view_id = view.value;
 }
 
 var g_class_registered: bool = false;
@@ -292,7 +292,7 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
 
     // Header: "switch profile" hint + live query text.
     var header_buf: [192]u8 = undefined;
-    const q = app.g.palette_query_buf[0..app.g.palette_query_len];
+    const q = app.g.palette.query_buf[0..app.g.palette.query_len];
     const header_z = std.fmt.bufPrintZ(&header_buf, "switch profile · {s}", .{q}) catch return;
     const header_str = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, header_z.ptr)});
     const header_attrs = NSMutableDictionary.msgSend(objc.Object, "dictionaryWithCapacity:", .{@as(c_ulong, 2)});
@@ -312,7 +312,7 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
             .origin = .{ .x = 0, .y = y },
             .size = .{ .width = bounds.size.width, .height = row_h },
         };
-        const is_selected = i == app.g.palette_selected;
+        const is_selected = i == app.g.palette.selected;
         if (is_selected) {
             // Selected row: chip.bg lift over the surface backdrop.
             // Inverse of the prior treatment now that the palette
