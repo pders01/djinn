@@ -236,7 +236,7 @@ fn mountOverlay() void {
     // find chip + log pane separator. Layer-driven so it pixel-aligns
     // on Retina without antialias drift.
     const NSColor = objc.getClass("NSColor") orelse return;
-    if (app.g.chrome_style) |s| {
+    if (app.g.theme.chrome_style) |s| {
         const layer = view.msgSend(objc.Object, "layer", .{});
         if (layer.value != null) {
             layer.msgSend(void, "setCornerRadius:", .{@as(f64, 4)});
@@ -270,7 +270,7 @@ fn isFlippedImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
 fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void {
     const view = objc.Object.fromId(self_id);
     const bounds = view.msgSend(NSRect, "bounds", .{});
-    const style = app.g.chrome_style orelse return;
+    const style = app.g.theme.chrome_style orelse return;
     const sm = app.g.session_manager orelse return;
 
     const NSColor = objc.getClass("NSColor") orelse return;

@@ -1727,7 +1727,7 @@ const theme_mod = @import("../theme/theme.zig");
 /// fields; we can't rely on the appearance comparison since the
 /// appearance hasn't changed — only the config has.
 pub fn reloadTheme() void {
-    app.g.last_appearance = 0;
+    app.g.theme.last_appearance = 0;
     reapplyTheme();
 }
 
@@ -1754,7 +1754,7 @@ fn reapplyTheme() void {
         .light => 1,
         .dark => 2,
     };
-    if (app.g.last_appearance == current_tag) return;
+    if (app.g.theme.last_appearance == current_tag) return;
 
     // Push the new appearance to ghostty + reload its Config BEFORE
     // theme.resolve runs. theme.resolve reads `app.g.ghostty.config`
@@ -1782,12 +1782,12 @@ fn reapplyTheme() void {
     defer new_theme.deinit();
 
     const new_style = chrome_mod.Style.fromTheme(new_theme);
-    app.g.chrome_style = new_style;
+    app.g.theme.chrome_style = new_style;
     if (app.g.agent.log_view) |lv| lv.applyStyle(new_style);
     find.applyOverlayStyle(new_style);
     @import("../session/tab_strip.zig").applyStyle(new_style);
 
-    if (app.g.panel) |p| {
+    if (app.g.window.panel) |p| {
         const bg_r = @as(f64, @floatFromInt(new_theme.background.r)) / 255.0;
         const bg_g = @as(f64, @floatFromInt(new_theme.background.g)) / 255.0;
         const bg_b = @as(f64, @floatFromInt(new_theme.background.b)) / 255.0;
@@ -1798,5 +1798,5 @@ fn reapplyTheme() void {
     // and bailing on theme.resolve failure would poison the guard —
     // every subsequent call would short-circuit until the system
     // flipped a second time.
-    app.g.last_appearance = current_tag;
+    app.g.theme.last_appearance = current_tag;
 }

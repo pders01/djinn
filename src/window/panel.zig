@@ -26,7 +26,7 @@ fn registerPanelClass() void {
 /// Reset alpha after a visual-bell flash. Scheduled via
 /// performSelector:withObject:afterDelay: from `Panel.flashBell`.
 fn restoreBellAlphaImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
-    const p = app_state.g.panel orelse return;
+    const p = app_state.g.window.panel orelse return;
     const panel_obj = objc.Object.fromId(self_id);
     panel_obj.msgSend(void, "setAlphaValue:", .{p.expected_alpha});
 }
@@ -44,8 +44,8 @@ fn canBecomeKeyImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
 /// sibling djinn window (find chip, palette overlay), not a real blur.
 /// macOS won't auto-hide in that case either.
 fn didResignKeyImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
-    if (!app_state.g.hide_on_blur) return;
-    const p = app_state.g.panel orelse return;
+    if (!app_state.g.window.hide_on_blur) return;
+    const p = app_state.g.window.panel orelse return;
     if (!p.visible) return;
 
     const NSApplication = objc.getClass("NSApplication") orelse return;
@@ -56,7 +56,7 @@ fn didResignKeyImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void
 }
 
 fn didEndLiveResizeImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
-    const handler = app_state.g.resize_handler orelse return;
+    const handler = app_state.g.window.resize_handler orelse return;
     const panel_obj = objc.Object.fromId(self_id);
     const frame = panel_obj.msgSend(NSRect, "frame", .{});
     const w: u32 = @intFromFloat(@max(1.0, frame.size.width));
@@ -460,7 +460,7 @@ pub const Panel = struct {
     /// once the user releases a window-edge drag; we forward the new frame
     /// size to the supplied callback (typically the persistence hook).
     pub fn setResizeEndHandler(self: *Panel, handler: *const fn (u32, u32) void) void {
-        app_state.g.resize_handler = handler;
+        app_state.g.window.resize_handler = handler;
 
         const NSNotificationCenter = objc.getClass("NSNotificationCenter") orelse return;
         const center = NSNotificationCenter.msgSend(objc.Object, "defaultCenter", .{});
@@ -490,8 +490,8 @@ pub const Panel = struct {
     /// the resignKey observer is registered once and gates on
     /// `hide_on_blur` at fire time.
     pub fn setHideOnBlur(self: *Panel, enabled: bool) void {
-        app_state.g.hide_on_blur = enabled;
-        app_state.g.panel = self;
+        app_state.g.window.hide_on_blur = enabled;
+        app_state.g.window.panel = self;
 
         const c_enabled: c_int = if (enabled) 1 else 0;
         self.ns_panel.msgSend(void, "setHidesOnDeactivate:", .{c_enabled});

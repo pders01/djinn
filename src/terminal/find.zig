@@ -102,7 +102,7 @@ pub fn updateCountLabel() void {
         tf.msgSend(void, "setHidden:", .{@as(c_int, 1)});
         return;
     }
-    const style = app.g.chrome_style orelse return;
+    const style = app.g.theme.chrome_style orelse return;
 
     const needle = app.g.find.query_buf[0..app.g.find.query_len];
     var count_buf: [32]u8 = undefined;
@@ -219,7 +219,7 @@ fn applyFindOverlayFont(tf: objc.Object, style: chrome_mod.Style) void {
 /// Reskin the find-overlay chip after a theme reload. Layer bg + font
 /// flip immediately; the per-run colors of the next setAttributedStringValue
 /// pick up `style.chip.*` automatically since updateCountLabel reads
-/// `app.g.chrome_style` on every call.
+/// `app.g.theme.chrome_style` on every call.
 pub fn applyOverlayStyle(style: chrome_mod.Style) void {
     const fid = app.g.find.field_id orelse return;
     const tf = objc.Object.fromId(fid);

@@ -104,7 +104,7 @@ fn isFlippedImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
 fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void {
     const view = objc.Object.fromId(self_id);
     const bounds = view.msgSend(NSRect, "bounds", .{});
-    const style = app.g.chrome_style orelse return;
+    const style = app.g.theme.chrome_style orelse return;
     const sm = app.g.session_manager orelse return;
     if (sm.sessions.items.len < 2) return;
 

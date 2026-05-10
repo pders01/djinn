@@ -641,7 +641,7 @@ fn handleRingBell(host: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s,
         notifier.playSound(cfg.bell.sound);
     }
     if (cfg.bell.visual) {
-        if (host.app_state.panel) |p| p.flashBell();
+        if (host.app_state.window.panel) |p| p.flashBell();
     }
     return true;
 }
@@ -994,7 +994,7 @@ fn closeSurfaceStub(userdata: ?*anyopaque, _: bool) callconv(.c) void {
     // per-session `exited` state is owned by handleChildExited where
     // target.surface lets us identify the right session.
     const host = hostFromUserdata(userdata) orelse return;
-    if (host.app_state.panel) |p| {
+    if (host.app_state.window.panel) |p| {
         dispatch_async_f(@ptrCast(c_dispatch.dispatch_get_main_queue()), p, &closePanelMain);
     }
 }

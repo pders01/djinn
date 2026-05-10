@@ -26,18 +26,14 @@ pub const AppState = struct {
     // Agent surface observers ----------------------------------------
     agent: AgentSurface = .{},
 
-    // Theme reload ---------------------------------------------------
-    /// Allocator + config pointer used by the theme reloader on
-    /// system appearance changes. The Config lives in main()'s stack
-    /// for the lifetime of the process; pointer is stable.
+    // Allocator + config pointer used by the theme reloader on
+    // system appearance changes. The Config lives in main()'s stack
+    // for the lifetime of the process; pointer is stable.
     allocator: ?std.mem.Allocator = null,
     config: ?*Config = null,
-    /// Cached effective appearance from the last reapplyTheme run.
-    /// AppKit calls viewDidChangeEffectiveAppearance at moments that
-    /// don't necessarily change appearance (window show / first
-    /// move-to-window / ancestry changes); skipping the reload when
-    /// the cached value matches keeps the show path snappy.
-    last_appearance: u8 = 0, // 0 = unset, 1 = light, 2 = dark
+
+    // Theme state ----------------------------------------------------
+    theme: Theme = .{},
 
     // Bell -----------------------------------------------------------
     /// Pointer to Notifier so the bell effect callback can play a
@@ -45,13 +41,7 @@ pub const AppState = struct {
     notifier: ?*Notifier = null,
 
     // Window / panel -------------------------------------------------
-    panel: ?*Panel = null,
-    /// When true, the panel slides out as soon as another app takes
-    /// key focus. Set from config.window.hide_on_blur via setHideOnBlur.
-    hide_on_blur: bool = false,
-    /// Resize-end handler — fired by NSWindowDidEndLiveResizeNotification.
-    /// Persists the new window size.
-    resize_handler: ?*const fn (u32, u32) void = null,
+    window: Window = .{},
 
     // Live-reload targets — set by main() so the FSEvent watcher can
     // mutate runtime state without taking a closure (Cocoa callbacks
@@ -62,13 +52,6 @@ pub const AppState = struct {
 
     // Find on page ----------------------------------------------------
     find: FindState = .{},
-
-    // Chrome ---------------------------------------------------------
-    /// Active chrome style — derived from theme on startup + every
-    /// reapplyTheme. Find overlay + future host UI surfaces read this
-    /// for colors / fonts so they reskin in lockstep with the log
-    /// pane on appearance flips.
-    chrome_style: ?@import("chrome.zig").Style = null,
 
     // Tier-5 surface migration --------------------------------------
     layout: Layout = .{},
@@ -89,6 +72,33 @@ pub const AppState = struct {
     // Declared after fields per Zig's container layout rule. Each
     // group is opt-in: callers reach `app.g.find.*`, `app.g.palette.*`,
     // etc. instead of the flat field sea this struct used to be.
+
+    pub const Theme = struct {
+        /// Active chrome style — derived from theme on startup + every
+        /// reapplyTheme. Find overlay + future host UI surfaces read
+        /// this for colors / fonts so they reskin in lockstep with
+        /// the log pane on appearance flips.
+        chrome_style: ?@import("chrome.zig").Style = null,
+        /// Cached effective appearance from the last reapplyTheme run.
+        /// AppKit calls viewDidChangeEffectiveAppearance at moments
+        /// that don't necessarily change appearance (window show /
+        /// first move-to-window / ancestry changes); skipping the
+        /// reload when the cached value matches keeps the show path
+        /// snappy.
+        last_appearance: u8 = 0, // 0 = unset, 1 = light, 2 = dark
+    };
+
+    pub const Window = struct {
+        panel: ?*Panel = null,
+        /// When true, the panel slides out as soon as another app
+        /// takes key focus. Set from config.window.hide_on_blur via
+        /// setHideOnBlur.
+        hide_on_blur: bool = false,
+        /// Resize-end handler — fired by
+        /// NSWindowDidEndLiveResizeNotification. Persists the new
+        /// window size.
+        resize_handler: ?*const fn (u32, u32) void = null,
+    };
 
     pub const AgentSurface = struct {
         state: ?*AgentState = null,

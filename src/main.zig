@@ -72,7 +72,7 @@ fn deferredPostLaunchInit(_: ?*anyopaque) callconv(.c) void {
 // Hotkey callback runs on the main thread (CGEventTap source is added to the
 // main run loop at hotkey init time). Safe to drive Cocoa from here.
 fn toggleCallback() void {
-    if (app.g.panel) |p| p.toggle();
+    if (app.g.window.panel) |p| p.toggle();
 }
 
 fn onPanelResize(w: u32, h: u32) void {
@@ -123,7 +123,7 @@ fn onConfigChanged() void {
         if (app.g.hotkey) |hk| hk.setBinding(kb.keycode, kb.modifiers);
     } else |_| {}
 
-    if (app.g.panel) |p| {
+    if (app.g.window.panel) |p| {
         p.setHideOnBlur(new_cfg.window.hide_on_blur);
         p.setTopmost(new_cfg.window.topmost);
         p.setInstantToggle(new_cfg.window.toggle_style == .instant);
@@ -622,7 +622,7 @@ fn ensureTabStripVisible(visible: bool) void {
         const strip = tab_strip_mod.create(c_bounds.size.width, c_bounds.size.height);
         container.msgSend(void, "addSubview:", .{strip});
         app.g.layout.tab_strip_id = strip.value;
-        if (app.g.chrome_style) |s| tab_strip_mod.applyStyle(s);
+        if (app.g.theme.chrome_style) |s| tab_strip_mod.applyStyle(s);
     } else {
         const sid = app.g.layout.tab_strip_id.?;
         objc.Object.fromId(sid).msgSend(void, "removeFromSuperview", .{});
@@ -865,7 +865,7 @@ fn buildContainer(
         const strip = tab_strip.create(width, height);
         container.msgSend(void, "addSubview:", .{strip});
         app.g.layout.tab_strip_id = strip.value;
-        if (app.g.chrome_style) |s| tab_strip.applyStyle(s);
+        if (app.g.theme.chrome_style) |s| tab_strip.applyStyle(s);
     }
 
     return container;
@@ -961,7 +961,7 @@ pub fn main() !void {
         std.process.exit(1);
     };
     defer panel.deinit();
-    app.g.panel = &panel;
+    app.g.window.panel = &panel;
     // Theme reloader (viewDidChangeEffectiveAppearance) needs a stable
     // pointer to the config + an allocator. Stash both before the view
     // is created so the first appearance flip can already see them.
@@ -999,7 +999,7 @@ pub fn main() !void {
     // overlay + log pane both read this so host UI surfaces share one
     // visual language. reapplyTheme rebuilds + reskins both on flips.
     const chrome_style = @import("chrome.zig").Style.fromTheme(theme);
-    app.g.chrome_style = chrome_style;
+    app.g.theme.chrome_style = chrome_style;
 
     // Build terminal view (computes cell metrics from chosen font).
     var view = TerminalView.init(w, h, theme.font_family, theme.font_size, theme.padding_x, theme.padding_y, view_bg_alpha, chrome_style) catch |err| {
