@@ -69,12 +69,17 @@ dev-cert:
 # Smoke loop: build + test in one shot.
 check: build test
 
-# One-shot deploy: build + sign + rsync the bundle, launch via `open`.
+# One-shot deploy: build + sign + rsync the bundle, kill any running
+# instance, relaunch via `open`. The killall step is the important
+# bit: `open` brings an already-running djinn to front instead of
+# launching the freshly-installed bundle, so without it the on-disk
+# binary updates but the in-memory process keeps serving stale code.
 # When `dev-cert` has been run, the bundle's designated requirement
 # stays stable across rebuilds — so this no longer needs to reset TCC
 # every time. First launch still prompts for Accessibility; subsequent
 # launches skip the prompt.
 deploy: install-app
+    killall djinn 2>/dev/null || true
     open ~/Applications/Djinn.app
 
 # Print the active toolchain wrapper (`bash -c` vs `nix develop ... bash -c`).
