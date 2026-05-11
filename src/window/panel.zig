@@ -456,6 +456,56 @@ pub const Panel = struct {
         _ = self.ns_panel.msgSend(c_int, "makeFirstResponder:", .{view});
     }
 
+    /// Resize the panel to `width`×`height`, re-anchored to its current
+    /// position grid (top_left → origin stays at the top-left of the
+    /// active screen; top_center → re-centers). Called when switching
+    /// to a profile that has a persisted per-profile size in
+    /// state.json — log-heavy profile gets its tall+wide frame back,
+    /// shell profile gets its compact frame back. No-op when dims
+    /// match current frame to avoid a redundant repaint.
+    pub fn setSize(self: *Panel, width: f64, height: f64) void {
+        const cur = self.ns_panel.msgSend(NSRect, "frame", .{});
+        if (cur.size.width == width and cur.size.height == height) return;
+
+        self.width = width;
+        self.height = height;
+
+        // Re-resolve origin against the screen the panel is on so
+        // top_center / center / bottom_center stay anchored after the
+        // size change. Mirrors the `show()` placement math.
+        const win_screen = self.ns_panel.msgSend(objc.Object, "screen", .{});
+        const screen = if (win_screen.value != null) win_screen else (currentScreen() orelse return);
+        const sframe = screen.msgSend(NSRect, "frame", .{});
+
+        const new_x = if (self.position_x) |px|
+            sframe.origin.x + px
+        else switch (self.position) {
+            .top_left, .center_left, .bottom_left => sframe.origin.x,
+            .top_center, .center, .bottom_center => sframe.origin.x + (sframe.size.width - width) / 2.0,
+            .top_right, .center_right, .bottom_right => sframe.origin.x + sframe.size.width - width,
+        };
+        const new_y = if (self.position_y) |py|
+            sframe.origin.y + py
+        else switch (self.position) {
+            .top_left, .top_center, .top_right => sframe.origin.y + sframe.size.height - height,
+            .center_left, .center, .center_right => sframe.origin.y + (sframe.size.height - height) / 2.0,
+            .bottom_left, .bottom_center, .bottom_right => sframe.origin.y,
+        };
+
+        self.visible_y = new_y;
+        self.hidden_y = sframe.origin.y + sframe.size.height;
+
+        const target = NSRect{
+            .origin = .{ .x = new_x, .y = new_y },
+            .size = .{ .width = width, .height = height },
+        };
+        // Animate when visible — the size pop is jarring without it.
+        // Skip animation when hidden — no point spending frames on a
+        // window the user can't see.
+        const animate: c_int = if (self.visible) 1 else 0;
+        self.ns_panel.msgSend(void, "setFrame:display:animate:", .{ target, @as(c_int, 1), animate });
+    }
+
     /// Register a resize-end handler. AppKit emits NSWindowDidEndLiveResize
     /// once the user releases a window-edge drag; we forward the new frame
     /// size to the supplied callback (typically the persistence hook).

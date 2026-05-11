@@ -84,6 +84,13 @@ pub fn activateSession(idx: usize) bool {
         ghostty_runtime.surfaceSetFocus(@ptrCast(sp), true);
     }
 
+    // Per-profile window size memory. State.json may carry a
+    // per-profile width/height — restore it here so log-heavy profiles
+    // stay tall+wide while shell profiles stay compact. Skip when the
+    // user pinned `window-width` / `window-height` explicitly in
+    // config (config wins so editing the file takes effect immediately).
+    applyProfileWindowSize(new_sess.profile.name);
+
     // Trigger menubar redraw — its dropdown subtitle reflects the
     // active profile name.
     if (app.g.agent.menubar) |mb| {
@@ -231,6 +238,27 @@ pub fn bindGhosttySurface(
     ghostty_runtime.surfaceSetFocus(surf, true);
     std.debug.print("ghostty: surface bound + foregrounded ({d}x{d}px @ {d:.1}x)\n", .{ px_w, px_h, surface_scale });
     return surf;
+}
+
+/// Look up the persisted size for `profile_name` in state.json and
+/// resize the panel to match. Config-pinned dims short-circuit — when
+/// the user wrote `window-width = N` they want the same N across all
+/// profiles. State.json holds *implicit* sizes from the user dragging
+/// the edge; the per-profile override only matters when the user
+/// hasn't pinned a global size.
+fn applyProfileWindowSize(profile_name: []const u8) void {
+    const cfg = app.g.config orelse return;
+    if (cfg.window.width != null and cfg.window.height != null) return;
+    const allocator = app.g.allocator orelse return;
+    const panel = app.g.window.panel orelse return;
+
+    const persist = @import("../state/persist.zig");
+    var maybe_state = persist.load(allocator);
+    defer if (maybe_state) |*st| st.deinit(allocator);
+    const st = maybe_state orelse return;
+    const dims = st.profileSize(profile_name) orelse return;
+
+    panel.setSize(@as(f64, @floatFromInt(dims.w)), @as(f64, @floatFromInt(dims.h)));
 }
 
 fn isShell(cmd: []const u8) bool {

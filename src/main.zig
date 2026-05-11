@@ -79,7 +79,12 @@ fn toggleCallback() void {
 }
 
 fn onPanelResize(w: u32, h: u32) void {
-    persist.saveDebounced(.{ .width = w, .height = h });
+    const allocator = app.g.allocator orelse return;
+    const active_name: ?[]const u8 = if (app.g.session_manager) |sm|
+        sm.active().profile.name
+    else
+        null;
+    persist.saveDebounced(allocator, w, h, active_name);
 }
 
 /// FSEvent fan-in handler. Re-loads config from disk and pushes deltas
@@ -287,20 +292,47 @@ fn loadConfigWithRetry(allocator: std.mem.Allocator) ?Config {
     return null;
 }
 
+/// Resolve which profile will be active at startup, mirroring
+/// `SessionManager.init`'s default-resolution rules. Pulled out so
+/// `restoreWindowSize` can pick the per-profile dims before the
+/// SessionManager is even built (the panel is created earlier in
+/// `main` than the session manager — flipping that order is more
+/// invasive than this 6-line helper).
+fn resolveStartupProfileName(cfg: *const Config) []const u8 {
+    if (cfg.profiles.entries.len == 0) return "default";
+    if (cfg.profiles.default) |name| {
+        for (cfg.profiles.entries) |e| {
+            if (std.mem.eql(u8, e.name, name)) return e.name;
+        }
+    }
+    return cfg.profiles.entries[0].name;
+}
+
 /// Restore last-resized window size, clamped to the cursor screen's
 /// visibleFrame so a state.json captured on a 4K monitor doesn't paint
 /// off-screen on a 13" laptop. Falls back to config defaults; floors at
 /// 200×100 so a corrupt state.json doesn't crash AppKit.
-fn restoreWindowSize(allocator: std.mem.Allocator, cfg: *const Config) struct { w: u32, h: u32 } {
-    // Priority: explicit config dim → state.json → hardcoded default.
-    // Explicit config wins so a user editing `window-width = 2000`
-    // sees their change immediately, even when state.json holds an
-    // older size from a previous launch. state.json fills in only when
-    // the user hasn't pinned the dim in config (their resize lives on
-    // across restarts).
-    const persisted = persist.load(allocator);
-    var width_i: u32 = cfg.window.width orelse if (persisted) |st| st.width else 800;
-    var height_i: u32 = cfg.window.height orelse if (persisted) |st| st.height else 400;
+/// When `active_profile` is non-null, the per-profile entry in
+/// state.json wins over the top-level dims — log-heavy profiles can
+/// stay tall+wide while shell profiles stay compact across launches.
+fn restoreWindowSize(allocator: std.mem.Allocator, cfg: *const Config, active_profile: ?[]const u8) struct { w: u32, h: u32 } {
+    // Priority: explicit config dim → state.json (per-profile, then
+    // top-level) → hardcoded default. Explicit config wins so a user
+    // editing `window-width = 2000` sees their change immediately,
+    // even when state.json holds an older size from a previous launch.
+    var maybe_state = persist.load(allocator);
+    defer if (maybe_state) |*st| st.deinit(allocator);
+
+    const persisted: ?struct { w: u32, h: u32 } = blk: {
+        const st = maybe_state orelse break :blk null;
+        if (active_profile) |name| {
+            if (st.profileSize(name)) |p| break :blk .{ .w = p.w, .h = p.h };
+        }
+        if (st.width != 0 and st.height != 0) break :blk .{ .w = st.width, .h = st.height };
+        break :blk null;
+    };
+    var width_i: u32 = cfg.window.width orelse if (persisted) |p| p.w else 800;
+    var height_i: u32 = cfg.window.height orelse if (persisted) |p| p.h else 400;
 
     if (objc.getClass("NSScreen")) |sc| {
         const screen = panel_mod.currentScreen() orelse sc.msgSend(objc.Object, "mainScreen", .{});
@@ -423,7 +455,8 @@ pub fn main() !void {
     var agent_state = AgentState.init(allocator);
     defer agent_state.deinit();
 
-    const dims = restoreWindowSize(allocator, &config);
+    const startup_profile = resolveStartupProfileName(&config);
+    const dims = restoreWindowSize(allocator, &config, startup_profile);
     const w: f64 = @floatFromInt(dims.w);
     const h: f64 = @floatFromInt(dims.h);
 
