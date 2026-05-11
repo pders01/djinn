@@ -67,6 +67,7 @@ pub const AppState = struct {
     // Palette switcher (Cmd+Shift+P) ---------------------------------
     palette: PaletteState = .{},
     log_filter: LogFilterState = .{},
+    cheatsheet: CheatsheetState = .{},
 
 
     // ─── Sub-state types ───────────────────────────────────────────
@@ -212,6 +213,14 @@ pub const AppState = struct {
         /// indicator even after the user moves focus back to the
         /// terminal.
         field_id: ?objc.c.id = null,
+    };
+
+    pub const CheatsheetState = struct {
+        /// True while the keymap cheatsheet overlay is up. Routes
+        /// printable keys / Esc into `cheatsheet.handleKey` (which
+        /// dismisses on any input — the overlay is read-only).
+        mode: bool = false,
+        view_id: ?objc.c.id = null,
     };
 
     pub const FindState = struct {

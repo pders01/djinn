@@ -942,6 +942,14 @@ fn keyDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(
         return;
     }
 
+    // Cheatsheet overlay — any non-modifier key dismisses (the
+    // overlay is read-only; there's nothing meaningful to type
+    // into it).
+    if (app.g.cheatsheet.mode and (flags & (mod_cmd | mod_control)) == 0) {
+        @import("../session/cheatsheet.zig").handleKey(event, keycode);
+        return;
+    }
+
     // IME slow path. When the input source is non-Latin (Kotoeri,
     // Pinyin, Hangul …) or we're already mid-composition, route the
     // event through AppKit's text input pipeline so insertText /
@@ -1128,6 +1136,8 @@ var actions = [_]keymap.Action{
     .{ .name = "palette_open", .mods = mod_cmd | mod_shift, .keycode = 35, .handler = actionPaletteOpen },
     // Log filter chip — Cmd+Shift+L (kVK_ANSI_L = 37).
     .{ .name = "log_filter_open", .mods = mod_cmd | mod_shift, .keycode = 37, .handler = actionLogFilterOpen },
+    // Cheatsheet — Cmd+? = Cmd+Shift+/ (kVK_ANSI_Slash = 44).
+    .{ .name = "cheatsheet_open", .mods = mod_cmd | mod_shift, .keycode = 44, .handler = actionCheatsheetOpen },
     // Restart dead session — Cmd+R re-spawns with the same profile command.
     .{ .name = "restart_session", .mods = mod_cmd, .keycode = 15, .handler = actionRestartSession },
     // Drop to a plain shell — Cmd+Shift+R forces /bin/zsh for the session.
@@ -1139,6 +1149,13 @@ var actions = [_]keymap.Action{
 /// ignored — a typo in config shouldn't crash djinn.
 pub fn rebind(name: []const u8, mods: u64, keycode: u16) bool {
     return keymap.rebind(&actions, name, mods, keycode);
+}
+
+/// Read-only access to the host action table. The cheatsheet
+/// overlay (`session/cheatsheet.zig`) iterates this to render the
+/// live keymap (reflects user `rebind` overrides).
+pub fn actionList() []const keymap.Action {
+    return &actions;
 }
 
 fn dispatchAction(flags: u64, keycode: u16) bool {
@@ -1264,6 +1281,10 @@ fn actionPrevTab() void {
 
 fn actionLogFilterOpen() void {
     @import("../session/log_filter.zig").actionOpen();
+}
+
+fn actionCheatsheetOpen() void {
+    @import("../session/cheatsheet.zig").actionOpen();
 }
 
 fn actionPaletteOpen() void {
