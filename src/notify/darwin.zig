@@ -17,6 +17,30 @@ extern "c" fn dispatch_async_f(
     work: *const fn (?*anyopaque) callconv(.c) void,
 ) void;
 
+/// State a notification carries. Mirrors `agent.state.Agent` minus
+/// `idle`. Used as the rate-limit bucket key alongside client label
+/// so different states from the same client get their own first
+/// banner immediately (an `attention` doesn't suppress a follow-up
+/// `error` even within the rate window).
+pub const Kind = enum { attention, working, done, @"error" };
+
+const RateEntry = struct {
+    /// Hash of `client_label` (0 for anonymous / null) + Kind tag.
+    /// Combined into one u64 so the lookup is a flat scan over a tiny
+    /// fixed array — no allocator, no eviction policy beyond LRU on
+    /// the ring.
+    key: u64 = 0,
+    /// Wall-clock ms of last banner delivery for this bucket.
+    last_ms: i64 = 0,
+};
+
+/// Per-(client, kind) rate-limit ring. Sized for the realistic upper
+/// bound (a handful of agents × four kinds) — overflow falls through
+/// to the LRU slot with no warning, which just means the oldest
+/// bucket's rate-limit memory is wiped. Cheaper than a hash table for
+/// the expected ≤16 active entries.
+const rate_buckets: usize = 16;
+
 /// macOS notification sender via NSUserNotification (deprecated in 10.14
 /// but functional through current macOS; UNUserNotificationCenter is the
 /// modern path but requires a code-signed bundle, entitlements, and Zig
@@ -25,6 +49,15 @@ extern "c" fn dispatch_async_f(
 /// behavior is identical.
 pub const Notifier = struct {
     enabled: bool = true,
+    /// Minimum interval between banners for the same (client, kind)
+    /// tuple. Set from `notifications.rate_limit_ms`.
+    rate_limit_ms: u64 = 30_000,
+    rate_mutex: std.Thread.Mutex = .{},
+    rate_ring: [rate_buckets]RateEntry = [_]RateEntry{.{}} ** rate_buckets,
+    /// Next slot to overwrite on miss-after-full. Wraps mod
+    /// rate_buckets — pure FIFO eviction; good enough for ≤16
+    /// concurrent clients.
+    rate_next_slot: usize = 0,
 
     /// Play a system sound. Always runs via `afplay` in a detached thread
     /// — NSSound's msgSend chain is documented as main-thread-only and
@@ -76,29 +109,86 @@ pub const Notifier = struct {
         }
     }
 
+    /// Backwards-compatible send: no rate limit, no kind/client
+    /// bucketing. Internal hosts (config-reload warnings, etc.) use
+    /// this path. MCP tool handlers should call `sendKind` so the
+    /// rate-limit ring engages.
     pub fn send(self: *const Notifier, title: []const u8, body: []const u8) void {
         if (!self.enabled) return;
+        deliver(title, body);
+    }
 
-        const allocator = std.heap.page_allocator;
-        const payload = allocator.create(Payload) catch return;
-        payload.title = nulDupe(allocator, title) catch {
-            allocator.destroy(payload);
-            return;
-        };
-        payload.body = nulDupe(allocator, body) catch {
-            allocator.free(payload.title);
-            allocator.destroy(payload);
-            return;
-        };
+    /// Rate-limited variant for agent-driven notifications. Returns
+    /// true when a banner was delivered; false when the rate window
+    /// for this (client, kind) tuple is still cooling down. The
+    /// menubar + log surfaces always update regardless — this gate is
+    /// purely about the noisy OS-level banner.
+    pub fn sendKind(self: *Notifier, kind: Kind, client_label: ?[]const u8, title: []const u8, body: []const u8) bool {
+        if (!self.enabled) return false;
+        if (!self.checkAndBumpRate(kind, client_label)) return false;
+        deliver(title, body);
+        return true;
+    }
 
-        // The hot-path send() is called from MCP HTTP worker threads;
-        // AppKit / NSUserNotificationCenter must run on main. dispatch_async_f
-        // posts the work to the main queue, which the AppKit run loop
-        // drains. payload is freed inside deliverOnMain.
-        const main_queue = c_dispatch.dispatch_get_main_queue();
-        dispatch_async_f(@ptrCast(main_queue), payload, &deliverOnMain);
+    fn checkAndBumpRate(self: *Notifier, kind: Kind, client_label: ?[]const u8) bool {
+        const now = std.time.milliTimestamp();
+        const key = makeRateKey(kind, client_label);
+
+        self.rate_mutex.lock();
+        defer self.rate_mutex.unlock();
+
+        // Hit: existing bucket — bump only when the window expired.
+        for (&self.rate_ring) |*entry| {
+            if (entry.key == key) {
+                if (now - entry.last_ms < @as(i64, @intCast(self.rate_limit_ms))) return false;
+                entry.last_ms = now;
+                return true;
+            }
+        }
+        // Miss: claim a free slot, else FIFO-evict.
+        for (&self.rate_ring) |*entry| {
+            if (entry.key == 0) {
+                entry.key = key;
+                entry.last_ms = now;
+                return true;
+            }
+        }
+        const slot = self.rate_next_slot;
+        self.rate_next_slot = (slot + 1) % rate_buckets;
+        self.rate_ring[slot] = .{ .key = key, .last_ms = now };
+        return true;
     }
 };
+
+fn makeRateKey(kind: Kind, client_label: ?[]const u8) u64 {
+    var h: u64 = std.hash.Wyhash.hash(0xD711, client_label orelse "");
+    h ^= @as(u64, @intFromEnum(kind)) << 56;
+    // Reserve 0 as the "empty slot" sentinel — flip away from it if
+    // we land there exactly.
+    if (h == 0) h = 1;
+    return h;
+}
+
+fn deliver(title: []const u8, body: []const u8) void {
+    const allocator = std.heap.page_allocator;
+    const payload = allocator.create(Payload) catch return;
+    payload.title = nulDupe(allocator, title) catch {
+        allocator.destroy(payload);
+        return;
+    };
+    payload.body = nulDupe(allocator, body) catch {
+        allocator.free(payload.title);
+        allocator.destroy(payload);
+        return;
+    };
+
+    // Hot path called from MCP HTTP worker threads; AppKit /
+    // NSUserNotificationCenter must run on main. dispatch_async_f
+    // posts work to the main queue, which the AppKit run loop
+    // drains. Payload is freed inside deliverOnMain.
+    const main_queue = c_dispatch.dispatch_get_main_queue();
+    dispatch_async_f(@ptrCast(main_queue), payload, &deliverOnMain);
+}
 
 const Payload = struct {
     /// NUL-terminated UTF-8 — stringWithUTF8String: requires that.
@@ -177,4 +267,26 @@ fn execAfplay(path: []const u8) void {
     );
     child.spawn() catch return;
     _ = child.wait() catch {};
+}
+
+test "Notifier: rate limit blocks repeat within window" {
+    var n = Notifier{ .enabled = true, .rate_limit_ms = 60_000 };
+    // First call for (client=A, kind=attention) passes the gate.
+    try std.testing.expect(n.checkAndBumpRate(.attention, "A"));
+    // Repeat within window blocked.
+    try std.testing.expect(!n.checkAndBumpRate(.attention, "A"));
+    // Different kind for same client gets its own bucket.
+    try std.testing.expect(n.checkAndBumpRate(.@"error", "A"));
+    // Different client also passes.
+    try std.testing.expect(n.checkAndBumpRate(.attention, "B"));
+    // Null client (= internal hosts) has its own bucket distinct
+    // from any labeled client.
+    try std.testing.expect(n.checkAndBumpRate(.attention, null));
+}
+
+test "Notifier: rate limit clears after window" {
+    var n = Notifier{ .enabled = true, .rate_limit_ms = 1 };
+    try std.testing.expect(n.checkAndBumpRate(.attention, "X"));
+    std.Thread.sleep(5 * std.time.ns_per_ms);
+    try std.testing.expect(n.checkAndBumpRate(.attention, "X"));
 }

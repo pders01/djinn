@@ -191,6 +191,21 @@ pub const Config = struct {
         /// Defaults to "Glass" so the surface ships audibly out of the box;
         /// users can opt out by setting null.
         attention_sound: ?[]const u8 = "Glass",
+        /// Per-state banner gates. Each MCP tool only delivers an
+        /// NSUserNotification banner when its gate is true. Defaults
+        /// chosen to surface user-facing events (attention, error) and
+        /// stay silent on chatter (progress, per-completion summaries
+        /// that already have the menubar as their primary surface).
+        notify_on_attention: bool = true,
+        notify_on_error: bool = true,
+        notify_on_done: bool = false,
+        notify_on_progress: bool = false,
+        /// Minimum interval between banners from the same client. Kills
+        /// banner-storm scenarios where a chatty agent calls
+        /// `djinn_attention` faster than the user can dismiss. Per
+        /// (client_label, state) tuple — different agents or different
+        /// states still get their own first banner immediately.
+        rate_limit_ms: u64 = 30_000,
     };
 
     /// Load config from ~/.config/djinn/config (ghostty key=value format),
@@ -366,6 +381,16 @@ pub const Config = struct {
             config.notifications.menubar_icon = try parseBool(val);
         } else if (eq(key, "attention-sound")) {
             config.notifications.attention_sound = try allocator.dupe(u8, val);
+        } else if (eq(key, "notify-attention")) {
+            config.notifications.notify_on_attention = try parseBool(val);
+        } else if (eq(key, "notify-error")) {
+            config.notifications.notify_on_error = try parseBool(val);
+        } else if (eq(key, "notify-done")) {
+            config.notifications.notify_on_done = try parseBool(val);
+        } else if (eq(key, "notify-progress")) {
+            config.notifications.notify_on_progress = try parseBool(val);
+        } else if (eq(key, "notify-rate-limit-ms")) {
+            config.notifications.rate_limit_ms = try std.fmt.parseInt(u64, val, 10);
         }
         // Terminal --------------------------------------------------------
         else if (eq(key, "font-family")) {

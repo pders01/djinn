@@ -11,8 +11,18 @@ const Notifier = @import("../notify/darwin.zig").Notifier;
 /// hotkey, not to the agent.
 pub const ToolTable = struct {
     state: *AgentState,
-    notifier: ?*const Notifier = null,
+    /// Mutable — `sendKind` updates the per-(client, kind) rate-limit
+    /// ring under an internal mutex.
+    notifier: ?*Notifier = null,
     attention_sound: ?[]const u8 = null,
+    /// Per-state banner gates. Pushed from `config.notifications.*`
+    /// at startup and on hot-config-reload. Defaults match
+    /// NotifyConfig so test ToolTables (constructed without a config)
+    /// still get attention/error banners.
+    notify_on_attention: bool = true,
+    notify_on_error: bool = true,
+    notify_on_done: bool = false,
+    notify_on_progress: bool = false,
 
     pub fn table(self: *ToolTable) Dispatcher.ToolTable {
         return .{
@@ -40,9 +50,12 @@ pub const ToolTable = struct {
             const msg = stringArg(args, "message") orelse "agent needs attention";
             try self.state.setState(.attention, msg);
             try self.state.appendLogFrom(.warn, msg, client);
-            if (self.notifier) |n| {
-                n.send("djinn", msg);
-                n.playSound(self.attention_sound);
+            if (self.notify_on_attention) {
+                if (self.notifier) |n| {
+                    if (n.sendKind(.attention, client, "djinn", msg)) {
+                        n.playSound(self.attention_sound);
+                    }
+                }
             }
             return .{ .text = "ack" };
         }
@@ -50,6 +63,9 @@ pub const ToolTable = struct {
         if (std.mem.eql(u8, name, "djinn_progress")) {
             const msg = stringArg(args, "message") orelse "working";
             try self.state.setState(.working, msg);
+            if (self.notify_on_progress) {
+                if (self.notifier) |n| _ = n.sendKind(.working, client, "djinn", msg);
+            }
             return .{ .text = "ack" };
         }
 
@@ -57,6 +73,9 @@ pub const ToolTable = struct {
             const msg = stringArg(args, "message") orelse "done";
             try self.state.setState(.done, msg);
             try self.state.appendLogFrom(.info, msg, client);
+            if (self.notify_on_done) {
+                if (self.notifier) |n| _ = n.sendKind(.done, client, "djinn", msg);
+            }
             return .{ .text = "ack" };
         }
 
@@ -64,6 +83,9 @@ pub const ToolTable = struct {
             const msg = stringArg(args, "message") orelse "error";
             try self.state.setState(.@"error", msg);
             try self.state.appendLogFrom(.err, msg, client);
+            if (self.notify_on_error) {
+                if (self.notifier) |n| _ = n.sendKind(.@"error", client, "djinn", msg);
+            }
             return .{ .text = "ack" };
         }
 

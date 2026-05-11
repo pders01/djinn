@@ -357,6 +357,22 @@ system-notifications = true         # bool — NSUserNotification on agent atten
 menubar-icon = true                 # bool
 attention-sound = Glass             # system sound name, "default" (= Funk), or absolute path
 
+# Per-state banner gates — which MCP tool calls deliver a banner.
+# Menubar + log surfaces always update; this only governs the noisy
+# OS-level notification. Defaults shipped to surface user-actionable
+# events (attention, error) and stay silent on chatter (progress,
+# per-completion done).
+notify-attention = true             # bool
+notify-error = true                 # bool
+notify-done = false                 # bool
+notify-progress = false             # bool
+
+# Banner rate limit per (client, state) tuple. Different agents or
+# different states still get their own first banner immediately;
+# repeat banners from the same (client, state) within this window
+# are dropped silently.
+notify-rate-limit-ms = 30000        # u64 — milliseconds
+
 # Keymap overrides — `keybind = <action>=<trigger>`
 # Actions: copy, paste, scroll_page_up, scroll_page_down, font_inc, font_dec,
 #          font_reset, clear_scrollback, open_settings, toggle_log_pane,

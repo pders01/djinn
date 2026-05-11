@@ -137,8 +137,17 @@ fn onConfigChanged() void {
         p.setInstantToggle(new_cfg.window.toggle_style == .instant);
     }
 
-    if (app.g.notifier) |n| n.enabled = new_cfg.notifications.system_notifications;
-    if (app.g.tool_table) |tt| tt.attention_sound = new_cfg.notifications.attention_sound;
+    if (app.g.notifier) |n| {
+        n.enabled = new_cfg.notifications.system_notifications;
+        n.rate_limit_ms = new_cfg.notifications.rate_limit_ms;
+    }
+    if (app.g.tool_table) |tt| {
+        tt.attention_sound = new_cfg.notifications.attention_sound;
+        tt.notify_on_attention = new_cfg.notifications.notify_on_attention;
+        tt.notify_on_error = new_cfg.notifications.notify_on_error;
+        tt.notify_on_done = new_cfg.notifications.notify_on_done;
+        tt.notify_on_progress = new_cfg.notifications.notify_on_progress;
+    }
     if (app.g.agent.menubar) |mb| mb.setEnabled(new_cfg.notifications.menubar_icon);
 
     // Log-pane visibility: only re-apply when the config value
@@ -709,10 +718,15 @@ pub fn main() !void {
     // and no accept thread spawns — and ~/.config/djinn/mcp.json isn't
     // touched, so stale endpoint info from a previous run isn't left
     // pointing at a port nothing's listening on.
+    notifier.rate_limit_ms = config.notifications.rate_limit_ms;
     var tools = ToolTable{
         .state = &agent_state,
         .notifier = &notifier,
         .attention_sound = config.notifications.attention_sound,
+        .notify_on_attention = config.notifications.notify_on_attention,
+        .notify_on_error = config.notifications.notify_on_error,
+        .notify_on_done = config.notifications.notify_on_done,
+        .notify_on_progress = config.notifications.notify_on_progress,
     };
     app.g.tool_table = &tools;
     var dispatcher = Dispatcher{ .tool_table = tools.table() };
