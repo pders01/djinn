@@ -14,6 +14,7 @@ pub const Config = struct {
     bell: BellConfig = .{},
     keymap: KeymapConfig = .{},
     profiles: ProfilesConfig = .{},
+    clients: ClientsConfig = .{},
 
     pub const WindowConfig = struct {
         /// Optional so the runtime can tell "user set this explicitly"
@@ -100,6 +101,27 @@ pub const Config = struct {
         /// terminal. `~`-relative paths are expanded at SessionManager
         /// resolve time.
         script: ?[]const u8 = null,
+    };
+
+    /// User-set per-client identity. The key matches the 6-hex client
+    /// label that `mcp/server.zig:shortClientId` derives from the
+    /// request User-Agent. Add `client.<hash>.name = "review-bot"` to
+    /// give a memorable label; `client.<hash>.mute = true` suppresses
+    /// banner delivery from that client without dropping log entries.
+    pub const ClientEntry = struct {
+        /// 6-hex client id from User-Agent SHA-256 (stable across
+        /// requests from the same client).
+        id: []const u8,
+        /// Display nickname shown in log headers + menubar surfaces in
+        /// place of the raw hash. Null = fall through to the raw hash.
+        name: ?[]const u8 = null,
+        /// When true, MCP-driven banners from this client are dropped
+        /// (the log still records the entry).
+        mute: bool = false,
+    };
+
+    pub const ClientsConfig = struct {
+        entries: []const ClientEntry = &.{},
     };
 
     pub const ProfilesConfig = struct {
@@ -251,6 +273,8 @@ pub const Config = struct {
         defer keymap_list.deinit(allocator);
         var profile_list = std.ArrayList(ProfileEntry){};
         defer profile_list.deinit(allocator);
+        var client_list = std.ArrayList(ClientEntry){};
+        defer client_list.deinit(allocator);
 
         var lines = std.mem.splitScalar(u8, contents, '\n');
         var line_no: u32 = 0;
@@ -266,7 +290,7 @@ pub const Config = struct {
             const key = std.mem.trim(u8, line[0..eq_idx], " \t");
             const val = unquote(std.mem.trim(u8, line[eq_idx + 1 ..], " \t"));
 
-            applyKey(&config, &keymap_list, &profile_list, allocator, key, val) catch |err| {
+            applyKey(&config, &keymap_list, &profile_list, &client_list, allocator, key, val) catch |err| {
                 std.debug.print("warning: config:{d}: '{s}' = '{s}' ({})\n", .{ line_no, key, val, err });
             };
         }
@@ -293,6 +317,13 @@ pub const Config = struct {
             }
             break :blk &.{};
         };
+        config.clients.entries = client_list.toOwnedSlice(allocator) catch blk: {
+            for (client_list.items) |e| {
+                allocator.free(e.id);
+                if (e.name) |s| allocator.free(s);
+            }
+            break :blk &.{};
+        };
         return config;
     }
 
@@ -300,10 +331,17 @@ pub const Config = struct {
         config: *Config,
         keymap_list: *std.ArrayList(KeymapEntry),
         profile_list: *std.ArrayList(ProfileEntry),
+        client_list: *std.ArrayList(ClientEntry),
         allocator: std.mem.Allocator,
         key: []const u8,
         val: []const u8,
     ) !void {
+        // Per-client identity overrides: `client.<id>.name = ...`,
+        // `client.<id>.mute = true`. Dotted path mirrors profile.*.
+        if (std.mem.startsWith(u8, key, "client.")) {
+            try applyClientKey(client_list, allocator, key["client.".len..], val);
+            return;
+        }
         // Profiles --------------------------------------------------------
         // `default-profile = name` selects which profile is active at
         // startup. `profile.<name>.<field> = value` defines per-profile
@@ -498,6 +536,49 @@ pub const Config = struct {
             allocator.free(dup);
             return error.UnknownProfileField;
         }
+    }
+
+    fn applyClientKey(
+        client_list: *std.ArrayList(ClientEntry),
+        allocator: std.mem.Allocator,
+        tail: []const u8,
+        val: []const u8,
+    ) !void {
+        const dot = std.mem.indexOfScalar(u8, tail, '.') orelse return error.MalformedClientKey;
+        const id = tail[0..dot];
+        const field = tail[dot + 1 ..];
+        if (id.len == 0 or field.len == 0) return error.MalformedClientKey;
+
+        var idx: ?usize = null;
+        for (client_list.items, 0..) |e, i| {
+            if (std.mem.eql(u8, e.id, id)) {
+                idx = i;
+                break;
+            }
+        }
+        if (idx == null) {
+            try client_list.append(allocator, .{ .id = try allocator.dupe(u8, id) });
+            idx = client_list.items.len - 1;
+        }
+
+        const entry = &client_list.items[idx.?];
+        if (eq(field, "name")) {
+            entry.name = try allocator.dupe(u8, val);
+        } else if (eq(field, "mute")) {
+            entry.mute = try parseBool(val);
+        } else {
+            return error.UnknownClientField;
+        }
+    }
+
+    /// Find the per-client config entry for a runtime client label
+    /// (the 6-hex hash produced by `shortClientId`). Returns null when
+    /// the user hasn't configured an override.
+    pub fn findClient(self: *const Config, id: []const u8) ?ClientEntry {
+        for (self.clients.entries) |e| {
+            if (std.mem.eql(u8, e.id, id)) return e;
+        }
+        return null;
     }
 
     /// Get the effective command to spawn for the configured provider.
@@ -854,4 +935,22 @@ test "Config: parseBool variants" {
     try std.testing.expectEqual(false, try parseBool("off"));
     try std.testing.expectEqual(false, try parseBool("0"));
     try std.testing.expectError(error.NotABool, parseBool("maybe"));
+}
+
+test "Config: parse client entries + findClient" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const src =
+        \\client.abc123.name = review-bot
+        \\client.abc123.mute = true
+        \\client.deadbe.name = main
+    ;
+    const config = try Config.parse(arena.allocator(), src);
+    try std.testing.expectEqual(@as(usize, 2), config.clients.entries.len);
+    const c1 = config.findClient("abc123") orelse return error.MissingClient;
+    try std.testing.expectEqualStrings("review-bot", c1.name.?);
+    try std.testing.expect(c1.mute);
+    const c2 = config.findClient("deadbe") orelse return error.MissingClient;
+    try std.testing.expect(!c2.mute);
+    try std.testing.expectEqual(@as(?Config.ClientEntry, null), config.findClient("nope"));
 }

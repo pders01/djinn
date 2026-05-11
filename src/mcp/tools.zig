@@ -5,6 +5,17 @@ const AgentState = @import("../agent/state.zig").AgentState;
 const Agent = @import("../agent/state.zig").Agent;
 const LogEntry = @import("../agent/state.zig").LogEntry;
 const Notifier = @import("../notify/darwin.zig").Notifier;
+const app_state = @import("../app.zig");
+
+/// Look up the per-client mute flag. Wired through `app.g.config` so
+/// hot-config-reload edits take effect on the next tool call without
+/// rebuilding the ToolTable. Anonymous (null) client always passes.
+fn clientMuted(client: ?[]const u8) bool {
+    const id = client orelse return false;
+    const cfg = app_state.g.config orelse return false;
+    if (cfg.findClient(id)) |e| return e.mute;
+    return false;
+}
 
 /// MCP tool surface for djinn. Tools push agent state to the user — they do
 /// NOT control the popup window. Window control belongs to the user's
@@ -50,7 +61,7 @@ pub const ToolTable = struct {
             const msg = stringArg(args, "message") orelse "agent needs attention";
             try self.state.setState(.attention, msg);
             try self.state.appendLogFrom(.warn, msg, client);
-            if (self.notify_on_attention) {
+            if (self.notify_on_attention and !clientMuted(client)) {
                 if (self.notifier) |n| {
                     if (n.sendKind(.attention, client, "djinn", msg)) {
                         n.playSound(self.attention_sound);
@@ -63,7 +74,7 @@ pub const ToolTable = struct {
         if (std.mem.eql(u8, name, "djinn_progress")) {
             const msg = stringArg(args, "message") orelse "working";
             try self.state.setState(.working, msg);
-            if (self.notify_on_progress) {
+            if (self.notify_on_progress and !clientMuted(client)) {
                 if (self.notifier) |n| _ = n.sendKind(.working, client, "djinn", msg);
             }
             return .{ .text = "ack" };
@@ -73,7 +84,7 @@ pub const ToolTable = struct {
             const msg = stringArg(args, "message") orelse "done";
             try self.state.setState(.done, msg);
             try self.state.appendLogFrom(.info, msg, client);
-            if (self.notify_on_done) {
+            if (self.notify_on_done and !clientMuted(client)) {
                 if (self.notifier) |n| _ = n.sendKind(.done, client, "djinn", msg);
             }
             return .{ .text = "ack" };
@@ -83,7 +94,7 @@ pub const ToolTable = struct {
             const msg = stringArg(args, "message") orelse "error";
             try self.state.setState(.@"error", msg);
             try self.state.appendLogFrom(.err, msg, client);
-            if (self.notify_on_error) {
+            if (self.notify_on_error and !clientMuted(client)) {
                 if (self.notifier) |n| _ = n.sendKind(.@"error", client, "djinn", msg);
             }
             return .{ .text = "ack" };

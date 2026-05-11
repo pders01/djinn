@@ -227,7 +227,22 @@ pub const LogView = struct {
         // from the same client skip the header so the eye reads the
         // group as one conversation. When two agents interleave, each
         // switch reintroduces the header so the source stays clear.
-        const client_str = entry.client orelse "djinn";
+        //
+        // Display nickname swap: when the user has set
+        // `client.<hash>.name` in config, the friendly label replaces
+        // the raw 6-hex id. Grouping key still uses the raw entry.client
+        // so a rename mid-session doesn't accidentally split a group.
+        const client_str: []const u8 = blk: {
+            if (entry.client) |id| {
+                if (@import("../app.zig").g.config) |cfg| {
+                    if (cfg.findClient(id)) |e| {
+                        if (e.name) |n| break :blk n;
+                    }
+                }
+                break :blk id;
+            }
+            break :blk "djinn";
+        };
         const same_client = self.last_client_known and
             std.mem.eql(u8, client_str, self.last_client_buf[0..self.last_client_len]);
 

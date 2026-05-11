@@ -373,6 +373,14 @@ notify-progress = false             # bool
 # are dropped silently.
 notify-rate-limit-ms = 30000        # u64 — milliseconds
 
+# Per-client identity — rename the raw 6-hex hash that the log
+# pane / menubar use to identify each MCP client, and optionally
+# mute its OS-level banners. The id is the same hex string shown
+# in log headers (derived from User-Agent). Log entries continue
+# to flow even when muted — only the noisy banner is suppressed.
+# client.abc123.name = review-bot
+# client.abc123.mute = true
+
 # Keymap overrides — `keybind = <action>=<trigger>`
 # Actions: copy, paste, scroll_page_up, scroll_page_down, font_inc, font_dec,
 #          font_reset, clear_scrollback, open_settings, toggle_log_pane,
