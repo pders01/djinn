@@ -88,6 +88,11 @@ pub const AppState = struct {
         /// reload when the cached value matches keeps the show path
         /// snappy.
         last_appearance: u8 = 0, // 0 = unset, 1 = light, 2 = dark
+        /// Runtime appearance override. null = follow system (default).
+        /// `theme_toggle` cycles null → light → dark → null and forces
+        /// a `reloadTheme` pass on each step. Not persisted — restart
+        /// returns to the system-follow default.
+        override: ?@import("theme/theme.zig").Appearance = null,
     };
 
     pub const Window = struct {

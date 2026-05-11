@@ -1140,6 +1140,8 @@ var actions = [_]keymap.Action{
     .{ .name = "cheatsheet_open", .mods = mod_cmd | mod_shift, .keycode = 44, .handler = actionCheatsheetOpen },
     // Duplicate active profile — Cmd+Shift+N (kVK_ANSI_N = 45).
     .{ .name = "profile_duplicate", .mods = mod_cmd | mod_shift, .keycode = 45, .handler = actionProfileDuplicate },
+    // Cycle theme override — Cmd+Shift+T (kVK_ANSI_T = 17).
+    .{ .name = "theme_toggle", .mods = mod_cmd | mod_shift, .keycode = 17, .handler = actionThemeToggle },
     // Restart dead session — Cmd+R re-spawns with the same profile command.
     .{ .name = "restart_session", .mods = mod_cmd, .keycode = 15, .handler = actionRestartSession },
     // Drop to a plain shell — Cmd+Shift+R forces /bin/zsh for the session.
@@ -1293,6 +1295,23 @@ fn actionProfileDuplicate() void {
     @import("../session/profile_manager.zig").duplicateActive();
 }
 
+fn actionThemeToggle() void {
+    // Cycle null (system) → light → dark → null. reloadTheme forces
+    // a full reapply on each step by clearing the last_appearance
+    // cache; otherwise the chrome stays on the cached variant when
+    // the override resolves to the same value as the previous one.
+    // Zig 0.15 doesn't switch directly on `?Enum`, so unwrap first.
+    if (app.g.theme.override) |cur| {
+        app.g.theme.override = switch (cur) {
+            .light => @as(?theme_mod.Appearance, .dark),
+            .dark => null,
+        };
+    } else {
+        app.g.theme.override = .light;
+    }
+    reloadTheme();
+}
+
 fn actionPaletteOpen() void {
     @import("../session/palette.zig").open();
 }
@@ -1347,7 +1366,9 @@ fn reapplyTheme() void {
     // window-attach, panel show, layout passes — and re-running
     // theme.resolve (file IO + parse) on every show is the source of
     // the perceived show-time lag.
-    const current_appearance = theme_mod.detectSystemAppearance();
+    // Runtime override (Cmd+Shift+T) wins over system appearance.
+    // When null, fall back to NSAppearance probe.
+    const current_appearance = app.g.theme.override orelse theme_mod.detectSystemAppearance();
     const current_tag: u8 = switch (current_appearance) {
         .light => 1,
         .dark => 2,
