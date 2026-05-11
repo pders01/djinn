@@ -26,6 +26,12 @@ pub fn actionOpen() void {
         exitMode();
         return;
     }
+    // Auto-reveal the log pane. Filtering a hidden pane is a no-op
+    // from the user's perspective — the chip surface shows the
+    // filter state but the entries the filter would highlight are
+    // off-screen. `setLogPaneHidden(false)` is idempotent so an
+    // already-visible pane stays put.
+    @import("../terminal/view.zig").setLogPaneHidden(false);
     app.g.log_filter.mode = true;
     ensureChip();
     refresh();
@@ -130,8 +136,26 @@ fn ensureChip() void {
     tf.msgSend(void, "setSelectable:", .{@as(c_int, 0)});
     tf.msgSend(void, "setDrawsBackground:", .{@as(c_int, 1)});
     tf.msgSend(void, "setHidden:", .{@as(c_int, 1)});
+    // Single-line + clip line-break match the find chip exactly.
+    // DjinnChipCell.drawInteriorWithFrame: only vertically centers
+    // when the cell renders in single-line mode — without these
+    // calls the text top-aligns because NSTextFieldCell defaults
+    // to multi-line layout and the cell-centering math reads the
+    // wrong text bounds.
+    const tf_cell = tf.msgSend(objc.Object, "cell", .{});
+    if (tf_cell.value != null) {
+        tf_cell.msgSend(void, "setUsesSingleLineMode:", .{@as(c_int, 1)});
+        tf_cell.msgSend(void, "setLineBreakMode:", .{@as(c_long, 4)}); // NSLineBreakByClipping
+    }
     tf.msgSend(void, "setBackgroundColor:", .{chrome.nsColorFromRgb(NSColor, style.chip.bg)});
     tf.msgSend(void, "setTextColor:", .{chrome.nsColorFromRgb(NSColor, style.chip.fg)});
+    // Field-level font in addition to attributed-run fonts. The
+    // cell uses the field font for sizing decisions (line height,
+    // baseline) even when the rendered runs carry their own font
+    // attrs — without this the chip's vertical metric tracks
+    // NSTextField's default system font, mismatching the find chip.
+    const NSFont = objc.getClass("NSFont") orelse return;
+    tf.msgSend(void, "setFont:", .{chrome.chromeFont(NSFont, style.font_family, style.font_size_chip)});
     tf.msgSend(void, "setWantsLayer:", .{@as(c_int, 1)});
     const layer = tf.msgSend(objc.Object, "layer", .{});
     if (layer.value != null) {
@@ -141,9 +165,6 @@ fn ensureChip() void {
         const border = chrome.nsColorFromRgb(NSColor, style.chip.border);
         layer.msgSend(void, "setBorderColor:", .{border.msgSend(?*anyopaque, "CGColor", .{})});
     }
-    // NSViewMinXMargin (1) + NSViewMinYMargin (32) — pinned to
-    // top-right under live resize. Stacked below the find chip's
-    // home position so the two never overlap when both are visible.
     tf.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, 1 | 32)});
     container.msgSend(void, "addSubview:", .{tf});
     app.g.log_filter.field_id = tf.value;
@@ -163,40 +184,104 @@ fn refresh() void {
         return;
     }
 
-    // "log: <needle>" — the leading colon doubles as the cursor
-    // proxy when the chip is in input mode with no needle yet.
-    var buf: [256]u8 = undefined;
-    const prefix = "log: ";
-    @memcpy(buf[0..prefix.len], prefix);
-    const room = buf.len - prefix.len - 1;
-    const take = @min(needle.len, room);
-    @memcpy(buf[prefix.len .. prefix.len + take], needle[0..take]);
-    buf[prefix.len + take] = 0;
-
+    // "log: <needle>" — leading "log: " in dim, needle in chip.fg.
+    // Build an NSAttributedString so DjinnChipCell's
+    // drawInteriorWithFrame: (which reads attributedStringValue
+    // only — plain stringValue renders without font/color attrs
+    // and stays invisible against the chip bg) actually paints.
+    const style = app.g.theme.chrome_style orelse return;
     const NSString = objc.getClass("NSString") orelse return;
-    const text = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, &buf)});
-    if (text.value == null) return;
-    tf.msgSend(void, "setStringValue:", .{text});
+    const NSAttributedString = objc.getClass("NSMutableAttributedString") orelse return;
+    const root_alloc = NSAttributedString.msgSend(objc.Object, "alloc", .{});
+    const root = root_alloc.msgSend(objc.Object, "init", .{});
+    defer root.msgSend(void, "release", .{});
 
-    // Auto-size width to text + padding; anchor below the find
-    // chip's home position so both chips can be visible together.
+    // Match the find chip's typography exactly: dim label, optional
+    // " · " + fg needle when present. Empty-needle keeps a bare
+    // "log" — no trailing separator (the find chip doesn't have
+    // one either; consistency matters more than the live-cursor
+    // affordance).
+    appendChipRun(root, "log", style.chip.dim, style);
+    if (needle.len > 0) {
+        appendChipRun(root, " · ", style.chip.dim, style);
+        appendChipRun(root, needle, style.chip.fg, style);
+    }
+    tf.msgSend(void, "setAttributedStringValue:", .{root});
+
+    const text_size = root.msgSend(NSSize, "size", .{});
     const tf_h: f64 = 24;
     const margin: f64 = 14;
-    const find_chip_offset_y: f64 = tf_h + margin + 4;
-    const text_size = text.msgSend(NSSize, "size", .{});
     const pad_x: f64 = 32;
     const new_w = @ceil(text_size.width) + pad_x;
     const container_id = app.g.layout.container_id orelse return;
     const container = objc.Object.fromId(container_id);
     const c_frame = container.msgSend(NSRect, "frame", .{});
+
+    // Place log chip on the SAME vertical offset as the find chip
+    // and stack horizontally to its left. The find chip sits at
+    // `parent_width - find_width - margin`; we anchor against the
+    // find chip's actual frame (queried live, since its width
+    // tracks the needle) so the gap stays constant regardless of
+    // find chip state. Falls back to the top-right corner when
+    // find chip isn't mounted yet (find_id null).
+    const gap: f64 = 6;
+    const right_x: f64 = if (app.g.find.field_id) |find_id| blk: {
+        const find_tf = objc.Object.fromId(find_id);
+        const find_frame = find_tf.msgSend(NSRect, "frame", .{});
+        break :blk find_frame.origin.x - gap - new_w;
+    } else c_frame.size.width - new_w - margin;
+    const y = c_frame.size.height - tf_h - margin;
     tf.msgSend(void, "setFrame:", .{NSRect{
-        .origin = .{
-            .x = c_frame.size.width - new_w - margin,
-            .y = c_frame.size.height - find_chip_offset_y - tf_h - margin,
-        },
+        .origin = .{ .x = right_x, .y = y },
         .size = .{ .width = new_w, .height = tf_h },
     }});
     tf.msgSend(void, "setHidden:", .{@as(c_int, 0)});
+    _ = NSString;
+}
+
+/// Append one styled run to the chip's attributed string. Mirrors
+/// terminal/find.zig:appendFindRun — center-aligned, chrome chip
+/// font, configurable color. Kept local to avoid a back-import
+/// dependency on find.zig (smaller blast radius, no module
+/// coupling).
+fn appendChipRun(root: objc.Object, text: []const u8, color: chrome.Rgb, style: chrome.Style) void {
+    const NSString = objc.getClass("NSString") orelse return;
+    const NSColor = objc.getClass("NSColor") orelse return;
+    const NSDictionary = objc.getClass("NSDictionary") orelse return;
+    const NSAttributedString = objc.getClass("NSAttributedString") orelse return;
+    const NSFont = objc.getClass("NSFont") orelse return;
+    const NSParagraphStyle = objc.getClass("NSMutableParagraphStyle") orelse return;
+
+    var stack: [257]u8 = undefined;
+    const take = @min(text.len, stack.len - 1);
+    @memcpy(stack[0..take], text[0..take]);
+    stack[take] = 0;
+    const ns_text = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, &stack)});
+
+    const font = chrome.chromeFont(NSFont, style.font_family, style.font_size_chip);
+    const ns_color = chrome.nsColorFromRgb(NSColor, color);
+
+    // NSCenterTextAlignment = 2. Same horizontal-center idiom as
+    // the find chip so the needle doesn't jitter as it grows.
+    const para = NSParagraphStyle.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "init", .{});
+    defer para.msgSend(void, "release", .{});
+    para.msgSend(void, "setAlignment:", .{@as(c_long, 2)});
+
+    const fg_key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "NSColor")});
+    const font_key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "NSFont")});
+    const para_key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "NSParagraphStyle")});
+    const objects = [_]objc.c.id{ ns_color.value, font.value, para.value };
+    const keys = [_]objc.c.id{ fg_key.value, font_key.value, para_key.value };
+    const dict = NSDictionary.msgSend(
+        objc.Object,
+        "dictionaryWithObjects:forKeys:count:",
+        .{ &objects, &keys, @as(c_ulong, 3) },
+    );
+
+    const attr_alloc = NSAttributedString.msgSend(objc.Object, "alloc", .{});
+    const attr = attr_alloc.msgSend(objc.Object, "initWithString:attributes:", .{ ns_text, dict });
+    defer attr.msgSend(void, "release", .{});
+    root.msgSend(void, "appendAttributedString:", .{attr});
 }
 
 /// Re-skin the chip after a theme reload. Called from
