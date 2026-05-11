@@ -246,6 +246,7 @@ Tools update djinn's internal `AgentState`; the menubar polls at ~4Hz, the log p
 | Filter log entries   | `cmd+shift+L` — type, Esc clears, Return keeps |
 | Keymap cheatsheet    | `cmd+shift+.` — any key dismisses (Cmd+? is reserved by macOS) |
 | Duplicate profile    | `cmd+shift+N` — clones active profile, reloads via FSEvent |
+| Close profile        | `cmd+shift+W` — removes active profile from config (refuses last) |
 | Cycle theme override | `cmd+shift+T` — system → light → dark → system |
 | Quit                 | `cmd+Q` (from the menubar menu)      |
 
@@ -400,8 +401,8 @@ notify-rate-limit-ms = 30000        # u64 — milliseconds
 # Actions: copy, paste, scroll_page_up, scroll_page_down, font_inc, font_dec,
 #          font_reset, clear_scrollback, open_settings, toggle_log_pane,
 #          palette_open, log_filter_open, cheatsheet_open,
-#          profile_duplicate, theme_toggle, tab_1..tab_9, next_tab,
-#          prev_tab.
+#          profile_duplicate, profile_close, theme_toggle,
+#          tab_1..tab_9, next_tab, prev_tab.
 # Triggers: same modifier+key grammar as `hotkey`.
 # keybind = clear_scrollback=cmd+l
 # keybind = copy=cmd+c

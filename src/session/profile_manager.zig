@@ -104,6 +104,80 @@ fn appendProfileBlock(
     try file.writeAll(buf.items);
 }
 
+/// Bound to `profile_close` (Cmd+Shift+W). Removes the active
+/// session's `profile.<name>.*` block from
+/// `~/.config/djinn/config`. The existing FSEvent watcher fires
+/// reconcileProfiles which drops the session live — no in-process
+/// SessionManager surgery needed. Refuses to remove the last
+/// profile so djinn can't end up with zero sessions.
+pub fn closeActive() void {
+    const sm = app.g.session_manager orelse return;
+    const allocator = app.g.allocator orelse return;
+    if (sm.sessions.items.len < 2) {
+        hostLog("profile close: refusing to remove last profile", .{});
+        return;
+    }
+
+    const active_name = sm.active().profile.name;
+    // Copy the name out before mutating config — reconcileProfiles
+    // will free the original slice when it drops the session.
+    var name_buf: [128]u8 = undefined;
+    const name_len = @min(active_name.len, name_buf.len);
+    @memcpy(name_buf[0..name_len], active_name[0..name_len]);
+    const name_copy = name_buf[0..name_len];
+
+    removeProfileFromConfig(allocator, name_copy) catch |err| {
+        hostLog("profile close: write failed ({})", .{err});
+        return;
+    };
+    hostLog("profile close: removed '{s}' (reload in <1s)", .{name_copy});
+}
+
+fn removeProfileFromConfig(allocator: std.mem.Allocator, name: []const u8) !void {
+    const home = std.posix.getenv("HOME") orelse return error.NoHome;
+    const path = try std.fmt.allocPrint(allocator, "{s}/.config/djinn/config", .{home});
+    defer allocator.free(path);
+
+    const file = std.fs.openFileAbsolute(path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return error.NoConfigFile,
+        else => return err,
+    };
+    const contents = file.readToEndAlloc(allocator, 256 * 1024) catch |err| {
+        file.close();
+        return err;
+    };
+    file.close();
+    defer allocator.free(contents);
+
+    var prefix_buf: [144]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&prefix_buf, "profile.{s}.", .{name});
+    var default_buf: [160]u8 = undefined;
+    const default_line = try std.fmt.bufPrint(&default_buf, "default-profile = {s}", .{name});
+
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(allocator);
+    var w = buf.writer(allocator);
+
+    // Filter: drop `profile.<name>.*` lines + the matching
+    // `default-profile =` line. Everything else (other profiles,
+    // comments, blank lines) survives verbatim so existing
+    // structure stays intact.
+    var lines = std.mem.splitScalar(u8, contents, '\n');
+    var first = true;
+    while (lines.next()) |raw| {
+        const trim = std.mem.trim(u8, raw, " \t\r");
+        if (std.mem.startsWith(u8, trim, prefix)) continue;
+        if (std.mem.eql(u8, trim, default_line)) continue;
+        if (!first) try w.writeAll("\n");
+        first = false;
+        try w.writeAll(raw);
+    }
+
+    const out = std.fs.createFileAbsolute(path, .{ .truncate = true }) catch |err| return err;
+    defer out.close();
+    try out.writeAll(buf.items);
+}
+
 fn hostLog(comptime fmt: []const u8, args: anytype) void {
     var buf: [256]u8 = undefined;
     const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..0];

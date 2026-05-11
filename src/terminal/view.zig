@@ -1144,6 +1144,9 @@ var actions = [_]keymap.Action{
     .{ .name = "cheatsheet_open", .mods = mod_cmd | mod_shift, .keycode = 47, .handler = actionCheatsheetOpen },
     // Duplicate active profile — Cmd+Shift+N (kVK_ANSI_N = 45).
     .{ .name = "profile_duplicate", .mods = mod_cmd | mod_shift, .keycode = 45, .handler = actionProfileDuplicate },
+    // Close active profile — Cmd+Shift+W (kVK_ANSI_W = 13). Tab-close
+    // convention; refuses to remove the last profile.
+    .{ .name = "profile_close", .mods = mod_cmd | mod_shift, .keycode = 13, .handler = actionProfileClose },
     // Cycle theme override — Cmd+Shift+T (kVK_ANSI_T = 17).
     .{ .name = "theme_toggle", .mods = mod_cmd | mod_shift, .keycode = 17, .handler = actionThemeToggle },
     // Restart dead session — Cmd+R re-spawns with the same profile command.
@@ -1297,6 +1300,10 @@ fn actionCheatsheetOpen() void {
 
 fn actionProfileDuplicate() void {
     @import("../session/profile_manager.zig").duplicateActive();
+}
+
+fn actionProfileClose() void {
+    @import("../session/profile_manager.zig").closeActive();
 }
 
 fn actionThemeToggle() void {
