@@ -935,6 +935,13 @@ fn keyDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(
         return;
     }
 
+    // Log filter chip — same modal idiom as find / palette. Cmd-held
+    // chords fall through so the toggle (Cmd+Shift+L) stays reachable.
+    if (app.g.log_filter.mode and (flags & (mod_cmd | mod_control)) == 0) {
+        @import("../session/log_filter.zig").handleKey(event, keycode);
+        return;
+    }
+
     // IME slow path. When the input source is non-Latin (Kotoeri,
     // Pinyin, Hangul …) or we're already mid-composition, route the
     // event through AppKit's text input pipeline so insertText /
@@ -1119,6 +1126,8 @@ var actions = [_]keymap.Action{
     .{ .name = "prev_tab", .mods = mod_cmd | mod_shift, .keycode = 33, .handler = actionPrevTab },
     // Palette switcher — Cmd+Shift+P (kVK_ANSI_P = 35).
     .{ .name = "palette_open", .mods = mod_cmd | mod_shift, .keycode = 35, .handler = actionPaletteOpen },
+    // Log filter chip — Cmd+Shift+L (kVK_ANSI_L = 37).
+    .{ .name = "log_filter_open", .mods = mod_cmd | mod_shift, .keycode = 37, .handler = actionLogFilterOpen },
     // Restart dead session — Cmd+R re-spawns with the same profile command.
     .{ .name = "restart_session", .mods = mod_cmd, .keycode = 15, .handler = actionRestartSession },
     // Drop to a plain shell — Cmd+Shift+R forces /bin/zsh for the session.
@@ -1251,6 +1260,10 @@ fn actionPrevTab() void {
     const sm = app.g.session_manager orelse return;
     const idx = sm.peekPrev() orelse return;
     activateSessionByIndex(idx);
+}
+
+fn actionLogFilterOpen() void {
+    @import("../session/log_filter.zig").actionOpen();
 }
 
 fn actionPaletteOpen() void {

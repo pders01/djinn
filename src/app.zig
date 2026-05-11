@@ -66,6 +66,7 @@ pub const AppState = struct {
     session_manager: ?*@import("session/manager.zig").SessionManager = null,
     // Palette switcher (Cmd+Shift+P) ---------------------------------
     palette: PaletteState = .{},
+    log_filter: LogFilterState = .{},
 
 
     // ─── Sub-state types ───────────────────────────────────────────
@@ -191,6 +192,26 @@ pub const AppState = struct {
         /// Overlay NSView. Stashed so close() can pull it from the view
         /// tree without indexing into `container.subviews`.
         view_id: ?objc.c.id = null,
+    };
+
+    pub const LogFilterState = struct {
+        /// True while the log filter chip has focus. Routes printable
+        /// keys from `keyDownImpl` into `query_buf` instead of the
+        /// ghostty surface. Pattern mirrors `find.mode` /
+        /// `palette.mode`.
+        mode: bool = false,
+        /// Live filter needle. Even when `mode = false` the buffer
+        /// can hold a non-empty needle — the log view stays filtered
+        /// after the user exits the chip; clearing requires opening
+        /// the chip again + Esc (or typing a different needle).
+        query_buf: [128]u8 = [_]u8{0} ** 128,
+        query_len: usize = 0,
+        /// Inline chip NSTextField. Hidden via frame-to-zero when
+        /// neither `mode` is true nor `query_len > 0` — once a filter
+        /// is active the chip stays visible as the "filter on"
+        /// indicator even after the user moves focus back to the
+        /// terminal.
+        field_id: ?objc.c.id = null,
     };
 
     pub const FindState = struct {

@@ -37,6 +37,13 @@ pub const LogView = struct {
     /// visible so log entries scroll into view beneath it instead of
     /// hiding behind the chip on first paint.
     attention_inset_top: f64 = 16,
+    /// Free-text filter for log entries. When `filter_len > 0`,
+    /// syncFrom skips entries whose message doesn't contain the
+    /// needle (case-insensitive substring). Filter changes call
+    /// `rebuild` which clears the text storage and re-streams the
+    /// full ring filtered.
+    filter_buf: [128]u8 = [_]u8{0} ** 128,
+    filter_len: usize = 0,
     font: objc.Object,
     last_count: usize = 0,
     /// Tracks the client label of the previous entry so consecutive
@@ -287,10 +294,58 @@ pub const LogView = struct {
         }
 
         for (entries[self.last_count..]) |entry| {
+            if (!self.entryMatchesFilter(entry)) continue;
             self.appendEntry(entry);
         }
         self.last_count = entries.len;
 
+        self.text_view.msgSend(void, "scrollToEndOfDocument:", .{@as(?*anyopaque, null)});
+    }
+
+    /// Set the free-text filter needle. Subsequent `syncFrom` calls
+    /// (and the immediate `rebuild` here) only render entries whose
+    /// message contains `needle` (case-insensitive substring). Empty
+    /// needle = no filter.
+    pub fn setFilter(self: *LogView, needle: []const u8, agent_state: *AgentState) void {
+        const trim_len = @min(needle.len, self.filter_buf.len);
+        if (trim_len == self.filter_len and std.mem.eql(u8, needle[0..trim_len], self.filter_buf[0..self.filter_len])) return;
+
+        @memcpy(self.filter_buf[0..trim_len], needle[0..trim_len]);
+        self.filter_len = trim_len;
+        self.rebuild(agent_state);
+    }
+
+    /// Clear the active filter. Equivalent to `setFilter("", state)`.
+    pub fn clearFilter(self: *LogView, agent_state: *AgentState) void {
+        self.setFilter("", agent_state);
+    }
+
+    fn entryMatchesFilter(self: *const LogView, entry: LogEntry) bool {
+        if (self.filter_len == 0) return true;
+        return indexOfIgnoreCase(entry.message, self.filter_buf[0..self.filter_len]) != null;
+    }
+
+    /// Clear the text view + re-stream the full agent_state.log
+    /// through the filter. Called when `setFilter` changes the needle
+    /// — the streaming-append model can't retroactively hide entries
+    /// already rendered with the previous filter.
+    fn rebuild(self: *LogView, agent_state: *AgentState) void {
+        const NSString = objc.getClass("NSString") orelse return;
+        const empty = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "")});
+        if (empty.value != null) {
+            self.text_view.msgSend(void, "setString:", .{empty});
+        }
+        self.last_count = 0;
+        self.last_client_known = false;
+
+        agent_state.mutex.lock();
+        defer agent_state.mutex.unlock();
+        const entries = agent_state.log.items;
+        for (entries) |entry| {
+            if (!self.entryMatchesFilter(entry)) continue;
+            self.appendEntry(entry);
+        }
+        self.last_count = entries.len;
         self.text_view.msgSend(void, "scrollToEndOfDocument:", .{@as(?*anyopaque, null)});
     }
 
@@ -513,6 +568,32 @@ pub const NSRect = extern struct { origin: NSPoint, size: NSSize };
 /// Hour/minute are UTC (seconds since epoch math) — matches the source
 /// timestamps from `std.time.milliTimestamp` and stays stable across
 /// timezone changes / DST transitions on the host.
+/// Case-insensitive substring search used by `entryMatchesFilter`.
+/// ASCII-only — log messages from agent tooling are practically all
+/// ASCII, and a real Unicode-aware fold would drag in NSString just
+/// for this hot path.
+fn indexOfIgnoreCase(haystack: []const u8, needle: []const u8) ?usize {
+    if (needle.len == 0) return 0;
+    if (needle.len > haystack.len) return null;
+    var i: usize = 0;
+    while (i + needle.len <= haystack.len) : (i += 1) {
+        var j: usize = 0;
+        var match = true;
+        while (j < needle.len) : (j += 1) {
+            const a = haystack[i + j];
+            const b = needle[j];
+            const al = if (a >= 'A' and a <= 'Z') a + 32 else a;
+            const bl = if (b >= 'A' and b <= 'Z') b + 32 else b;
+            if (al != bl) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return i;
+    }
+    return null;
+}
+
 pub fn formatEntryHeader(buf: []u8, client: []const u8, timestamp_ms: i64) ?[:0]const u8 {
     const seconds: i64 = @divFloor(timestamp_ms, 1000);
     const hr: u32 = @intCast(@mod(@divFloor(seconds, 3600), 24));
@@ -568,4 +649,14 @@ test "formatEntryHeader: empty client" {
     var buf: [80]u8 = undefined;
     const hdr = formatEntryHeader(&buf, "", 0) orelse return error.TestFailed;
     try std.testing.expectEqualStrings(" · 00:00\n", hdr);
+}
+
+test "indexOfIgnoreCase: ascii folding" {
+    try std.testing.expectEqual(@as(?usize, 0), indexOfIgnoreCase("Hello", "hel"));
+    try std.testing.expectEqual(@as(?usize, 6), indexOfIgnoreCase("hello World", "world"));
+    try std.testing.expectEqual(@as(?usize, null), indexOfIgnoreCase("foo", "bar"));
+    // Empty needle matches at 0 (vacuous truth).
+    try std.testing.expectEqual(@as(?usize, 0), indexOfIgnoreCase("anything", ""));
+    // Needle longer than haystack.
+    try std.testing.expectEqual(@as(?usize, null), indexOfIgnoreCase("hi", "hello"));
 }
