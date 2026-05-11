@@ -301,6 +301,28 @@ fn loadConfigWithRetry(allocator: std.mem.Allocator) ?Config {
     return null;
 }
 
+/// Scan /tmp for `djinn-drop-*.png` files older than 1h and
+/// remove them. Called once at startup so `/tmp` doesn't grow
+/// unboundedly across launches. Failures are silent — a stale
+/// temp file is annoying, not breaking, and we don't want to
+/// block startup on a /tmp permission glitch.
+fn reapDragDropTemps() void {
+    var dir = std.fs.openDirAbsolute("/tmp", .{ .iterate = true }) catch return;
+    defer dir.close();
+    const now = std.time.timestamp();
+    const max_age_s: i64 = 3600;
+    var it = dir.iterate();
+    while (it.next() catch return) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.startsWith(u8, entry.name, "djinn-drop-")) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".png")) continue;
+        const stat = dir.statFile(entry.name) catch continue;
+        const mtime_s = @divTrunc(stat.mtime, std.time.ns_per_s);
+        if (now - mtime_s < max_age_s) continue;
+        dir.deleteFile(entry.name) catch continue;
+    }
+}
+
 /// Resolve which profile will be active at startup, mirroring
 /// `SessionManager.init`'s default-resolution rules. Pulled out so
 /// `restoreWindowSize` can pick the per-profile dims before the
@@ -404,6 +426,15 @@ pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
+
+    // Reap stale drag-drop temp files left behind by previous
+    // sessions. tryDropImage writes the path into the surface as
+    // bracketed-paste immediately, so by the next launch the
+    // agent has already consumed any file it cared about — the
+    // remainder is just /tmp pollution. 1h grace window protects
+    // a file freshly dropped in a still-open session that gets
+    // restarted.
+    reapDragDropTemps();
 
     // Tier-5 step 1: smoke-init the libghostty surface API. Sets
     // ghostty's global state + std.os.argv. Failures log + bail
