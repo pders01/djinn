@@ -242,6 +242,7 @@ Tools update djinn's internal `AgentState`; the menubar polls at ~4Hz, the log p
 | Toggle log pane      | `cmd+/`                              |
 | Filter log entries   | `cmd+shift+L` — type, Esc clears, Return keeps |
 | Keymap cheatsheet    | `cmd+?` — any key dismisses          |
+| Duplicate profile    | `cmd+shift+N` — clones active profile, reloads via FSEvent |
 | Quit                 | `cmd+Q` (from the menubar menu)      |
 
 The menubar dropdown also exposes show/hide, copy MCP config, and quit.
@@ -386,8 +387,8 @@ notify-rate-limit-ms = 30000        # u64 — milliseconds
 # Keymap overrides — `keybind = <action>=<trigger>`
 # Actions: copy, paste, scroll_page_up, scroll_page_down, font_inc, font_dec,
 #          font_reset, clear_scrollback, open_settings, toggle_log_pane,
-#          palette_open, log_filter_open, cheatsheet_open, tab_1..tab_9,
-#          next_tab, prev_tab.
+#          palette_open, log_filter_open, cheatsheet_open,
+#          profile_duplicate, tab_1..tab_9, next_tab, prev_tab.
 # Triggers: same modifier+key grammar as `hotkey`.
 # keybind = clear_scrollback=cmd+l
 # keybind = copy=cmd+c

@@ -1,0 +1,134 @@
+//! Profile manager — runtime profile duplication.
+//!
+//! Cmd+Shift+N appends a new `profile.<name>.*` block to
+//! `~/.config/djinn/config` derived from the currently-active
+//! session. The existing FSEvent watcher + `reconcileProfiles`
+//! pipeline picks the new entry up automatically — no in-process
+//! mutation of `Config.profiles.entries` required, and the file
+//! becomes the source of truth so subsequent restarts see the
+//! same profile.
+//!
+//! Append-only writeback: no structure-preserving editor — the
+//! new block goes to the bottom of the file regardless of where
+//! the source profile was declared. Comments + existing layout
+//! upstream are untouched.
+
+const std = @import("std");
+const objc = @import("objc");
+const app = @import("../app.zig");
+
+/// Bound to `profile_duplicate` (Cmd+Shift+N). Clones the active
+/// session's profile under a unique derived name + flushes the
+/// new block to disk. The reconcile path spawns the surface on
+/// the next FSEvent tick.
+pub fn duplicateActive() void {
+    const sm = app.g.session_manager orelse return;
+    const allocator = app.g.allocator orelse return;
+    if (sm.sessions.items.len == 0) return;
+
+    const active = sm.active();
+    const base_name = active.profile.name;
+
+    var name_buf: [128]u8 = undefined;
+    const new_name = deriveUniqueName(base_name, sm.sessions.items, &name_buf) catch {
+        hostLog("profile duplicate: could not derive unique name from '{s}'", .{base_name});
+        return;
+    };
+
+    appendProfileBlock(allocator, new_name, active.profile) catch |err| {
+        hostLog("profile duplicate: write failed ({})", .{err});
+        return;
+    };
+
+    hostLog("profile duplicate: '{s}' → '{s}' (reload in <1s)", .{ base_name, new_name });
+}
+
+/// Walk `<base>-2`, `<base>-3`, … until we find a suffix that
+/// isn't already in use. Bails after 256 attempts so a runaway
+/// caller can't pin the main thread.
+fn deriveUniqueName(
+    base: []const u8,
+    sessions: []const @import("manager.zig").Session,
+    out: []u8,
+) ![]const u8 {
+    var i: u32 = 2;
+    while (i < 256) : (i += 1) {
+        const candidate = try std.fmt.bufPrint(out, "{s}-{d}", .{ base, i });
+        var collision = false;
+        for (sessions) |s| {
+            if (std.mem.eql(u8, s.profile.name, candidate)) {
+                collision = true;
+                break;
+            }
+        }
+        if (!collision) return candidate;
+    }
+    return error.NoFreeName;
+}
+
+fn appendProfileBlock(
+    allocator: std.mem.Allocator,
+    new_name: []const u8,
+    src: @import("manager.zig").Profile,
+) !void {
+    const home = std.posix.getenv("HOME") orelse return error.NoHome;
+    const path = try std.fmt.allocPrint(allocator, "{s}/.config/djinn/config", .{home});
+    defer allocator.free(path);
+
+    // Open in append mode so existing content + comments stay
+    // intact. createFile + truncate is the wrong tool here.
+    const file = std.fs.openFileAbsolute(path, .{ .mode = .read_write }) catch |err| switch (err) {
+        error.FileNotFound => return error.NoConfigFile,
+        else => return err,
+    };
+    defer file.close();
+
+    try file.seekFromEnd(0);
+
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try w.print("\n# duplicated from '{s}' on {d}\n", .{ src.name, std.time.timestamp() });
+    try w.print("profile.{s}.command = {s}\n", .{ new_name, src.command });
+    if (src.cwd) |c| try w.print("profile.{s}.cwd = {s}\n", .{ new_name, c });
+    // Title decoration so the new tab is visually distinct from
+    // the source. Falls back to derived name when source has no
+    // explicit title.
+    if (src.title) |t| {
+        try w.print("profile.{s}.title = {s} (copy)\n", .{ new_name, t });
+    } else {
+        try w.print("profile.{s}.title = {s}\n", .{ new_name, new_name });
+    }
+
+    try file.writeAll(buf.items);
+}
+
+fn hostLog(comptime fmt: []const u8, args: anytype) void {
+    var buf: [256]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..0];
+    std.debug.print("{s}\n", .{msg});
+    if (app.g.agent.state) |st| st.appendLog(.info, msg) catch {};
+}
+
+test "deriveUniqueName: increments past collisions" {
+    const Session = @import("manager.zig").Session;
+    const sessions = [_]Session{
+        .{ .profile = .{ .name = "main", .command = "claude" } },
+        .{ .profile = .{ .name = "main-2", .command = "claude" } },
+        .{ .profile = .{ .name = "main-3", .command = "claude" } },
+    };
+    var buf: [128]u8 = undefined;
+    const name = try deriveUniqueName("main", &sessions, &buf);
+    try std.testing.expectEqualStrings("main-4", name);
+}
+
+test "deriveUniqueName: no collision returns -2" {
+    const Session = @import("manager.zig").Session;
+    const sessions = [_]Session{
+        .{ .profile = .{ .name = "main", .command = "claude" } },
+    };
+    var buf: [128]u8 = undefined;
+    const name = try deriveUniqueName("main", &sessions, &buf);
+    try std.testing.expectEqualStrings("main-2", name);
+}

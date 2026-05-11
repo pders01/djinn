@@ -1138,6 +1138,8 @@ var actions = [_]keymap.Action{
     .{ .name = "log_filter_open", .mods = mod_cmd | mod_shift, .keycode = 37, .handler = actionLogFilterOpen },
     // Cheatsheet — Cmd+? = Cmd+Shift+/ (kVK_ANSI_Slash = 44).
     .{ .name = "cheatsheet_open", .mods = mod_cmd | mod_shift, .keycode = 44, .handler = actionCheatsheetOpen },
+    // Duplicate active profile — Cmd+Shift+N (kVK_ANSI_N = 45).
+    .{ .name = "profile_duplicate", .mods = mod_cmd | mod_shift, .keycode = 45, .handler = actionProfileDuplicate },
     // Restart dead session — Cmd+R re-spawns with the same profile command.
     .{ .name = "restart_session", .mods = mod_cmd, .keycode = 15, .handler = actionRestartSession },
     // Drop to a plain shell — Cmd+Shift+R forces /bin/zsh for the session.
@@ -1285,6 +1287,10 @@ fn actionLogFilterOpen() void {
 
 fn actionCheatsheetOpen() void {
     @import("../session/cheatsheet.zig").actionOpen();
+}
+
+fn actionProfileDuplicate() void {
+    @import("../session/profile_manager.zig").duplicateActive();
 }
 
 fn actionPaletteOpen() void {
