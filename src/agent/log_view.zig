@@ -22,6 +22,21 @@ pub const LogView = struct {
     /// 1px-wide border view at x=0; tracks chip.border color across
     /// theme reloads via `applyStyle`.
     separator: objc.Object,
+    /// Sticky-attention chip floating above the scroll view. Visible
+    /// only when AgentState has a pinned attention message. Frame-to-
+    /// zero for hide because layer-backed setHidden races with
+    /// ghostty's CADisplayLink-driven repaints (see CLAUDE memory).
+    attention_banner: objc.Object,
+    attention_label: objc.Object,
+    /// Tracks the currently-displayed banner text so syncFrom can
+    /// skip the NSString rebuild when the pinned message hasn't
+    /// changed. Cleared when the banner hides.
+    attention_buf: [256]u8 = [_]u8{0} ** 256,
+    attention_len: usize = 0,
+    /// Banner reserves a chunk of textContainerInset.top when
+    /// visible so log entries scroll into view beneath it instead of
+    /// hiding behind the chip on first paint.
+    attention_inset_top: f64 = 16,
     font: objc.Object,
     last_count: usize = 0,
     /// Tracks the client label of the previous entry so consecutive
@@ -139,11 +154,55 @@ pub const LogView = struct {
         sep.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, 4 | 16)});
         wrapper.msgSend(void, "addSubview:", .{sep});
 
+        // Sticky attention banner. NSTextField wrapped in a chip-style
+        // NSView (lifted chip.bg + 1px chip.border outline). Built
+        // hidden (frame-to-zero); syncFrom sizes + shows it when an
+        // attention is pinned.
+        const NSTextField = objc.getClass("NSTextField") orelse return error.ClassNotFound;
+        const banner_alloc = NSView.msgSend(objc.Object, "alloc", .{});
+        const banner = banner_alloc.msgSend(objc.Object, "initWithFrame:", .{NSRect{
+            .origin = .{ .x = 0, .y = 0 },
+            .size = .{ .width = 0, .height = 0 },
+        }});
+        banner.msgSend(void, "setWantsLayer:", .{@as(c_int, 1)});
+        const banner_layer = banner.msgSend(objc.Object, "layer", .{});
+        if (banner_layer.value != null) {
+            const banner_bg = chrome.nsColorFromRgb(NSColor, style.chip.bg);
+            banner_layer.msgSend(void, "setBackgroundColor:", .{banner_bg.msgSend(?*anyopaque, "CGColor", .{})});
+            banner_layer.msgSend(void, "setCornerRadius:", .{@as(f64, 4)});
+            banner_layer.msgSend(void, "setBorderWidth:", .{@as(f64, 1)});
+            const banner_border = chrome.nsColorFromRgb(NSColor, style.chip.border);
+            banner_layer.msgSend(void, "setBorderColor:", .{banner_border.msgSend(?*anyopaque, "CGColor", .{})});
+        }
+        // NSViewMinYMargin (32) + NSViewWidthSizable (2) — pinned to
+        // wrapper top, stretches horizontally on resize.
+        banner.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, 32 | 2)});
+
+        const label_alloc = NSTextField.msgSend(objc.Object, "alloc", .{});
+        const label = label_alloc.msgSend(objc.Object, "initWithFrame:", .{NSRect{
+            .origin = .{ .x = 8, .y = 4 },
+            .size = .{ .width = 0, .height = 0 },
+        }});
+        label.msgSend(void, "setEditable:", .{@as(c_int, 0)});
+        label.msgSend(void, "setSelectable:", .{@as(c_int, 0)});
+        label.msgSend(void, "setBezeled:", .{@as(c_int, 0)});
+        label.msgSend(void, "setBordered:", .{@as(c_int, 0)});
+        label.msgSend(void, "setDrawsBackground:", .{@as(c_int, 0)});
+        label.msgSend(void, "setFont:", .{font});
+        const warn_ns = chrome.nsColorFromRgb(NSColor, style.warn);
+        label.msgSend(void, "setTextColor:", .{warn_ns});
+        // WidthSizable so the label tracks the banner width on resize.
+        label.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, 2)});
+        banner.msgSend(void, "addSubview:", .{label});
+        wrapper.msgSend(void, "addSubview:", .{banner});
+
         return .{
             .view = wrapper,
             .scroll = scroll,
             .text_view = tv,
             .separator = sep,
+            .attention_banner = banner,
+            .attention_label = label,
             .font = font,
             .bg = style.bg,
             .fg = style.fg,
@@ -189,12 +248,31 @@ pub const LogView = struct {
             sep_layer.msgSend(void, "setBackgroundColor:", .{sep_ns.msgSend(?*anyopaque, "CGColor", .{})});
         }
 
+        // Re-skin the sticky attention banner so a theme flip while
+        // an attention is pinned doesn't leave the chip on stale
+        // palette tones.
+        const banner_layer = self.attention_banner.msgSend(objc.Object, "layer", .{});
+        if (banner_layer.value != null) {
+            const banner_bg = chrome.nsColorFromRgb(NSColor, style.chip.bg);
+            banner_layer.msgSend(void, "setBackgroundColor:", .{banner_bg.msgSend(?*anyopaque, "CGColor", .{})});
+            const banner_border = chrome.nsColorFromRgb(NSColor, style.chip.border);
+            banner_layer.msgSend(void, "setBorderColor:", .{banner_border.msgSend(?*anyopaque, "CGColor", .{})});
+        }
+        const warn_ns = chrome.nsColorFromRgb(NSColor, style.warn);
+        self.attention_label.msgSend(void, "setTextColor:", .{warn_ns});
+
         self.view.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
         self.scroll.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
         self.text_view.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
     }
 
     pub fn syncFrom(self: *LogView, agent_state: *AgentState) void {
+        // Refresh the sticky attention banner first — it reads
+        // pinned_attention under the same mutex appendEntry needs, so
+        // doing it before the lock window avoids a second acquire on
+        // the AgentState mutex.
+        self.refreshAttentionBanner(agent_state);
+
         agent_state.mutex.lock();
         defer agent_state.mutex.unlock();
 
@@ -214,6 +292,79 @@ pub const LogView = struct {
         self.last_count = entries.len;
 
         self.text_view.msgSend(void, "scrollToEndOfDocument:", .{@as(?*anyopaque, null)});
+    }
+
+    /// Update the sticky attention banner from `pinned_attention`.
+    /// When pinned: chip floats at the top of the log pane with the
+    /// latest attention message + raises the text view's top inset so
+    /// log entries scroll into view below it. When unpinned: chip
+    /// frame goes to zero and the inset drops back to its base value.
+    fn refreshAttentionBanner(self: *LogView, agent_state: *AgentState) void {
+        var local_buf: [256]u8 = undefined;
+        const maybe_len = agent_state.pinnedAttention(&local_buf);
+
+        if (maybe_len) |len| {
+            const same = (len == self.attention_len) and
+                std.mem.eql(u8, local_buf[0..len], self.attention_buf[0..self.attention_len]);
+            if (same and self.attention_len > 0) return;
+
+            @memcpy(self.attention_buf[0..len], local_buf[0..len]);
+            self.attention_len = len;
+
+            const NSString = objc.getClass("NSString") orelse return;
+            var z: [257]u8 = undefined;
+            @memcpy(z[0..len], local_buf[0..len]);
+            z[len] = 0;
+            // Prefix the message with ⚠ — same visual semantic as the
+            // menubar attention SF Symbol, just inline in the chip so
+            // the banner reads as "user-action required" without the
+            // user needing to glance at the menubar.
+            var with_prefix_buf: [288]u8 = undefined;
+            const prefix = "⚠  ";
+            @memcpy(with_prefix_buf[0..prefix.len], prefix);
+            @memcpy(with_prefix_buf[prefix.len..][0..len], local_buf[0..len]);
+            with_prefix_buf[prefix.len + len] = 0;
+
+            const text = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, @ptrCast(&with_prefix_buf))});
+            if (text.value == null) return;
+            self.attention_label.msgSend(void, "setStringValue:", .{text});
+
+            // Size + show the banner. 28pt chip, 8px horizontal inset
+            // inside the wrapper. Pin to the top of the wrapper —
+            // banner.frame.y = wrapper.height - banner.height - 8.
+            const wrap_bounds = self.view.msgSend(NSRect, "bounds", .{});
+            const banner_h: f64 = 28;
+            const banner_y = wrap_bounds.size.height - banner_h - 8;
+            const banner_w = wrap_bounds.size.width - 8 - 16; // 8px left (after separator), 16px right
+            self.attention_banner.msgSend(void, "setFrame:", .{NSRect{
+                .origin = .{ .x = 8, .y = banner_y },
+                .size = .{ .width = banner_w, .height = banner_h },
+            }});
+            self.attention_label.msgSend(void, "setFrame:", .{NSRect{
+                .origin = .{ .x = 10, .y = 6 },
+                .size = .{ .width = banner_w - 12, .height = banner_h - 8 },
+            }});
+
+            // Push the text view's top inset down so the first log
+            // entry sits below the banner instead of being covered.
+            self.text_view.msgSend(void, "setTextContainerInset:", .{NSSize{
+                .width = 16,
+                .height = self.attention_inset_top + banner_h + 8,
+            }});
+        } else {
+            if (self.attention_len == 0) return;
+            self.attention_len = 0;
+            // Frame-to-zero hide (layer-backed setHidden races with
+            // ghostty's CADisplayLink on this view's layout).
+            self.attention_banner.msgSend(void, "setFrame:", .{NSRect{
+                .origin = .{ .x = 0, .y = 0 },
+                .size = .{ .width = 0, .height = 0 },
+            }});
+            self.text_view.msgSend(void, "setTextContainerInset:", .{NSSize{
+                .width = 16,
+                .height = self.attention_inset_top,
+            }});
+        }
     }
 
     fn appendEntry(self: *LogView, entry: LogEntry) void {

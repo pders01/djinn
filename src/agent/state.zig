@@ -33,6 +33,13 @@ pub const AgentState = struct {
     message: []const u8 = "",
     message_owned: bool = false,
     log: std.ArrayList(LogEntry) = .{},
+    /// Latest `attention` message that hasn't been auto-cleared by a
+    /// subsequent `done` / `idle` transition or explicitly acked by
+    /// the user. Surfaces in the log pane as a sticky banner so a
+    /// blocked agent stays visible even when the user wasn't looking
+    /// at the panel when the call arrived. Null = nothing pending.
+    pinned_attention: ?[]const u8 = null,
+    pinned_attention_owned: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) AgentState {
         return .{ .allocator = allocator };
@@ -42,6 +49,9 @@ pub const AgentState = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         if (self.message_owned) self.allocator.free(self.message);
+        if (self.pinned_attention_owned) {
+            if (self.pinned_attention) |p| self.allocator.free(p);
+        }
         for (self.log.items) |entry| {
             self.allocator.free(entry.message);
             if (entry.client) |c| self.allocator.free(c);
@@ -56,6 +66,37 @@ pub const AgentState = struct {
         self.message = try self.allocator.dupe(u8, message);
         self.message_owned = true;
         self.state = new_state;
+
+        // Sticky-attention bookkeeping. .attention pins the message;
+        // any non-attention transition (working / done / idle / error)
+        // clears the pin so the banner doesn't outstay its welcome —
+        // the log entry itself still records the event.
+        if (new_state == .attention) {
+            if (self.pinned_attention_owned) {
+                if (self.pinned_attention) |p| self.allocator.free(p);
+            }
+            self.pinned_attention = try self.allocator.dupe(u8, message);
+            self.pinned_attention_owned = true;
+        } else {
+            if (self.pinned_attention_owned) {
+                if (self.pinned_attention) |p| self.allocator.free(p);
+            }
+            self.pinned_attention = null;
+            self.pinned_attention_owned = false;
+        }
+    }
+
+    /// User-driven clear of the sticky attention banner. Distinct from
+    /// the auto-clear that fires on non-attention setState — lets the
+    /// user dismiss without waiting for the agent to follow up.
+    pub fn ackAttention(self: *AgentState) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        if (self.pinned_attention_owned) {
+            if (self.pinned_attention) |p| self.allocator.free(p);
+        }
+        self.pinned_attention = null;
+        self.pinned_attention_owned = false;
     }
 
     pub fn appendLog(self: *AgentState, level: LogEntry.Level, message: []const u8) !void {
@@ -98,6 +139,18 @@ pub const AgentState = struct {
         defer self.mutex.unlock();
         return .{ .state = self.state, .message = self.message };
     }
+
+    /// Borrow the pinned attention message under the state mutex. Caller
+    /// copies into a local buffer before releasing the mutex — the
+    /// slice's lifetime ends at the next setState / ackAttention call.
+    pub fn pinnedAttention(self: *AgentState, dst: []u8) ?usize {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const p = self.pinned_attention orelse return null;
+        const n = @min(p.len, dst.len);
+        @memcpy(dst[0..n], p[0..n]);
+        return n;
+    }
 };
 
 test "AgentState: setState updates" {
@@ -130,4 +183,39 @@ test "AgentState: log bounded at max_log_entries" {
         try s.appendLog(.info, "x");
     }
     try std.testing.expectEqual(max_log_entries, s.log.items.len);
+}
+
+test "AgentState: attention pins; done clears; ack clears" {
+    var s = AgentState.init(std.testing.allocator);
+    defer s.deinit();
+
+    try std.testing.expect(s.pinned_attention == null);
+    try s.setState(.attention, "need input");
+    try std.testing.expectEqualStrings("need input", s.pinned_attention.?);
+
+    // Latest attention overrides earlier pinned message.
+    try s.setState(.attention, "still blocked");
+    try std.testing.expectEqualStrings("still blocked", s.pinned_attention.?);
+
+    // .done auto-clears.
+    try s.setState(.done, "unstuck");
+    try std.testing.expect(s.pinned_attention == null);
+
+    // ack also clears.
+    try s.setState(.attention, "again");
+    try std.testing.expect(s.pinned_attention != null);
+    s.ackAttention();
+    try std.testing.expect(s.pinned_attention == null);
+}
+
+test "AgentState: pinnedAttention copies into caller buffer" {
+    var s = AgentState.init(std.testing.allocator);
+    defer s.deinit();
+
+    var buf: [32]u8 = undefined;
+    try std.testing.expect(s.pinnedAttention(&buf) == null);
+
+    try s.setState(.attention, "need input");
+    const n = s.pinnedAttention(&buf) orelse unreachable;
+    try std.testing.expectEqualStrings("need input", buf[0..n]);
 }
