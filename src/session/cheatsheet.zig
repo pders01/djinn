@@ -147,7 +147,7 @@ fn populateTextView(tv: objc.Object, style: chrome.Style) void {
     const root = root_alloc.msgSend(objc.Object, "init", .{});
     defer root.msgSend(void, "release", .{});
 
-    appendRun(root, NSString, NSColor, NSFont, NSDictionary, "Keyboard cheatsheet\n", style.fg, style, true);
+    appendRun(root, NSString, NSColor, NSFont, NSDictionary, "Keyboard cheatsheet\n", style.fg, style, false);
     appendRun(root, NSString, NSColor, NSFont, NSDictionary, "Esc to dismiss\n\n", style.dim, style, false);
 
     // 64 spaces — covers any realistic binding column width. Zig 0.15
@@ -167,7 +167,7 @@ fn populateTextView(tv: objc.Object, style: chrome.Style) void {
             spaces[0..pad_clamped],
             a.name,
         }) catch continue;
-        appendRun(root, NSString, NSColor, NSFont, NSDictionary, line, style.fg, style, false);
+        appendRun(root, NSString, NSColor, NSFont, NSDictionary, line, style.fg, style, true);
     }
 
     const ts = tv.msgSend(objc.Object, "textStorage", .{});
@@ -185,7 +185,7 @@ fn appendRun(
     text: []const u8,
     color: chrome.Rgb,
     style: chrome.Style,
-    bold: bool,
+    mono: bool,
 ) void {
     const NSAttributedString = objc.getClass("NSAttributedString") orelse return;
     var stack: [257]u8 = undefined;
@@ -194,8 +194,17 @@ fn appendRun(
     stack[take] = 0;
     const ns_text = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, &stack)});
 
-    const font = if (bold)
-        chrome.chromeFont(NSFont, style.font_family, style.font_size_sm)
+    // Body rows use the system monospaced font so the space-padded
+    // binding column actually lines up with the action names. The
+    // chrome UI font (San Francisco) is proportional — variable-
+    // width spaces would shift each row's name column independently
+    // and break the visual table. Header strings keep the chrome
+    // font for typographic consistency with the rest of djinn.
+    const font = if (mono)
+        NSFont.msgSend(objc.Object, "monospacedSystemFontOfSize:weight:", .{
+            style.font_size_sm,
+            @as(f64, 0), // NSFontWeightRegular
+        })
     else
         chrome.chromeFont(NSFont, style.font_family, style.font_size_sm);
     const ns_color = chrome.nsColorFromRgb(NSColor, color);

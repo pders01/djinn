@@ -1136,8 +1136,12 @@ var actions = [_]keymap.Action{
     .{ .name = "palette_open", .mods = mod_cmd | mod_shift, .keycode = 35, .handler = actionPaletteOpen },
     // Log filter chip — Cmd+Shift+L (kVK_ANSI_L = 37).
     .{ .name = "log_filter_open", .mods = mod_cmd | mod_shift, .keycode = 37, .handler = actionLogFilterOpen },
-    // Cheatsheet — Cmd+? = Cmd+Shift+/ (kVK_ANSI_Slash = 44).
-    .{ .name = "cheatsheet_open", .mods = mod_cmd | mod_shift, .keycode = 44, .handler = actionCheatsheetOpen },
+    // Cheatsheet — Cmd+Shift+. (kVK_ANSI_Period = 47). Cmd+? would
+    // be the conventional binding but macOS's system-wide "Show
+    // Help Menu" shortcut consumes Cmd+Shift+/ before the event
+    // reaches our keyDown handler, even in Accessory apps with no
+    // Help menu set. Period is unclaimed and stable across layouts.
+    .{ .name = "cheatsheet_open", .mods = mod_cmd | mod_shift, .keycode = 47, .handler = actionCheatsheetOpen },
     // Duplicate active profile — Cmd+Shift+N (kVK_ANSI_N = 45).
     .{ .name = "profile_duplicate", .mods = mod_cmd | mod_shift, .keycode = 45, .handler = actionProfileDuplicate },
     // Cycle theme override — Cmd+Shift+T (kVK_ANSI_T = 17).

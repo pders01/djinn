@@ -244,7 +244,7 @@ Tools update djinn's internal `AgentState`; the menubar polls at ~4Hz, the log p
 | Find on page         | `cmd+F` open, `cmd+G` next, `cmd+shift+G` prev |
 | Toggle log pane      | `cmd+/`                              |
 | Filter log entries   | `cmd+shift+L` — type, Esc clears, Return keeps |
-| Keymap cheatsheet    | `cmd+?` — any key dismisses          |
+| Keymap cheatsheet    | `cmd+shift+.` — any key dismisses (Cmd+? is reserved by macOS) |
 | Duplicate profile    | `cmd+shift+N` — clones active profile, reloads via FSEvent |
 | Cycle theme override | `cmd+shift+T` — system → light → dark → system |
 | Quit                 | `cmd+Q` (from the menubar menu)      |
