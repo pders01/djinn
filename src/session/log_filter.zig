@@ -86,6 +86,23 @@ pub fn handleKey(event: objc.Object, keycode: u16) void {
     refresh();
 }
 
+/// Called from `view.setLogPaneHidden(true)` when the pane goes
+/// hidden. Clears the filter + hides the chip so the surface
+/// state matches what the user can see — leaving the chip
+/// visible (and the underlying filter still active) over a
+/// hidden pane is a state leak the user can't dismiss without
+/// reopening the pane first.
+pub fn onPaneHidden() void {
+    app.g.log_filter.query_len = 0;
+    app.g.log_filter.mode = false;
+    if (app.g.agent.log_view) |lv| {
+        if (app.g.agent.state) |st| lv.clearFilter(st);
+    }
+    if (app.g.log_filter.field_id) |fid| {
+        objc.Object.fromId(fid).msgSend(void, "setHidden:", .{@as(c_int, 1)});
+    }
+}
+
 fn exitMode() void {
     app.g.log_filter.mode = false;
     refresh();

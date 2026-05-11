@@ -1253,6 +1253,12 @@ pub fn setLogPaneHidden(hide: bool) void {
     const term_w: f64 = @max(1.0, c_bounds.size.width - log_w - eff_div_w);
 
     applyLogLayout(container, term_w, log_w, c_bounds.size.height);
+
+    // Clear log filter state when the pane hides — chip is a
+    // subview of the log pane wrapper, so without this the chip
+    // stays on screen at frame-zero size + the filter mode keeps
+    // routing printable keys away from the surface.
+    if (hide) @import("../session/log_filter.zig").onPaneHidden();
 }
 
 fn actionClearScrollback() void {
