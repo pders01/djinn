@@ -173,9 +173,21 @@ fn removeProfileFromConfig(allocator: std.mem.Allocator, name: []const u8) !void
         try w.writeAll(raw);
     }
 
-    const out = std.fs.createFileAbsolute(path, .{ .truncate = true }) catch |err| return err;
-    defer out.close();
-    try out.writeAll(buf.items);
+    // Atomic write: tmp file + rename. A truncate-write would
+    // leave a zero-byte config visible to djinn's FSEvent reload
+    // if djinn crashes (or is killed) between truncate and write
+    // completion — that's parsed as an empty Config which silently
+    // drops every profile. The rename swap means the on-disk file
+    // is always either the previous content or the new content,
+    // never partially written.
+    const tmp_path = try std.fmt.allocPrint(allocator, "{s}.tmp", .{path});
+    defer allocator.free(tmp_path);
+    {
+        const out = try std.fs.createFileAbsolute(tmp_path, .{ .truncate = true });
+        defer out.close();
+        try out.writeAll(buf.items);
+    }
+    try std.fs.renameAbsolute(tmp_path, path);
 }
 
 fn hostLog(comptime fmt: []const u8, args: anytype) void {
