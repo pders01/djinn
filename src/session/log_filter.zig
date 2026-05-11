@@ -113,8 +113,13 @@ fn applyToLogView() void {
 /// without rebuilding the view.
 fn ensureChip() void {
     if (app.g.log_filter.field_id != null) return;
-    const container_id = app.g.layout.container_id orelse return;
-    const container = objc.Object.fromId(container_id);
+    // Mount on the LogView wrapper. The chip is semantically
+    // associated with the log pane (it filters log entries), so
+    // anchoring it inside the pane's own coord space keeps it
+    // visually attached to the surface it acts on — and the find
+    // chip stays where it belongs (over the terminal area).
+    const lv = app.g.agent.log_view orelse return;
+    const container = lv.view;
 
     const NSTextField = objc.getClass("NSTextField") orelse return;
     const NSColor = objc.getClass("NSColor") orelse return;
@@ -210,27 +215,18 @@ fn refresh() void {
 
     const text_size = root.msgSend(NSSize, "size", .{});
     const tf_h: f64 = 24;
-    const margin: f64 = 14;
+    const margin: f64 = 10;
     const pad_x: f64 = 32;
     const new_w = @ceil(text_size.width) + pad_x;
-    const container_id = app.g.layout.container_id orelse return;
-    const container = objc.Object.fromId(container_id);
-    const c_frame = container.msgSend(NSRect, "frame", .{});
 
-    // Place log chip on the SAME vertical offset as the find chip
-    // and stack horizontally to its left. The find chip sits at
-    // `parent_width - find_width - margin`; we anchor against the
-    // find chip's actual frame (queried live, since its width
-    // tracks the needle) so the gap stays constant regardless of
-    // find chip state. Falls back to the top-right corner when
-    // find chip isn't mounted yet (find_id null).
-    const gap: f64 = 6;
-    const right_x: f64 = if (app.g.find.field_id) |find_id| blk: {
-        const find_tf = objc.Object.fromId(find_id);
-        const find_frame = find_tf.msgSend(NSRect, "frame", .{});
-        break :blk find_frame.origin.x - gap - new_w;
-    } else c_frame.size.width - new_w - margin;
-    const y = c_frame.size.height - tf_h - margin;
+    // Anchor inside the log pane wrapper. Top-right of the pane,
+    // small inset on each side. Frame in the wrapper's own coord
+    // space — autoresize mask keeps it pinned as the pane resizes
+    // via the splitview drag handle.
+    const lv = app.g.agent.log_view orelse return;
+    const w_frame = lv.view.msgSend(NSRect, "frame", .{});
+    const right_x = w_frame.size.width - new_w - margin;
+    const y = w_frame.size.height - tf_h - margin;
     tf.msgSend(void, "setFrame:", .{NSRect{
         .origin = .{ .x = right_x, .y = y },
         .size = .{ .width = new_w, .height = tf_h },
