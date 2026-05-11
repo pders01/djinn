@@ -215,13 +215,16 @@ The token is regenerated and the port re-bound on each launch — re-paste after
 
 ## Tool surface
 
-| Tool              | Purpose                                                      |
-|-------------------|--------------------------------------------------------------|
-| `djinn_attention` | "I need user input" — flashes the menubar to attention state |
-| `djinn_progress`  | "Working on X (3/8)" — menubar text update                   |
-| `djinn_done`      | Task complete; menubar returns to a quiescent icon           |
-| `djinn_error`     | Task failed                                                  |
-| `djinn_log`       | Append a structured event to djinn's side log panel          |
+| Tool                       | Purpose                                                      |
+|----------------------------|--------------------------------------------------------------|
+| `djinn_attention`          | "I need user input" — flashes the menubar to attention state |
+| `djinn_progress`           | "Working on X (3/8)" — menubar text update                   |
+| `djinn_done`               | Task complete; menubar returns to a quiescent icon           |
+| `djinn_error`              | Task failed                                                  |
+| `djinn_log`                | Append a structured event to djinn's side log panel          |
+| `djinn_recent_logs`        | Read recent log entries (JSON array)                         |
+| `djinn_recent_attentions`  | Read pinned attention + recent warn entries (JSON object)    |
+| `djinn_active_profile`     | Read active profile name / label / cwd / spawn command       |
 
 Tools update djinn's internal `AgentState`; the menubar polls at ~4Hz, the log panel at the same cadence.
 

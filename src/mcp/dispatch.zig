@@ -67,10 +67,15 @@ pub const Dispatcher = struct {
             const call_result = self.tool_table.call(self.tool_table.ctx, allocator, name_v.string, args, client) catch return errorResult(-32603, "tool call failed");
 
             const is_err: []const u8 = if (call_result.is_error) "true" else "false";
+            // Escape the text content so tools can return JSON-shaped
+            // payloads (read tools do this) without breaking the
+            // enclosing JSON-RPC envelope.
+            const escaped = jsonEscape(allocator, call_result.text) catch return errorResult(-32603, "internal");
+            defer allocator.free(escaped);
             const result = std.fmt.allocPrint(
                 allocator,
                 "{{\"content\":[{{\"type\":\"text\",\"text\":\"{s}\"}}],\"isError\":{s}}}",
-                .{ call_result.text, is_err },
+                .{ escaped, is_err },
             ) catch return errorResult(-32603, "internal");
             return .{ .result = result };
         }
@@ -81,6 +86,52 @@ pub const Dispatcher = struct {
 
 fn errorResult(code: i32, msg: []const u8) McpServer.DispatchResult {
     return .{ .err_code = code, .err_message = msg };
+}
+
+/// Escape a string for safe inclusion as a JSON string literal.
+/// Caller owns the returned slice. Handles ", \, control chars per
+/// RFC 8259 §7. Worst case ~6× expansion (control byte → \uXXXX);
+/// preallocated upper bound covers it.
+pub fn jsonEscape(allocator: std.mem.Allocator, s: []const u8) ![]const u8 {
+    var buf = try allocator.alloc(u8, s.len * 6 + 1);
+    var n: usize = 0;
+    for (s) |c| switch (c) {
+        '"' => { buf[n] = '\\'; buf[n + 1] = '"'; n += 2; },
+        '\\' => { buf[n] = '\\'; buf[n + 1] = '\\'; n += 2; },
+        '\n' => { buf[n] = '\\'; buf[n + 1] = 'n'; n += 2; },
+        '\r' => { buf[n] = '\\'; buf[n + 1] = 'r'; n += 2; },
+        '\t' => { buf[n] = '\\'; buf[n + 1] = 't'; n += 2; },
+        0...0x08, 0x0b, 0x0c, 0x0e...0x1f => {
+            const hex = "0123456789abcdef";
+            buf[n + 0] = '\\';
+            buf[n + 1] = 'u';
+            buf[n + 2] = '0';
+            buf[n + 3] = '0';
+            buf[n + 4] = hex[(c >> 4) & 0xF];
+            buf[n + 5] = hex[c & 0xF];
+            n += 6;
+        },
+        else => {
+            buf[n] = c;
+            n += 1;
+        },
+    };
+    return try allocator.realloc(buf, n);
+}
+
+test "jsonEscape: passthrough + escape" {
+    const a = std.testing.allocator;
+    const e1 = try jsonEscape(a, "hello");
+    defer a.free(e1);
+    try std.testing.expectEqualStrings("hello", e1);
+
+    const e2 = try jsonEscape(a, "he said \"hi\"");
+    defer a.free(e2);
+    try std.testing.expectEqualStrings("he said \\\"hi\\\"", e2);
+
+    const e3 = try jsonEscape(a, "line1\nline2");
+    defer a.free(e3);
+    try std.testing.expectEqualStrings("line1\\nline2", e3);
 }
 
 test "Dispatcher: initialize returns protocol envelope" {

@@ -113,7 +113,32 @@ pub const ToolTable = struct {
             return .{ .text = "ack" };
         }
 
-        _ = allocator;
+        // Read tools — agents call these to introspect user-visible
+        // state (recent log entries, pinned attention, active profile)
+        // and decide whether to push more context or back off. Pairs
+        // with the write surface so a multi-agent session can act on
+        // what the user is actually seeing.
+        if (std.mem.eql(u8, name, "djinn_recent_logs")) {
+            const max_n: usize = blk: {
+                const v = intArg(args, "count") orelse break :blk 50;
+                if (v <= 0) break :blk 50;
+                if (v > 256) break :blk 256;
+                break :blk @intCast(v);
+            };
+            const text = try renderRecentLogs(allocator, self.state, max_n);
+            return .{ .text = text };
+        }
+
+        if (std.mem.eql(u8, name, "djinn_recent_attentions")) {
+            const text = try renderRecentAttentions(allocator, self.state);
+            return .{ .text = text };
+        }
+
+        if (std.mem.eql(u8, name, "djinn_active_profile")) {
+            const text = try renderActiveProfile(allocator);
+            return .{ .text = text };
+        }
+
         return .{ .text = "unknown tool", .is_error = true };
     }
 };
@@ -124,6 +149,135 @@ fn stringArg(args: ?json.Value, key: []const u8) ?[]const u8 {
     const v = a.object.get(key) orelse return null;
     if (v != .string) return null;
     return v.string;
+}
+
+fn intArg(args: ?json.Value, key: []const u8) ?i64 {
+    const a = args orelse return null;
+    if (a != .object) return null;
+    const v = a.object.get(key) orelse return null;
+    if (v != .integer) return null;
+    return v.integer;
+}
+
+const dispatch_mod = @import("dispatch.zig");
+
+/// Build a JSON array of the last `max_n` log entries. Each entry
+/// renders as `{"ts":<i64>,"level":"info|warn|error","message":"…",
+/// "client":"…"}`. Message + client are JSON-escaped via
+/// `dispatch.jsonEscape`. Caller owns the returned slice; allocator
+/// is the per-request arena so freeing is automatic on response.
+fn renderRecentLogs(allocator: std.mem.Allocator, state: *AgentState, max_n: usize) ![]const u8 {
+    state.mutex.lock();
+    defer state.mutex.unlock();
+
+    var buf: std.ArrayList(u8) = .{};
+    errdefer buf.deinit(allocator);
+    var w = buf.writer(allocator);
+
+    const total = state.log.items.len;
+    const start = if (total > max_n) total - max_n else 0;
+
+    try w.writeAll("[");
+    var first = true;
+    for (state.log.items[start..]) |entry| {
+        if (!first) try w.writeAll(",");
+        first = false;
+        const level_str = switch (entry.level) {
+            .info => "info",
+            .warn => "warn",
+            .err => "error",
+        };
+        const msg_esc = try dispatch_mod.jsonEscape(allocator, entry.message);
+        defer allocator.free(msg_esc);
+        try w.print("{{\"ts\":{d},\"level\":\"{s}\",\"message\":\"{s}\"", .{
+            entry.timestamp_ms,
+            level_str,
+            msg_esc,
+        });
+        if (entry.client) |c| {
+            const c_esc = try dispatch_mod.jsonEscape(allocator, c);
+            defer allocator.free(c_esc);
+            try w.print(",\"client\":\"{s}\"", .{c_esc});
+        }
+        try w.writeAll("}");
+    }
+    try w.writeAll("]");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Build a JSON object describing the current attention surface:
+/// `{"pinned":"…"|null,"recent":[<warn-level log entries>]}`. The
+/// `recent` array uses the same shape as `djinn_recent_logs` but
+/// filtered to warn entries — same source the menubar / banner
+/// consume.
+fn renderRecentAttentions(allocator: std.mem.Allocator, state: *AgentState) ![]const u8 {
+    state.mutex.lock();
+    defer state.mutex.unlock();
+
+    var buf: std.ArrayList(u8) = .{};
+    errdefer buf.deinit(allocator);
+    var w = buf.writer(allocator);
+
+    try w.writeAll("{\"pinned\":");
+    if (state.pinned_attention) |p| {
+        const esc = try dispatch_mod.jsonEscape(allocator, p);
+        defer allocator.free(esc);
+        try w.print("\"{s}\"", .{esc});
+    } else {
+        try w.writeAll("null");
+    }
+
+    try w.writeAll(",\"recent\":[");
+    var first = true;
+    for (state.log.items) |entry| {
+        if (entry.level != .warn) continue;
+        if (!first) try w.writeAll(",");
+        first = false;
+        const msg_esc = try dispatch_mod.jsonEscape(allocator, entry.message);
+        defer allocator.free(msg_esc);
+        try w.print("{{\"ts\":{d},\"message\":\"{s}\"", .{ entry.timestamp_ms, msg_esc });
+        if (entry.client) |c| {
+            const c_esc = try dispatch_mod.jsonEscape(allocator, c);
+            defer allocator.free(c_esc);
+            try w.print(",\"client\":\"{s}\"", .{c_esc});
+        }
+        try w.writeAll("}");
+    }
+    try w.writeAll("]}");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// Build a JSON object describing the active profile:
+/// `{"name":"…","label":"…","cwd":"…"|null,"command":"…"}`. Pulls
+/// from `app.g.session_manager.active()`.
+fn renderActiveProfile(allocator: std.mem.Allocator) ![]const u8 {
+    const sm = app_state.g.session_manager orelse return try allocator.dupe(u8, "{\"name\":null}");
+    if (sm.sessions.items.len == 0) return try allocator.dupe(u8, "{\"name\":null}");
+    const active = sm.active();
+
+    var buf: std.ArrayList(u8) = .{};
+    errdefer buf.deinit(allocator);
+    var w = buf.writer(allocator);
+
+    const name_esc = try dispatch_mod.jsonEscape(allocator, active.profile.name);
+    defer allocator.free(name_esc);
+    const label_esc = try dispatch_mod.jsonEscape(allocator, active.profile.label());
+    defer allocator.free(label_esc);
+    const cmd_esc = try dispatch_mod.jsonEscape(allocator, active.profile.command);
+    defer allocator.free(cmd_esc);
+
+    try w.print("{{\"name\":\"{s}\",\"label\":\"{s}\",\"command\":\"{s}\"", .{
+        name_esc, label_esc, cmd_esc,
+    });
+    if (active.profile.cwd) |c| {
+        const c_esc = try dispatch_mod.jsonEscape(allocator, c);
+        defer allocator.free(c_esc);
+        try w.print(",\"cwd\":\"{s}\"", .{c_esc});
+    } else {
+        try w.writeAll(",\"cwd\":null");
+    }
+    try w.writeAll("}");
+    return buf.toOwnedSlice(allocator);
 }
 
 const tools_json =
@@ -183,6 +337,26 @@ const tools_json =
     \\      },
     \\      "required": ["message"]
     \\    }
+    \\  },
+    \\  {
+    \\    "name": "djinn_recent_logs",
+    \\    "description": "Read recent log entries from djinn's side panel. Use to introspect what the user has already seen — decide whether to push more context or back off if the panel is already busy. Returns a JSON array of {ts, level, message, client?} objects.",
+    \\    "inputSchema": {
+    \\      "type": "object",
+    \\      "properties": {
+    \\        "count": { "type": "integer", "description": "Max entries to return (default 50, max 256)" }
+    \\      }
+    \\    }
+    \\  },
+    \\  {
+    \\    "name": "djinn_recent_attentions",
+    \\    "description": "Read the current attention surface: the pinned message (if any) plus recent warn-level entries. Returns a JSON object {pinned: string|null, recent: [...]}. Use to check whether the user has unacknowledged blocks before queuing another attention.",
+    \\    "inputSchema": { "type": "object", "properties": {} }
+    \\  },
+    \\  {
+    \\    "name": "djinn_active_profile",
+    \\    "description": "Read the active djinn profile (name, label, cwd, spawn command). Useful for multi-profile setups where the agent's behavior should depend on which session the user is currently looking at.",
+    \\    "inputSchema": { "type": "object", "properties": {} }
     \\  }
     \\]
 ;
@@ -310,4 +484,68 @@ test "ToolTable: client label flows into log entry" {
 
     _ = try t.call(t.ctx, std.testing.allocator, "djinn_log", parsed.value, "abc123");
     try std.testing.expectEqualStrings("abc123", s.log.items[0].client.?);
+}
+
+test "renderRecentLogs: empty state yields empty array" {
+    var s = AgentState.init(std.testing.allocator);
+    defer s.deinit();
+    const out = try renderRecentLogs(std.testing.allocator, &s, 10);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("[]", out);
+}
+
+test "renderRecentLogs: shape + client field" {
+    var s = AgentState.init(std.testing.allocator);
+    defer s.deinit();
+    try s.appendLog(.info, "hello");
+    try s.appendLogFrom(.warn, "need input", "abc123");
+    const out = try renderRecentLogs(std.testing.allocator, &s, 10);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"level\":\"info\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"message\":\"hello\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"level\":\"warn\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"client\":\"abc123\"") != null);
+}
+
+test "renderRecentLogs: count caps tail" {
+    var s = AgentState.init(std.testing.allocator);
+    defer s.deinit();
+    try s.appendLog(.info, "a");
+    try s.appendLog(.info, "b");
+    try s.appendLog(.info, "c");
+    const out = try renderRecentLogs(std.testing.allocator, &s, 2);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"message\":\"a\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"message\":\"b\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"message\":\"c\"") != null);
+}
+
+test "renderRecentAttentions: pinned + recent warn filter" {
+    var s = AgentState.init(std.testing.allocator);
+    defer s.deinit();
+    try s.setState(.attention, "blocked");
+    try s.appendLog(.info, "noise");
+    try s.appendLog(.warn, "earlier attention");
+    const out = try renderRecentAttentions(std.testing.allocator, &s);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"pinned\":\"blocked\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "earlier attention") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "noise") == null);
+}
+
+test "renderRecentAttentions: no pin null" {
+    var s = AgentState.init(std.testing.allocator);
+    defer s.deinit();
+    const out = try renderRecentAttentions(std.testing.allocator, &s);
+    defer std.testing.allocator.free(out);
+    try std.testing.expectEqualStrings("{\"pinned\":null,\"recent\":[]}", out);
+}
+
+test "renderRecentLogs: escapes quotes in message" {
+    var s = AgentState.init(std.testing.allocator);
+    defer s.deinit();
+    try s.appendLog(.info, "he said \"hi\"");
+    const out = try renderRecentLogs(std.testing.allocator, &s, 10);
+    defer std.testing.allocator.free(out);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\\\"hi\\\"") != null);
 }
