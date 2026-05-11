@@ -29,6 +29,123 @@ across rebuilds. Local iteration no longer needs `tccutil reset`.
 
 ## Open work — pick from here
 
+### Roadmap from UX review (2026-05-11)
+
+Full review in conversation; consolidated tier list below. Friction
+themes:
+
+- No first-run flow; user reads 200-line README before hotkey works.
+- MCP endpoint rotates per launch → re-paste into every project.
+- `djinn_attention` is one-way; user must context-switch to terminal.
+- Log pane is fire-and-forget — no filter, search, copy-entry, jump.
+- Multi-client confusion (raw 6-hex client ids, no nickname / mute).
+- Notification spam from `djinn_progress` floods Notification Center.
+- No keyboard discovery (`Cmd+?` cheatsheet absent).
+- Window size memory is global, not per-profile.
+- Profile creation is config-file-only (Cmd+Shift+N overlay missing).
+- Drag-drop image temp files in `/tmp/djinn-drop-*` never reaped.
+
+**Deferred Tier S items** (recorded for later):
+
+- **S1 — inline reply to `djinn_attention`**: agent calls
+  `djinn_ask(message, expects, choices?)`, mini-panel drops with
+  prompt, reply routes back through tool response or
+  `surface_input_text`. Defer — long-poll semantics on the MCP side
+  + reply panel + agent-side schema all need design first.
+- **S2 — first-run setup wizard**: drop-down with hotkey picker
+  (conflict check), provider/profile picker, MCP snippet copy
+  button. Defer — needs UX mock + decision on whether to write
+  config from UI vs. open editor.
+- **S3 — stable MCP endpoint (opt-in)**: `mcp.stable_port` +
+  `mcp.stable_token_path`. **Security concern** — a long-lived
+  bearer token in a flat file is a credentials-on-disk surface; a
+  malicious local process can read it and impersonate any agent.
+  Defer until we can pair with a keychain-backed token store +
+  `chmod 600` enforcement.
+
+**Tier S4 — Cmd+? cheatsheet overlay** *(early candidate, picked up
+after Tier A pass)*. Reuse `session/palette.zig` overlay pattern;
+render `actions[]` grouped by category, reflect user keymap
+overrides. Reuses `chrome.Style`; standalone module
+`session/cheatsheet.zig`.
+
+**Tier A — high value, medium cost (target this pass):**
+
+1. **Log pane v2** — filter chips (per-client, per-level, free-text
+   search debounced), click-to-copy entry, sticky "active
+   attentions" pinned until acked. Backfill: extend `djinn_log`
+   schema with optional `kind` / `file` / `line` / `tag`. Per-row
+   NSView refactor still gated by per-call expansion (see deferred
+   section below).
+2. **Per-client identity surface** — replace 6-hex client id with
+   user-set nickname (`client.<hash>.name = "review-bot"` in
+   config). Color-coded chip per client in log + tab strip dot when
+   client is active. Per-client mute toggle (notifications off,
+   still logged).
+3. **Notification policy** — coalesce `djinn_progress` (max 1
+   banner per 30s per client); banner only on attention / error /
+   done by default. Config keys
+   `notifications.progress_rate_limit_ms`,
+   `notifications.banner_states`.
+4. **Profile manager overlay (Cmd+Shift+N)** — append-only
+   writeback to config (path 1 from the deferred "dynamic profile
+   creation" section above); "duplicate active profile" preset;
+   show resolved cwd + spawn command per profile. The
+   palette-switcher UX is the natural surface.
+5. **Session resume** *(deferred — ghostty API gap)*. ghostty
+   exposes `ghostty_surface_read_text` (selection-based) but no
+   `inject_text` / `write_to_scrollback`. We can dump scrollback
+   to disk on hide for audit-style replay but cannot restore it
+   into a fresh surface on the next show — the PTY child writes
+   into a clean buffer. Either:
+   - Wait for upstream ghostty to expose a scrollback-inject API,
+     then restore the captured text into the new surface.
+   - Ship a "previous session log" disk artifact instead and surface
+     its path in the agent log on next show (degraded UX —
+     scrollback lives outside the live terminal).
+   Revisit when upstream lands the inject path.
+6. **Window-per-profile size memory** — currently `state.json`
+   tracks one global size. Split into
+   `state.profiles[<name>].{w,h,pos}` so log-heavy profile (Claude
+   review) can be tall+wide while shell profile stays compact.
+
+**Tier B — quality-of-life:**
+
+7. Paste history palette (Cmd+Shift+V) backed by host-side ring.
+8. Quick-send palette (Cmd+K when not at prompt) — type command,
+   Enter → inject into active surface.
+9. Selection → MCP push (Cmd+Shift+L) — selection becomes
+   `djinn_log(info, <text>)` so the agent can introspect what the
+   user pinned. Pairs with MCP read tools below.
+10. **MCP read tools** — `djinn_recent_logs(n)`,
+    `djinn_recent_attentions()`, `djinn_active_profile()`. Mirrors
+    the write surface; lets agents read user-visible state.
+11. Theme toggle hotkey (`Cmd+Shift+T`) cycles light → dark → auto.
+12. Drag-drop image temp cleanup on launch + on panel hide. Reap
+    `/tmp/djinn-drop-*` so the dir doesn't grow forever.
+13. Find chip toggles *(deferred — ghostty API gap)*. The
+    `ghostty_action_start_search_s` struct in ghostty.h carries
+    only `const char* needle`; case / regex / word flags aren't
+    exposed in the C API and the `search:<needle>` binding
+    action grammar takes a plain needle. Without upstream
+    additions, UI toggles wouldn't change search behaviour. Wait
+    for upstream to surface the flags or wire host-side regex on
+    top of `ghostty_surface_read_text` snapshots (expensive on
+    large scrollbacks).
+14. Mouse-less terminal nav — `Cmd+J` jump-to-prompt (regex per
+    profile). Skips most scrollback dragging.
+15. Per-profile bell config (`profile.<name>.bell-audible = false`).
+
+**Tier C — speculative / lower payoff:**
+
+16. Pinned attentions (survive panel hide until manually cleared).
+17. Activity heatmap sparkline in tab strip (log-rate per profile,
+    last 5 min).
+18. Spotlight-style action palette (restart session, clear
+    scrollback, switch theme, open settings, copy MCP config).
+19. WebUI mirror (`:port+1`) for second-monitor read-only log
+    dashboard; reuses MCP server thread.
+
 ### Per-profile env vars *(low priority — script subsumes)*
 
 `profile.<name>.script` already lets users export env vars before
