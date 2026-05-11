@@ -327,6 +327,14 @@ provider = generic
 # profile.work.script = ~/.config/djinn/profiles/work.sh
 # profile.work.cwd    = ~/projects/work
 # profile.work.title  = work claude
+#
+# Per-profile bell overrides fall through to the global bell.*
+# settings when unset. Useful for muting a chatter profile (working
+# Claude session) while keeping the bell on for interactive shells.
+#
+# profile.work.bell-audible = false
+# profile.work.bell-visual  = true
+# profile.work.bell-sound   = Pop
 
 # Theme — falls through to ghostty's resolved config when
 # inherit-ghostty=true (default). Overrides only listed below.

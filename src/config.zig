@@ -101,6 +101,13 @@ pub const Config = struct {
         /// terminal. `~`-relative paths are expanded at SessionManager
         /// resolve time.
         script: ?[]const u8 = null,
+        /// Per-profile bell overrides. null = inherit the global
+        /// `bell.*` config. Lets the user silence chatter profiles
+        /// (a working Claude session) while keeping the bell on for
+        /// interactive shells.
+        bell_audible: ?bool = null,
+        bell_visual: ?bool = null,
+        bell_sound: ?[]const u8 = null,
     };
 
     /// User-set per-client identity. The key matches the 6-hex client
@@ -521,6 +528,17 @@ pub const Config = struct {
         }
 
         const entry = &profile_list.items[idx.?];
+
+        // Bell overrides take a bool or a sound name. Parse those
+        // before the generic dup path so we don't allocate then free.
+        if (eq(field, "bell-audible")) {
+            entry.bell_audible = try parseBool(val);
+            return;
+        } else if (eq(field, "bell-visual")) {
+            entry.bell_visual = try parseBool(val);
+            return;
+        }
+
         const dup = try allocator.dupe(u8, val);
         if (eq(field, "provider")) {
             entry.provider = dup;
@@ -532,6 +550,8 @@ pub const Config = struct {
             entry.title = dup;
         } else if (eq(field, "script")) {
             entry.script = dup;
+        } else if (eq(field, "bell-sound")) {
+            entry.bell_sound = dup;
         } else {
             allocator.free(dup);
             return error.UnknownProfileField;

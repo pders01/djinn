@@ -635,12 +635,27 @@ fn closePanelMain(ctx: ?*anyopaque) callconv(.c) void {
 /// dim on the panel. Both are gated independently by config.
 fn handleRingBell(host: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, _: c.ghostty_action_s) bool {
     const cfg = host.app_state.config orelse return false;
-    if (cfg.bell.audible) {
+
+    // Active profile overrides override the global bell config so a
+    // chatter profile (working Claude session) can stay silent while
+    // an interactive shell still rings. Each field falls through
+    // independently — a profile can mute audible but keep visual.
+    const active_profile: ?@import("../session/manager.zig").Profile = blk: {
+        const sm = host.app_state.session_manager orelse break :blk null;
+        if (sm.sessions.items.len == 0) break :blk null;
+        break :blk sm.active().profile;
+    };
+
+    const audible = if (active_profile) |p| p.bell_audible orelse cfg.bell.audible else cfg.bell.audible;
+    const visual = if (active_profile) |p| p.bell_visual orelse cfg.bell.visual else cfg.bell.visual;
+    const sound = if (active_profile) |p| (p.bell_sound orelse cfg.bell.sound) else cfg.bell.sound;
+
+    if (audible) {
         const notify = @import("../notify/darwin.zig");
         const notifier = notify.Notifier{ .enabled = true };
-        notifier.playSound(cfg.bell.sound);
+        notifier.playSound(sound);
     }
-    if (cfg.bell.visual) {
+    if (visual) {
         if (host.app_state.window.panel) |p| p.flashBell();
     }
     return true;

@@ -18,6 +18,11 @@ pub const Profile = struct {
     /// Display label for the menubar / log-pane indicator. Falls back
     /// to `name` when unset.
     title: ?[]const u8 = null,
+    /// Per-profile bell overrides. null = inherit global `bell.*`.
+    /// handleRingBell consults these before the global fallback.
+    bell_audible: ?bool = null,
+    bell_visual: ?bool = null,
+    bell_sound: ?[]const u8 = null,
 
     pub fn label(self: Profile) []const u8 {
         return self.title orelse self.name;
@@ -250,6 +255,9 @@ fn resolveEntry(
         .command = cmd,
         .cwd = e.cwd,
         .title = e.title,
+        .bell_audible = e.bell_audible,
+        .bell_visual = e.bell_visual,
+        .bell_sound = e.bell_sound,
     };
 }
 
