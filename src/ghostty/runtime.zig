@@ -141,10 +141,18 @@ fn writeAppearanceThemeOverride() ?[]const u8 {
     // handled correctly by ghostty already.
     if (std.mem.indexOfScalar(u8, spec, ',') == null) return null;
 
-    // Detect appearance via NSAppearance and pick the matching variant.
-    // Inline lookup so this module stays free of theme.zig deps (theme
-    // imports runtime.zig already; circular import otherwise).
-    const dark = detectDarkAppearance();
+    // Detect appearance: prefer the runtime override (`Cmd+Shift+T`
+    // cycle stored in `app.g.theme.override`), fall back to the
+    // NSAppearance system probe. Without the override branch, the
+    // theme override action would set internal djinn state but the
+    // ghostty config reload would still pick the system variant on
+    // every reload — leaving the visible theme stuck on system
+    // appearance even after the user explicitly overrode it.
+    const dark: bool = blk: {
+        const app = @import("../app.zig");
+        if (app.g.theme.override) |ov| break :blk (ov == .dark);
+        break :blk detectDarkAppearance();
+    };
     const picked = pickThemeVariant(spec, dark) orelse return null;
 
     // Write the override to a tmp file. Path is process-lifetime; the

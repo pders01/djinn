@@ -1310,6 +1310,20 @@ fn actionThemeToggle() void {
         app.g.theme.override = .light;
     }
     reloadTheme();
+
+    // Log the new state to the agent log pane. The visible chrome
+    // flip only happens when the user's ghostty config has a
+    // `theme = light:X,dark:Y` split — without it the override is
+    // applied internally but the static theme palette doesn't
+    // change, leaving the action looking like a no-op. Surfacing
+    // the override in the log makes the action observable.
+    if (app.g.agent.state) |st| {
+        const label: []const u8 = if (app.g.theme.override) |cur| switch (cur) {
+            .light => "theme override → light",
+            .dark => "theme override → dark",
+        } else "theme override cleared (follow system)";
+        st.appendLog(.info, label) catch {};
+    }
 }
 
 fn actionPaletteOpen() void {
