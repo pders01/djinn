@@ -150,13 +150,21 @@ fn populateTextView(tv: objc.Object, style: chrome.Style) void {
     appendRun(root, NSString, NSColor, NSFont, NSDictionary, "Keyboard cheatsheet\n", style.fg, style, true);
     appendRun(root, NSString, NSColor, NSFont, NSDictionary, "Esc to dismiss\n\n", style.dim, style, false);
 
+    // 64 spaces — covers any realistic binding column width. Zig 0.15
+    // std.fmt doesn't accept runtime width specifiers against tuple
+    // args (named-arg lookup requires a struct, not a tuple), so we
+    // pad with a slice of this constant instead of `{s: <[width]}`.
+    const spaces: [64]u8 = [_]u8{' '} ** 64;
+
     var line_buf: [128]u8 = undefined;
     for (actions) |a| {
         var binding_buf: [64]u8 = undefined;
         const binding = formatBinding(a.mods, a.keycode, &binding_buf) catch continue;
-        const line = std.fmt.bufPrint(&line_buf, "{s: <[width]}  {s}\n", .{
+        const pad = if (binding.len < max_binding) max_binding - binding.len else 0;
+        const pad_clamped = @min(pad, spaces.len);
+        const line = std.fmt.bufPrint(&line_buf, "{s}{s}  {s}\n", .{
             binding,
-            .{ .width = max_binding },
+            spaces[0..pad_clamped],
             a.name,
         }) catch continue;
         appendRun(root, NSString, NSColor, NSFont, NSDictionary, line, style.fg, style, false);
