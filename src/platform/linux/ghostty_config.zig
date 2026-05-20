@@ -398,8 +398,43 @@ inline fn vt(comptime spec: [:0]const u8) *const GVariantType {
 
 const PORTAL_TIMEOUT_MS: c_int = 500;
 
+/// Runtime appearance override set by `cycleAppearanceOverride`
+/// (typically bound to Ctrl+Shift+T). `null` means "follow the
+/// xdg-desktop-portal color-scheme setting" — the default. Not
+/// persisted: a restart returns to system-follow, matching darwin's
+/// `app.g.theme.override`. Module scope rather than per-Config
+/// because the override is a runtime/session state, not a saved
+/// preference.
+var appearance_override: ?Appearance = null;
+
+/// Cycle the appearance override and return the new state. Matches
+/// darwin's `actionThemeToggle` shape: null → light → dark → null.
+/// Callers re-invoke the theme apply chain after this so the new
+/// variant of `theme = light:X,dark:Y` gets picked up — see
+/// `keymap.zig::onThemeToggle` and main_linux's reapply hook.
+pub fn cycleAppearanceOverride() ?Appearance {
+    appearance_override = if (appearance_override) |cur| switch (cur) {
+        .light => @as(?Appearance, .dark),
+        .dark => null,
+    } else .light;
+    return appearance_override;
+}
+
+/// Read the current override without changing it. Useful for log
+/// messages that want to surface "theme override → light/dark/
+/// cleared" alongside the cycle action.
+pub fn getAppearanceOverride() ?Appearance {
+    return appearance_override;
+}
+
 pub fn detectAppearance() Appearance {
     if (builtin.os.tag != .linux) return .dark;
+
+    // Override takes precedence over the portal probe so `Ctrl+Shift+T`
+    // (theme_toggle) flips the variant deterministically regardless
+    // of whether the user's desktop has portal-Settings or what its
+    // color-scheme says.
+    if (appearance_override) |o| return o;
 
     var err: ?*GError = null;
     const conn = gdbus.g_bus_get_sync(G_BUS_TYPE_SESSION, null, &err) orelse {
@@ -462,6 +497,20 @@ pub fn detectAppearance() Appearance {
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
+
+test "cycleAppearanceOverride: null → light → dark → null" {
+    // The override is a module-level static; reset to null at the top
+    // and bottom so other tests in the suite see the documented
+    // default ("follow portal").
+    appearance_override = null;
+    defer appearance_override = null;
+
+    try std.testing.expectEqual(@as(?Appearance, null), getAppearanceOverride());
+    try std.testing.expectEqual(@as(?Appearance, .light), cycleAppearanceOverride());
+    try std.testing.expectEqual(@as(?Appearance, .light), getAppearanceOverride());
+    try std.testing.expectEqual(@as(?Appearance, .dark), cycleAppearanceOverride());
+    try std.testing.expectEqual(@as(?Appearance, null), cycleAppearanceOverride());
+}
 
 test "parseColor: #rrggbb form" {
     const c = parseColor("#1a2b3c") orelse return error.TestFailed;

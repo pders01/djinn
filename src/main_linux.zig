@@ -42,6 +42,7 @@ const McpServer = @import("mcp/server.zig").McpServer;
 const writeMcpEndpointInfo = @import("mcp/server.zig").writeEndpointInfo;
 const cli = @import("cli.zig");
 const persist = @import("state/persist.zig");
+const SessionManager = @import("session/manager.zig").SessionManager;
 
 /// `g_unix_signal_add` lives in libgio (gio-2.0); routes a POSIX
 /// signal onto the GLib main loop, freeing us from sigaction-style
@@ -126,7 +127,7 @@ const Dispatch = struct {
     config: *Config,
     ghostty_colors: *?platform.GhosttyColors,
     /// Late-stamped subsystems. Default to null because Dispatch's
-    /// address is taken before these exist — Terminal, LogPane,
+    /// address is taken before these exist — SessionHost, LogPane,
     /// Hotkey, McpServer, ToolTable, and Notifier each receive
     /// `&g_dispatch` as a callback ctx during their own construction,
     /// so the struct lives at a stable address before any of them
@@ -135,7 +136,20 @@ const Dispatch = struct {
     /// mid-init bails cleanly instead of dereferencing `undefined`.
     /// `onConfigChanged` is the only handler that touches more than
     /// `panel`/`allocator`, so the unwraps cluster at its head.
-    terminal: ?*platform.Terminal = null,
+    session_host: ?*platform.SessionHost = null,
+    session_manager: ?*SessionManager = null,
+    /// Tab strip late-stamp. Watcher's `onConfigChanged` calls
+    /// `applyTheme` here alongside session_host + log_pane so the
+    /// chip row's CSS stays in lockstep with the VTE / log paint.
+    /// Null until `runWithIpc` constructs the strip; the unwrap in
+    /// `onConfigChanged` bails cleanly if a config save races init.
+    tab_strip: ?*platform.TabStrip = null,
+    /// Profile palette (Ctrl+Shift+P) late-stamp. Same `applyTheme`
+    /// fan-out story as `tab_strip`. The palette popover's chrome
+    /// (background mirrors the VTE bg) needs to track theme reloads
+    /// even when the popover is hidden, so the next open paints
+    /// with the current colors instead of stale ones.
+    palette: ?*platform.Palette = null,
     hotkey: ?*?platform.Hotkey = null,
     mcp_server: ?*?McpServer = null,
     mcp_handler: ?McpServer.Handler = null,
@@ -147,6 +161,35 @@ const Dispatch = struct {
     /// don't dangle. Mirrors the eager-refresh pattern darwin uses.
     tool_table: ?*ToolTable = null,
     notifier: ?*platform.Notifier = null,
+
+    /// Read the persisted size for the profile at `idx` and resize the
+    /// panel to match. Mirrors darwin's `applyProfileWindowSize` in
+    /// `src/ghostty/surface_lifecycle.zig`. Config-pinned dims
+    /// short-circuit so a user who wrote `window-width = N` keeps the
+    /// same N across all profiles; state.json holds *implicit* sizes
+    /// from the user dragging the panel edge, only relevant when the
+    /// config doesn't pin a global size.
+    ///
+    /// `profileSize` falls through to the top-level dims when no
+    /// per-profile entry exists — matches darwin's behavior. A profile
+    /// that's never been resized while active inherits whatever the
+    /// last globally-saved size was; once the user resizes while it's
+    /// active, `onPanelResize` writes an entry under the profile name
+    /// (the producer side was already wired) and subsequent switches
+    /// land on its own dims.
+    fn applyProfileWindowSize(self: *Dispatch, idx: usize) void {
+        if (self.config.window.width != null and self.config.window.height != null) return;
+        const sm = self.session_manager orelse return;
+        if (idx >= sm.sessions.items.len) return;
+        const profile_name = sm.sessions.items[idx].profile.name;
+
+        var maybe_state = persist.load(self.allocator);
+        defer if (maybe_state) |*st| st.deinit(self.allocator);
+        const st = maybe_state orelse return;
+        const dims = st.profileSize(profile_name) orelse return;
+
+        self.panel.setSize(@intCast(dims.w), @intCast(dims.h));
+    }
 
     fn onCommand(ctx: *anyopaque, command: platform.IpcCommand) void {
         const self: *Dispatch = @ptrCast(@alignCast(ctx));
@@ -185,13 +228,28 @@ const Dispatch = struct {
     /// initial GTK measure pass settled with non-default dims).
     /// Persists via `saveDebounced` so a continuous drag emits a
     /// single disk write 300ms after the user stops. `profile_name`
-    /// is null because the linux build doesn't have SessionManager
-    /// wired yet — when multi-profile lands (pick-up #6), this gains
-    /// the active profile's name so per-profile width/height keep
-    /// working across switches.
+    /// is the active profile so per-profile width/height memory
+    /// (state.json's `profiles[<name>]` slot) gets the right dims
+    /// when that feature lands; until then `persist.saveDebounced`
+    /// ignores the name and writes the global slot.
     fn onPanelResize(ctx: *anyopaque, w: u32, h: u32) void {
         const self: *Dispatch = @ptrCast(@alignCast(ctx));
-        persist.saveDebounced(self.allocator, w, h, null);
+        const profile_name: ?[]const u8 = if (self.session_manager) |sm|
+            sm.active().profile.name
+        else
+            null;
+        persist.saveDebounced(self.allocator, w, h, profile_name);
+    }
+
+    /// Log-pane GtkPaned divider drag. Fires at ~60Hz during a user
+    /// gesture; the 300ms persist worker cycle flattens the burst to
+    /// one disk write per release. Position is the start-child width
+    /// in pixels (VTE side of the split). Negative values aren't
+    /// reachable from a drag but the cast guards against them anyway.
+    fn onDividerChanged(ctx: *anyopaque, position: i32) void {
+        const self: *Dispatch = @ptrCast(@alignCast(ctx));
+        if (position <= 0) return;
+        persist.saveDividerDebounced(self.allocator, @intCast(position));
     }
 
     /// SIGTERM via `g_unix_signal_add`. Matches the existing SIGINT
@@ -224,7 +282,7 @@ const Dispatch = struct {
         // circuits at startup — the check protects against future
         // reorders or a new earlier-firing callback dragging the
         // watcher ahead of one of these slots.
-        const terminal = self.terminal orelse return logDispatchUnready("terminal");
+        const session_host = self.session_host orelse return logDispatchUnready("session_host");
         const log_pane = self.log_pane orelse return logDispatchUnready("log_pane");
         const hotkey_slot = self.hotkey orelse return logDispatchUnready("hotkey");
         const mcp_server_slot = self.mcp_server orelse return logDispatchUnready("mcp_server");
@@ -258,9 +316,14 @@ const Dispatch = struct {
         // Apply theme: cheap and idempotent. font, fg/bg/cursor,
         // padding, palette, opacity all flow through VTE setters /
         // the reloaded CSS provider. Same code path used at startup.
+        // `applyTheme` fans across every spawned VTE inside the
+        // SessionHost; lazy-spawn slots pick the new theme up on
+        // first activate via the cached `theme_opts`.
         const opts = buildThemeOptions(&new_config, new_ghostty);
-        terminal.applyTheme(opts);
+        session_host.applyTheme(opts);
         log_pane.applyTheme(opts);
+        if (self.tab_strip) |ts| ts.applyTheme(opts);
+        if (self.palette) |pal| pal.applyTheme(opts);
 
         // Window size: layer-shell may clip, but on non-layer-shell
         // (GNOME) the resize takes effect immediately. Only fire the
@@ -391,6 +454,34 @@ fn logDispatchUnready(field: []const u8) void {
         "config: reload skipped — dispatch field '{s}' not yet wired\n",
         .{field},
     );
+}
+
+/// Tab-strip click handler. The chip carries a session index in its
+/// user_data; this callback routes that through `SessionHost.activate`
+/// which handles bounds-checking, focus-grab, and the on_switch
+/// fan-out back to the strip. Returns whatever `activate` returns so
+/// the strip's hook signature stays useful for future palette wiring.
+fn onTabActivate(ctx: *anyopaque, idx: usize) bool {
+    const host: *platform.SessionHost = @ptrCast(@alignCast(ctx));
+    return host.activate(idx);
+}
+
+/// SessionHost.on_switch hook fired after every successful activate.
+/// Two responsibilities folded into one callback so the activate path
+/// has a single fan-out site:
+///
+///   1. Update the tab strip's active-row CSS class.
+///   2. Restore the per-profile persisted window size, when one is
+///      saved in state.json AND the user hasn't pinned a global size
+///      via config (config always wins so editing the file takes
+///      effect immediately).
+///
+/// Keymap-driven switches (Ctrl+Tab / Alt+N / Ctrl+Shift+P) all reach
+/// `host.activate` so they share this code path.
+fn onSessionSwitched(ctx: *anyopaque, idx: usize) void {
+    const self: *Dispatch = @ptrCast(@alignCast(ctx));
+    if (self.tab_strip) |strip| strip.markActive(idx);
+    self.applyProfileWindowSize(idx);
 }
 
 /// Try `Config.load` a handful of times with a short sleep between
@@ -753,15 +844,38 @@ pub fn main() !void {
     // toplevel (GNOME / DJINN_NO_LAYER_SHELL=1).
     panel.setOnResize(@ptrCast(&g_dispatch), Dispatch.onPanelResize);
 
-    var term = platform.Terminal.open(allocator, theme_opts, .{
+    // SessionManager resolves config's `profile.*` entries into a list
+    // of spawn-ready Profiles. With no profile lines, it synthesizes a
+    // single "default" profile from the flat `provider` / `provider-
+    // command` keys — legacy single-shell configs keep working. The
+    // manager survives until shutdown; SessionHost reaches into it
+    // for the active index + per-profile spawn payload.
+    var session_manager = SessionManager.init(allocator, &config) catch |err| {
+        std.debug.print("session manager init failed: {}\n", .{err});
+        return err;
+    };
+    defer session_manager.deinit();
+    g_dispatch.session_manager = &session_manager;
+
+    std.debug.print(
+        "sessions — {d} profile(s), active='{s}'\n",
+        .{ session_manager.count(), session_manager.active().profile.name },
+    );
+
+    // SessionHost owns one VTE per profile, hosted in a GtkStack. The
+    // active-at-startup session is spawned eagerly so the first paint
+    // shows that profile's shell; the rest are lazy until first
+    // activate. `Dispatch.onChildExited` closes the panel when any
+    // session's shell exits — matches today's single-shell semantics.
+    var host = platform.SessionHost.init(allocator, &session_manager, theme_opts, .{
         .ctx = @ptrCast(&g_dispatch),
         .on_child_exited = Dispatch.onChildExited,
     }) catch |err| {
-        std.debug.print("terminal init failed: {}\n", .{err});
+        std.debug.print("session host init failed: {}\n", .{err});
         return err;
     };
-    defer term.deinit();
-    g_dispatch.terminal = &term;
+    defer host.deinit();
+    g_dispatch.session_host = &host;
 
     // Log pane lives to the right of the VTE inside a horizontal
     // GtkPaned. Wrapped + attached even when `log_pane.enabled = false`
@@ -784,29 +898,93 @@ pub fn main() !void {
     // the pane on at runtime via Ctrl+/ reveals it at the configured
     // width — GtkPaned preserves the position across visibility
     // flips, so we only need to set it once at construction.
-    const log_width: f64 = blk: {
-        const desired = @as(f64, @floatFromInt(width)) * config.log_pane.width_fraction;
-        const clamped = std.math.clamp(
-            desired,
-            config.log_pane.width_min,
-            config.log_pane.width_max,
-        );
-        break :blk clamped;
+    //
+    // Priority: persisted state.divider (last user drag) →
+    // config-derived fraction → default. The persisted value wins so
+    // a user who has manually tuned the divider doesn't lose it on
+    // restart, matching how `state.width/height` shadow the config
+    // default for window dims.
+    const divider_position: c_int = blk: {
+        if (persisted_state) |st| {
+            if (st.divider != 0) break :blk @intCast(st.divider);
+        }
+        const log_width: f64 = inner_blk: {
+            const desired = @as(f64, @floatFromInt(width)) * config.log_pane.width_fraction;
+            const clamped = std.math.clamp(
+                desired,
+                config.log_pane.width_min,
+                config.log_pane.width_max,
+            );
+            break :inner_blk clamped;
+        };
+        break :blk width - @as(c_int, @intFromFloat(log_width));
     };
-    const divider_position: c_int = width - @as(c_int, @intFromFloat(log_width));
 
-    const paned = log_pane.pairWithSibling(term.widget, divider_position);
-    panel.attachChild(paned);
+    // Pair the SessionHost's GtkStack (the multi-VTE container) with
+    // the log pane inside a horizontal GtkPaned. Pre-multi-profile
+    // this passed `term.widget` directly; the stack is a drop-in
+    // replacement (any GtkWidget can sit as the start child).
+    const paned = log_pane.pairWithSibling(host.widget(), divider_position);
 
-    // Force initial keyboard focus onto VTE. Without this, the
-    // surrounding GtkPaned can hold focus by default (its divider is
-    // keyboard-navigable with arrow keys), which routes every key
+    // Tab strip above the paned. Hidden when `sm.count() < 2`, so
+    // single-profile setups look identical to pre-multi-profile.
+    // `pairWithChild` wraps (strip, paned) into a vertical GtkBox so
+    // the strip takes its natural height and the paned gets the
+    // remainder. Mouse clicks reach `host.activate(idx)` via the
+    // OnActivate callback; the reverse direction (re-skin the chip
+    // when a keymap-driven switch lands) flows through SessionHost's
+    // `on_switch` hook below.
+    var tab_strip = platform.TabStrip.init(
+        allocator,
+        &session_manager,
+        .{
+            .ctx = @ptrCast(&host),
+            .on_invoke = onTabActivate,
+        },
+        theme_opts,
+    ) catch |err| {
+        std.debug.print("tab strip init failed: {}\n", .{err});
+        return err;
+    };
+    defer tab_strip.deinit();
+    g_dispatch.tab_strip = &tab_strip;
+    // The `on_switch` hook routes through Dispatch (not the tab strip
+    // directly) so the same callback can fan to both the chip refresh
+    // AND the per-profile window-size restore — both need to fire
+    // after every successful activate. `&tab_strip` reachable via
+    // `g_dispatch.tab_strip` inside the handler.
+    host.on_switch = .{
+        .ctx = @ptrCast(&g_dispatch),
+        .on_invoke = onSessionSwitched,
+    };
+
+    const root = tab_strip.pairWithChild(paned);
+    panel.attachChild(root);
+
+    // Persist divider drags through the same debounce worker that
+    // handles window dims. `notify::position` fires at ~60Hz during a
+    // drag; the worker's 300ms cycle flattens the burst to one disk
+    // write per gesture. Independent dirty bit in persist.zig means
+    // a divider-only save preserves window dims from disk and vice
+    // versa.
+    log_pane.setOnDividerChange(.{
+        .ctx = @ptrCast(&g_dispatch),
+        .on_change = Dispatch.onDividerChanged,
+    });
+
+    // Force initial keyboard focus onto the active VTE. Without this,
+    // the surrounding GtkPaned can hold focus by default (its divider
+    // is keyboard-navigable with arrow keys), which routes every key
     // event into the paned's handlers instead of VTE — including
     // VTE's own Ctrl+Shift+C/V and our window-level shortcuts via
     // GtkShortcutController(MANAGED scope), which dispatch off the
-    // currently-focused widget's manager chain.
-    if (!panel.focusChild(term.widget)) {
-        std.debug.print("warning: failed to grab initial focus on VTE\n", .{});
+    // currently-focused widget's manager chain. GtkStack doesn't
+    // forward focus to its visible child on its own either, so we
+    // reach into the active session via `host.currentVte()`.
+    if (host.currentVte()) |vte| {
+        if (!panel.focusChild(vte)) {
+            std.debug.print("warning: failed to grab initial focus on VTE\n", .{});
+        }
     }
 
     // Pick up `window-hide-on-blur` from config — Raycast / Spotlight
@@ -824,15 +1002,78 @@ pub fn main() !void {
     // Install panel-window keyboard shortcuts (font zoom + clear
     // scrollback + open_settings + mcp_copy_endpoint + copy/paste
     // + toggle_log_pane). Context address must outlive the panel —
-    // placed on this frame, same lifetime as `term`, `panel`, and
+    // placed on this frame, same lifetime as `host`, `panel`, and
     // `log_pane`. CAPTURE phase keeps the bindings ahead of VTE's
     // internal shortcut set.
+    //
+    // Find overlay (Ctrl+Shift+F). Anchored on the GtkStack (the
+    // SessionHost's container) rather than a single VTE so the
+    // popover survives profile switches; SessionHost.find_overlay
+    // is stamped below so each `activate(idx)` retargets the search
+    // onto the new visible VTE. Initial target = currently active
+    // VTE.
+    const active_vte = host.currentVte() orelse {
+        std.debug.print("session host: no active VTE after init — aborting\n", .{});
+        return error.NoActiveSession;
+    };
+    var find = platform.FindOverlay.init(allocator, host.widget(), @ptrCast(active_vte)) catch |err| {
+        std.debug.print("find overlay init failed: {} — Ctrl+Shift+F unavailable\n", .{err});
+        return err;
+    };
+    defer find.deinit();
+    find.install();
+    host.find_overlay = &find;
+
+    // Cheatsheet popover (Ctrl+?). Anchored to the GtkStack so it's
+    // reachable regardless of which VTE is currently visible — the
+    // popover content (the keymap reference) is profile-agnostic.
+    var cheatsheet = platform.Cheatsheet.init(allocator, host.widget()) catch |err| {
+        std.debug.print("cheatsheet init failed: {} — Ctrl+? unavailable\n", .{err});
+        return err;
+    };
+    defer cheatsheet.deinit();
+
+    // Profile palette (Ctrl+Shift+P). Same anchor story as the find
+    // overlay + cheatsheet: parent on the GtkStack so the popover
+    // doesn't reparent across profile switches. Reuses `onTabActivate`
+    // as its activate handler. Both surfaces route into
+    // `SessionHost.activate`, so the chip-update fan-out via
+    // `on_switch` (already wired to the tab strip above) runs for
+    // palette-driven switches too.
+    var palette = platform.Palette.init(
+        allocator,
+        &session_manager,
+        .{ .ctx = @ptrCast(&host), .on_invoke = onTabActivate },
+        host.widget(),
+        theme_opts,
+    ) catch |err| {
+        std.debug.print("palette init failed: {}; Ctrl+Shift+P unavailable\n", .{err});
+        return err;
+    };
+    defer palette.deinit();
+    palette.install();
+    g_dispatch.palette = &palette;
+
     var keymap_ctx = platform.KeymapContext{
-        .terminal = &term,
+        .session_host = &host,
         .allocator = allocator,
         .log_pane = &log_pane,
         .panel = &panel,
         .config = &config,
+        // theme_toggle reapply hook. Cycles the appearance override
+        // in `ghostty_config`, then needs the same theme apply chain
+        // a config save would invoke so the new
+        // `theme = light:X,dark:Y` variant gets baked in. Routes
+        // through `Dispatch.onConfigChanged` — wasteful by ~1ms (re-
+        // reads djinn config too) but reuses one path instead of
+        // duplicating the apply sequence.
+        .reapply_config = .{
+            .ctx = @ptrCast(&g_dispatch),
+            .on_invoke = Dispatch.onConfigChanged,
+        },
+        .find_overlay = &find,
+        .cheatsheet = &cheatsheet,
+        .palette = &palette,
     };
     platform.keymap.install(&panel, &keymap_ctx);
 
@@ -965,11 +1206,10 @@ pub fn main() !void {
     //
     // Same wiring shape as darwin's `main.zig`: AgentState → Notifier →
     // ToolTable → Dispatcher → McpServer on a detached thread.
-    // SessionManager isn't wired on linux yet, so the
-    // `djinn_active_profile` tool returns `{"name":null}` and the
-    // notify-on-mute lookup short-circuits when no client is named.
-    // Everything else (attention / progress / done / error / log /
-    // recent_logs / recent_attentions) works identically to darwin.
+    // SessionManager is now wired on linux (built above), so
+    // `djinn_active_profile` returns real {name, label, cwd, command}
+    // for the currently-active profile. Notify-on-mute still works
+    // identically via the client.<id>.mute config lookup.
     var agent_state = AgentState.init(allocator);
     defer agent_state.deinit();
 
@@ -1002,8 +1242,7 @@ pub fn main() !void {
         .notify_on_done = config.notifications.notify_on_done,
         .notify_on_progress = config.notifications.notify_on_progress,
         .config = &config,
-        // session_manager stays null on linux until the multi-profile
-        // surface lands — `renderActiveProfile` handles that path.
+        .session_manager = &session_manager,
     };
     var dispatcher = Dispatcher{ .tool_table = tools.table() };
 
@@ -1065,6 +1304,9 @@ test {
     _ = @import("platform/linux/ghostty_config.zig");
     _ = @import("platform/linux/keymap.zig");
     _ = @import("platform/linux/log_pane.zig");
+    _ = @import("platform/linux/session_host.zig");
+    _ = @import("platform/linux/tab_strip.zig");
+    _ = @import("platform/linux/palette.zig");
 }
 
 // ─── main_linux smoke tests ──────────────────────────────────────────

@@ -590,6 +590,12 @@ fn tickImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
                         .@"error" => .@"error",
                     };
                     menubar.updateState(mb_state, snap.message);
+                    // Echo the state flip onto the tab strip's
+                    // trailing-edge dot. `refresh` is a setNeedsDisplay:
+                    // call that no-ops when no strip is mounted (single-
+                    // profile setups), so it's safe to fire on every
+                    // state change.
+                    @import("../session/tab_strip.zig").refresh();
                     app.g.agent.last_state = snap.state;
                 }
             }

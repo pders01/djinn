@@ -9,39 +9,156 @@ points you at the source.
 ## Priority order
 
 The original Important / Minor tiers have largely drained — see the
-History block under `## Code review backlog` for the chain. What's
-left is the Structural refactors batch:
+History block under `## Code review backlog` for the chain. Multi-
+profile Phases 0/1/2 (foundation, tab strip + keyboard switching,
+palette switcher) have all landed. Restart-session + per-profile
+window-size memory also landed this pass; remaining work is
+structural refactors and the opportunistic darwin-parity ports.
 
 1. **Structural refactors** — `log_pane.zig` extraction
-   (1373 lines; pull `writeThemedCss` into `log_pane_css.zig`,
+   (1485 lines; pull `writeThemedCss` into `log_pane_css.zig`,
    move filter+header bookkeeping into a `LogModel`),
-   `keymap.zig` `Context` god-object split before
-   find_overlay / command_palette land.
+   `keymap.zig` `Context` god-object split (nine fields now
+   with the palette slot; the action table grew to 32 rows
+   with restart_session + shell_session, making the case for
+   per-action `*anyopaque` user_data or a `Services` registry
+   stronger).
+2. **Multi-session exit refinement.** Today any session's
+   `child-exited` quits the panel; the active session's exit
+   should quit, but inactive sessions exiting should mark
+   `exited: true` and show a restart hint in the tab strip.
+   `restartActive` covers the user-initiated path so this is
+   less urgent — an inactive session typing `exit` is rare.
 
-Two batches landed since the last refresh:
+Most recent batch (older ones are in the History block at the bottom
+of `## Code review backlog`):
 
-- **Packaging cleanup** — `-Dsystem-install` gate in `build.zig`,
-  PKGBUILD + `debian/rules` drop the manual LICENSE/README installs,
-  `debian/djinn.install` declares the binary package's payload,
-  flake.nix `nix run` exports LD_LIBRARY_PATH on linux + glib moves
-  to buildInputs, `djinn.service` gains the conservative sandbox
-  set + `StartLimitBurst`, `djinn.desktop` flips `StartupNotify=true`
-  and documents the bare-Exec intent. Pbuilder debchroot + Nix
-  `nix build` revalidation still wanted before declaring
-  distro-ready.
-- **Resilience polish** — `watcher.zig` survives
-  destroy-and-recreate of the config dir via a 5s inode-health
-  probe that rebuilds the GFileMonitor in place when the cached
-  `st_ino` no longer matches; `dragdrop.zig` /tmp reaper now runs
-  on a 30-minute `g_timeout_add` cadence in addition to the
-  startup sweep, so long-running sessions don't accumulate temps;
-  `notifier.zig::playSound` logs once per process when invoked so
-  the `bell-sound` override gap is visible (the per-kind
-  notification sound-name hint still plays — only the override is
-  dropped today).
+- **`session_host.zig` Entry.name_z stack-pointer bug fix** —
+  the init loop wrote each Entry as a stack-local `e`, set
+  `e.name_z = written.ptr` (pointing into `&e.name[0]`), then
+  copied the value into the array via `appendAssumeCapacity`.
+  `name_z` still aliased the loop frame, so every stored
+  `name_z` resolved to the last iteration's `e.name` buffer
+  (e.g. `"session-N-1"` for an N-profile config). Symptoms:
+  `gtk_stack_add_named` collided on every non-eager spawn
+  (`duplicate child name in GtkStack: session-N-1` in the
+  journal), `gtk_stack_set_visible_child_name` always selected
+  the same slot, and profile switching was visually a no-op.
+  Fix: append the Entry first, then `bufPrintZ` into the
+  stored slot's `name` buffer and point `name_z` at it; the
+  stored slot is heap-stable post-init (`ensureTotalCapacity`
+  reserved up front, no further appends) so the pointer
+  survives.
+- **Restart-session (Ctrl+R) + drop-to-shell (Ctrl+Shift+R)** —
+  `SessionHost.restartActive(override_cmd)` replaces the active
+  VTE widget in place. The first attempt used
+  `vte_terminal_set_pty(t, NULL)` to hangup the child + a deferred
+  `spawn_async` to re-fork into the same widget; that path
+  NULL-derefs at +0x18 inside VTE 0.84's PTY dispose chain
+  (`set_pty -> inner helper -> libvte+0x4a7b4`) and crashed the
+  panel every Ctrl+R. The deployed shape sidesteps the buggy
+  codepath entirely: build a fresh `Terminal` first (so an OOM
+  doesn't strand the slot empty), `Terminal.detachExitHandler`
+  on the old (so widget destroy can't fan child-exited out as
+  `panel.quit`), `gtk_stack_remove` the old widget (which
+  finalizes it, closes the pty, sends SIGHUP to the child),
+  `deinit` the old Terminal's owned strings, then
+  `gtk_stack_add_named` the fresh widget under the same stack
+  name. Tab strip, log pane, and window position all preserved;
+  matches darwin's `restartSurfaceCallback` (free old surface,
+  bind a fresh one to the same NSView). `override_cmd = null`
+  keeps the profile's command (`Ctrl+R`); `override_cmd =
+  "/bin/zsh"` drops to the shell fallback (`Ctrl+Shift+R`).
+  Keymap action table grew to 32 rows.
+- **Per-profile window-size memory** — `SessionHost.on_switch`
+  hook ctx switched from `&tab_strip` to `&g_dispatch` so the
+  callback can fan to both the chip refresh AND a new
+  `Dispatch.applyProfileWindowSize` that reads `state.json` and
+  resizes the panel to the per-profile dims. Mirrors darwin's
+  `applyProfileWindowSize` in `src/ghostty/surface_lifecycle.zig`.
+  Producer side was already wired (`onPanelResize` plumbs the
+  active profile name into `persist.saveDebounced`); this lands
+  the reader half. Config-pinned `window-width` / `window-height`
+  short-circuit so editing the file always wins over state.json.
 
-`mcp/tools.zig:43` `session_manager` type-purity audit and the
-remaining Minor code-shape items (terminal.zig argv const, hotkey
+- **Multi-profile Phase 2 — Ctrl+Shift+P palette switcher** —
+  `src/platform/linux/palette.zig` owns a `GtkPopover` anchored to
+  `host.widget()` (the GtkStack, so the popover survives profile
+  switches) with a vertical box: `GtkSearchEntry` on top,
+  `GtkScrolledWindow → GtkListBox` underneath. One
+  `GtkListBoxRow` per profile, label widget child. Type-to-filter
+  via case-insensitive substring match against pre-lowercased
+  `label + name` haystacks (one buffer per profile, alloc'd at
+  init); `gtk_list_box_set_filter_func` reads the cached needle
+  on each `search-changed`. Up/Down/Return/Escape intercepted by
+  a CAPTURE-phase `GtkEventControllerKey` on the entry so the
+  user types into a focused entry while keyboard-navigating the
+  visible filtered rows; Enter fires the same `OnActivate` hook
+  the tab strip uses (routes through `host.activate(idx)`, fans
+  `on_switch` to the chip strip). Selection mode BROWSE keeps
+  one row selected at all times so Enter always has a target.
+  Module-local `GtkCssProvider` reload-in-place on `applyTheme`,
+  same pattern as `tab_strip.zig` / `log_pane.zig`; selected-row
+  accent fill from `palette[4]` (blue ANSI slot) with
+  `@accent_color` fallback. Drive-by fix: tab_strip + palette
+  both `gtk_css_provider_load_from_string` calls now append a
+  trailing `\0` to the build buffer — without it the parser
+  reads past `buf.items.len` and the second provider (palette)
+  perturbed allocator layout enough to surface as
+  `Theme parser error: <data>:27:398: Expected '{' after
+  selectors` warnings against tab_strip's CSS. `log_pane`
+  already does this. Banner reads `installed 30/30` on startup;
+  `palette_open` row gated by `predHasMultipleProfiles` so
+  single-profile setups propagate Ctrl+Shift+P unchanged.
+- **`log_pane.pairWithSibling` end_child repair** — was passing
+  `self.scrolled` to `gtk_paned_set_end_child` even though
+  `scrolled` is appended to `self.container` in `init`. The
+  `gtk_paned_set_end_child: assertion 'child == NULL || ... ||
+  gtk_widget_get_parent (child) == NULL' failed` Gtk-CRITICAL
+  in the journal was this; GTK either silently no-op'd or
+  reparented scrolled out of container, leaving `self.container`
+  (the widget `setVisible` / `toggleVisible` toggle) orphaned
+  outside the widget tree. Ctrl+/ logged the toggle but the user
+  saw nothing. Fix passes `self.container` to `set_end_child`
+  so the whole composite (attention chip + scrolled list +
+  search entry) lands in the paned and visibility flips work.
+- **Cheatsheet popover renders + stays open** —
+  `cheatsheet.zig` had two bugs surfaced once a multi-profile
+  user actually pressed Ctrl+? in production: (1) `autohide=true`
+  on a popover whose only child is a non-focusable `GtkLabel`
+  flipped the panel window's `notify::is-active` off on popup,
+  and with `hide-on-blur = true` the whole panel hid itself
+  right after the popup, looking like Ctrl+? hides djinn; (2)
+  without an explicit `gtk_popover_set_pointing_to`, GTK used
+  the anchor's full allocation rect as the target and could not
+  fit a ~400px-tall popover at any edge of the full-window-sized
+  GtkStack, so it clipped invisibly. Fix: `autohide=false` (Ctrl+?
+  already toggles dismiss), and `open()` recomputes a 1×1
+  pointing-to rect at the anchor's horizontal center / ~1/8 from
+  the top each popup so panel resizes keep it centered.
+  Find overlay + palette stay autohide=true because their
+  `GtkSearchEntry` anchors focus correctly.
+- **`just install-arch` ExecStart rewrite** — `contrib/packaging/
+  djinn.service` bakes `ExecStart=/usr/bin/djinn` (the AUR
+  install path). Copying it to `/usr/local/lib/systemd/user/`
+  without rewriting left the unit pointing at a missing binary
+  after a same-system AUR uninstall, producing
+  `status=203/EXEC` and `start-limit-hit`. The recipe now
+  appends a `sudo sed -i 's|^ExecStart=/usr/bin/djinn$|
+  ExecStart=/usr/local/bin/djinn|'` after the install copy.
+
+The previous batch — **Multi-profile Phase 1, tab strip +
+keyboard switching** — landed `src/platform/linux/tab_strip.zig`
+plus the 11-row keymap expansion (`next_tab` / `prev_tab` /
+`tab_1..9`) and the `SessionHost.on_switch` fan-out hook the
+palette also rides. Behavioral note from the earlier foundation
+batch is still in force: with no `profile.*` lines, the
+synthesized "default" profile spawns `Config.getProviderCommand()`
+— `/bin/zsh` for generic — instead of `$SHELL`. Matches darwin.
+Debian/Ubuntu users without zsh need `provider-command = /bin/bash`
+or `zsh` installed.
+
+Remaining Minor code-shape items (terminal.zig argv const, hotkey
 errdefer gap, unique_name re-fetch, watcher partial-init cleanup,
 ghostty_config detectAppearance GVariant ownership style) are
 small one-line edits and a good warm-up before the structural
@@ -86,19 +203,99 @@ prevailing shape.
   `DJINN_NO_LAYER_SHELL=1` forces the plain-toplevel path on
   layer-shell-capable compositors (debugging utility).
 - `terminal.zig` + `theme.zig` — VTE widget embedded as the panel's
-  child, spawns `$SHELL` (fallback `/bin/sh`), applies
-  `config.terminal.*` + `config.theme.*` (font / fg / bg / cursor /
-  padding / palette[0..15] / opacity) via VTE setters and a single
+  child, spawns the profile's resolved command (`script > command >
+  provider > /bin/zsh`, same precedence as darwin) into the
+  caller-supplied `cwd`, applies `config.terminal.*` +
+  `config.theme.*` (font / fg / bg / cursor / padding /
+  palette[0..15] / opacity) via VTE setters and a single
   module-level GtkCssProvider that gets reloaded in place on each
-  apply (so live-reload doesn't stack providers). `applyFont` runs a Pango font-family availability
-  check before setting `vte_terminal_set_font` and logs a clear
-  warning when the family isn't installed (avoids the "wide-cell"
-  rendering bug from silent Pango substitution to non-monospace).
-  `child-exited` is wired to `panel.quit` so typing `exit` closes
-  the window. SIGTERM is routed onto the GLib main loop via
-  `g_unix_signal_add` and quits the panel cleanly — needed by
-  systemd user units. SIGINT already worked through GLib's default
-  signal-fd watch.
+  apply (so live-reload doesn't stack providers). `Terminal.open`
+  takes a `Spawn { command, cwd }` parameter — null falls back to
+  `$SHELL` / `/bin/sh` (unused by SessionHost). `applyFont` runs a
+  Pango font-family availability check before setting
+  `vte_terminal_set_font` and logs a clear warning when the family
+  isn't installed (avoids the "wide-cell" rendering bug from silent
+  Pango substitution to non-monospace). `child-exited` is wired to
+  `panel.quit` so typing `exit` closes the window. SIGTERM is
+  routed onto the GLib main loop via `g_unix_signal_add` and quits
+  the panel cleanly — needed by systemd user units. SIGINT already
+  worked through GLib's default signal-fd watch.
+- `session_host.zig` — multi-profile container. Owns a `GtkStack`
+  of one VTE per profile, lazy-spawned on first `activate(idx)`;
+  the active-at-startup session spawns eagerly so the first paint
+  shows its shell. Reads `SessionManager` for the active index +
+  per-profile spawn payload. `widget()` returns the stack (drop-in
+  replacement for the single VTE at the GtkPaned start child slot).
+  `currentTerminal()` / `currentVte()` getters let keymap handlers
+  reach the visible session without tracking the active index
+  themselves. `applyTheme(opts)` fans across every live VTE; lazy
+  slots pick up the new theme on first activate via the cached
+  `theme_opts`. Late-stamped `find_overlay` slot — `activate`
+  retargets the search needle via `FindOverlay.setTarget` without
+  reparenting the popover. `on_switch: ?OnSwitch` hook fires once
+  per successful activate so the tab strip + palette can re-skin
+  the active chip / line up on the visible profile without
+  session_host importing either UI module (avoids the circular
+  import a typed pointer would create). `restartActive
+  (override_cmd)` replaces the active VTE widget in place:
+  build a fresh `Terminal` first, `detachExitHandler` on the
+  old so widget destroy can't fan child-exited out as
+  `panel.quit`, `gtk_stack_remove` the old (closes the pty,
+  child gets SIGHUP), then `gtk_stack_add_named` the new
+  under the same stack name. Wired into Ctrl+R (keeps the
+  profile command) / Ctrl+Shift+R (passes `/bin/zsh`) from
+  the keymap. The simpler `vte_terminal_set_pty(t, NULL)`
+  approach NULL-derefs at +0x18 inside VTE 0.84's PTY
+  dispose; see the matching "Decisions you should not undo"
+  entry.
+- `tab_strip.zig` — horizontal `GtkBox` of `GtkButton` chips, one
+  per session. Active chip carries the `.djinn-tab-active` CSS
+  class; inactive chips reserve a 2px transparent border-bottom so
+  the active accent underline doesn't shift the row vertically on
+  switch. Module-local `GtkCssProvider` reloaded in place on
+  `applyTheme` (same pattern as `log_pane.zig`); CSS buffer now
+  appends a trailing `\0` before `gtk_css_provider_load_from_string`
+  (palette landing surfaced the latent missing-sentinel bug as
+  Theme parser errors). Accent color picks `palette[4]` (blue ANSI
+  slot) with `@accent_color` fallback. Hidden when
+  `sm.count() < 2` so single-profile setups paint identically to
+  pre-Phase-1. `pairWithChild(paned)` wraps `(strip, paned)` into
+  a vertical GtkBox so main_linux stays free of GtkBox externs.
+  Click handlers route through a caller-supplied `OnActivate`
+  callback into `SessionHost.activate` — keeps the type
+  dependency one-way. Label buffers are owned per-chip
+  (sentinel-terminated) so a Config reload arena drop can't
+  invalidate the C `gtk_button_new_with_label` pointer.
+- `palette.zig` — `Ctrl+Shift+P` type-to-switch profile palette.
+  `GtkPopover` anchored to `host.widget()` (the GtkStack) so it
+  survives profile switches without reparenting. Vertical box
+  child: `GtkSearchEntry` on top, `GtkScrolledWindow → GtkListBox`
+  (min/max content height 120/360) underneath. One
+  `GtkListBoxRow` per profile, label as the row child, model
+  index == profile index (`gtk_list_box_row_get_index`).
+  Filtering via `gtk_list_box_set_filter_func` reading a cached
+  lowercased needle that gets rebuilt on each `search-changed`
+  (GtkSearchEntry's built-in 150ms debounce). Each row carries
+  pre-lowercased `label_lower + name_lower` slices into a single
+  per-row buffer (one alloc per profile, ASCII case-fold) so the
+  filter hot path is two `mem.indexOf` calls. Up/Down/Return/
+  Escape intercepted by a CAPTURE-phase `GtkEventControllerKey`
+  on the entry — selection moves through the visible filtered
+  rows while the entry keeps focus, Enter activates, Esc closes;
+  everything else falls through to the entry as normal text
+  input. Selection mode BROWSE so one row is always selected
+  (Enter always has a target). `OnActivate` callback into
+  `host.activate(idx)` — reuses `main_linux.onTabActivate`, so
+  palette-driven switches fan through the same `on_switch` hook
+  the tab strip listens on. Module-local `GtkCssProvider`
+  reload-in-place on `applyTheme`; selected-row background from
+  `palette[4]` (blue ANSI slot) with `@accent_color` fallback.
+  CSS-node gotcha: the listbox is targeted by `.djinn-palette-
+  list` class, not the `listbox` selector, because GtkListBox's
+  CSS node is `list` (already-burned in log_pane). CSS buffer
+  appended with `\0` before `load_from_string` — same trap as
+  tab_strip's. Pre-existing `keymap` action row count was 29;
+  with `palette_open` the banner now reads `installed 30/30`.
 - `ghostty_config.zig` — parses `~/.config/ghostty/config` directly
   (linux doesn't link libghostty). Strips matched `"…"` / `'…'`
   around values (ghostty's parser allows it; font-family with
@@ -280,13 +477,19 @@ prevailing shape.
   leave a torn file. Replaces SMAppService.
 - `keymap.zig` — `GtkShortcutController` on the panel window with
   `GTK_SHORTCUT_SCOPE_MANAGED` + PROPAGATION_CAPTURE so bindings
-  beat VTE's internal shortcut set. Eleven entries (`installed 11/11`
-  banner on startup):
+  beat VTE's internal shortcut set. 32 entries (`installed
+  32/32` banner on startup):
   - `font_inc` / `font_inc_shift` / `font_dec` / `font_reset`
     (Ctrl+= / Ctrl+Shift+= / Ctrl+- / Ctrl+0)
   - `clear_scrollback` (Ctrl+Shift+K) — `vte_terminal_reset` then
     `\x0c` (Ctrl+L) via `feed_child` so readline redraws the
     prompt at the cleared top
+  - `restart_session` (Ctrl+R) — `session_host.restartActive
+    (null)` hangs up the active VTE's child and re-spawns the
+    same profile command into the same widget
+  - `shell_session` (Ctrl+Shift+R) — `restartActive("/bin/zsh")`
+    drops to the shell fallback when the configured profile
+    script is broken
   - `open_settings` (Ctrl+,) — `xdg-open` primary (desktop MIME
     handler, GUI editor on KDE/GNOME), `$EDITOR` fallback (TTY
     editors fail silently with `.Ignore` stdio)
@@ -298,17 +501,73 @@ prevailing shape.
     `VTE_FORMAT_TEXT = 1` (not 0 — enum starts at 1, passing 0
     trips `check_enum_value` assertion and silently no-ops)
   - `toggle_log_pane` (Ctrl+/) — flips `log_pane.toggleVisible()`
+  - `scroll_page_up` / `scroll_page_down` (Shift+PgUp /
+    Shift+PgDn) — drives VTE's GtkScrollable vadjustment by one
+    page each; universal terminal-emulator scrollback gesture
+  - `theme_toggle` (Ctrl+Shift+T) — cycles
+    `ghostty_config.appearance_override` (null → light → dark),
+    then invokes the `reapply_config` hook so the new
+    `theme = light:X,dark:Y` variant gets baked in. Logs the new
+    state to the agent log pane via `LogPane.appendInfo`
+  - `find_open` / `find_next` / `find_prev` (Ctrl+Shift+F /
+    Ctrl+G / Ctrl+Shift+G) — drive `find_overlay.zig`'s
+    GtkPopover + VTE PCRE2 search
+  - `cheatsheet_open` (Ctrl+?) — toggles `cheatsheet.zig`'s
+    GtkPopover, rendered from `keymap.actionList()` as Pango
+    markup
   - `hide_panel` (Escape) — gated by `predHideOnEscape`, only
     consumes the key when `window.hide_on_escape = true`;
     propagates to VTE otherwise so TUIs (vim, less, htop, fzf)
     keep working. Action table grew a per-row `predicate` field
     for this — handlers return 0 (not-handled) when the
     predicate rejects, letting GTK continue propagation.
-  Context carries `terminal`, `allocator`, `log_pane`, `panel`,
-  `config`. Subset of darwin's `terminal/view.zig::actions` —
-  entries tied to features that don't exist on linux yet (tabs,
-  find, theme toggle, cheatsheet) land as their backing features
+  - `next_tab` / `prev_tab` (Ctrl+Tab / Ctrl+Shift+Tab) and
+    `tab_1..tab_9` (Alt+1..Alt+9) — multi-profile switching.
+    All gated by `predHasMultipleProfiles` so single-profile
+    setups propagate the keys (Alt+N as readline repeat-count
+    prefix keeps working). `tab_N` handlers are
+    comptime-built via `makeTabHandler(n)`. `next_tab` /
+    `prev_tab` reach `session_host.activateNext` /
+    `activatePrev`; `tab_N` reaches `session_host.activate(n - 1)`
+    which bounds-checks (no-op past `sm.count()`).
+  - `palette_open` (Ctrl+Shift+P) — toggles `palette.zig`'s
+    type-to-switch popover. Same `predHasMultipleProfiles` gate
+    as the tab keys; single-profile setups propagate Ctrl+Shift+P
+    unchanged.
+  - `restart_session` / `shell_session` (Ctrl+R / Ctrl+Shift+R)
+    — `session_host.restartActive(null)` keeps the profile
+    command; `restartActive("/bin/zsh")` drops to the shell
+    fallback. Strategy is widget-replacement: build a fresh
+    Terminal, detach the old's child-exited handler,
+    `gtk_stack_remove` the old, `gtk_stack_add_named` the new
+    under the same name. Sidesteps VTE 0.84's set_pty(NULL)
+    NULL-deref at +0x18 inside PTY dispose.
+  Action table grew `display` + `description` fields so
+  cheatsheet renders human-readable text without re-implementing
+  GTK's accel→label transform. Context carries `session_host`,
+  `allocator`, `log_pane`, `panel`, `config`, `reapply_config`,
+  `find_overlay`, `cheatsheet`, `palette`. Mirrors darwin's
+  `terminal/view.zig::actions` — entries tied to features that
+  don't exist on linux yet (IME) land as their backing features
   do.
+- `find_overlay.zig` — `GtkPopover` anchored to the VTE widget
+  with a `GtkSearchEntry` + Prev/Next icon buttons. Each entry-
+  text change recompiles a PCRE2 regex
+  (`vte_regex_new_for_search`, CASELESS + MULTILINE) and feeds
+  it into `vte_terminal_search_set_regex`; an inline `find_next`
+  fires on every recompile so the first match is visible without
+  an extra Enter. `vte_terminal_search_set_wrap_around(true)` at
+  init so searches loop past buffer edges. Ctrl+Shift+F /
+  Ctrl+G / Ctrl+Shift+G binds in keymap.zig; Esc / autohide
+  dismisses. Signal handler ids stashed on the struct so
+  `deinit` disconnects before unparenting + regex unref.
+- `cheatsheet.zig` — `GtkPopover` parented to the VTE widget
+  containing a Pango-markup `GtkLabel`. Walks
+  `keymap.actionList()` at startup, renders rows with non-empty
+  `description` as a two-column "accel | description" block
+  inside a `<tt>` span for monospace alignment. Toggled by Ctrl+?
+  via `gtk_widget_get_visible`; autohide handles click-outside
+  dismiss.
 - `dragdrop.zig` — two `GtkDropTarget`s on the VTE widget. The
   string target accepts `G_TYPE_STRING` (GTK 4 auto-serializes
   `text/uri-list` from file managers), percent-decodes paths, shell-
@@ -339,13 +598,24 @@ Tested on CachyOS + KDE Plasma Wayland 6.x.
 
 **Not yet wired** — exists on darwin but no linux analogue:
 
-- SessionManager + multi-profile + tab strip + command palette
-  + find overlay. SessionManager itself is platform-agnostic, but
-  its surface_host wiring is darwin-only (each session binds to a
-  ghostty surface). Linux would need one VTE per session with
-  siblings hidden — a larger task, kept off this priority list
-  until someone asks for it. Find overlay + command palette can
-  land independently of multi-profile (see pick-up #7).
+- Per-profile bell (`profile.<name>.bell-*`). Fields already
+  parsed; need a `playBell(profile)` route in `notifier.zig`
+  plus a `bell` signal hookup in `terminal.zig`. Bell subsystem
+  is its own thread — see the `notifier.zig` `playSound`
+  note in the resilience polish batch.
+- Hot-reload reconcile for multi-profile. Watcher's
+  `onConfigChanged` already fires; the linux analogue of
+  `src/session/live.zig` (add / remove / re-point sessions in
+  place) hasn't landed. Tab strip + palette are built once at
+  startup today — reconcile needs to also rebuild the chip row
+  and the palette listbox when a profile is added / removed /
+  renamed.
+- Multi-session exit refinement. Today any session's
+  `child-exited` quits the panel; the active session's exit
+  should still quit, but inactive sessions exiting should
+  mark `exited: true` and surface a restart hint in the tab
+  strip. `restartActive` covers the user-initiated path so
+  this is less urgent.
 
 ## Decisions you should not undo
 
@@ -368,6 +638,33 @@ Tested on CachyOS + KDE Plasma Wayland 6.x.
   or array before the spawn lands and you get
   `g_utf8_make_valid: assertion 'str != NULL' failed`. `Terminal`
   owns argv until `deinit`.
+- **Restart via widget replacement, NOT `vte_terminal_set_pty
+  (t, NULL)`.** The natural-looking shape (hangup the child via
+  set_pty(NULL), reset, then call spawn_async on the same widget)
+  NULL-derefs at +0x18 inside VTE 0.84's PTY dispose chain. Stack
+  was `Terminal.restart -> vte_terminal_set_pty -> inner helper ->
+  unmapped fn at libvte+0x4a7b4`; address 0x18 is some priv-struct
+  field accessed mid-dispose. Deferring the spawn via `g_idle_add`
+  doesn't help — the crash is in the hangup path. `SessionHost.
+  restartActive` instead builds a fresh `Terminal`, detaches the
+  old's `child-exited` (so widget destroy can't fan out as
+  `panel.quit`), `gtk_stack_remove`s the old (which finalizes it,
+  closes the pty, SIGHUPs the child), then `gtk_stack_add_named`s
+  the new under the same stack name. Sidesteps the buggy codepath
+  entirely; matches darwin's `restartSurfaceCallback` shape.
+- **`SessionHost.Entry.name_z` must point into the STORED slot's
+  `name` buffer, not into a stack-local.** The natural pattern
+  (`var e: Entry = ...; e.name_z = written.ptr; entries.append
+  AssumeCapacity(e)`) puts `name_z` aliased to the loop frame's
+  `e.name`; after the `append` copies the value, the next
+  iteration reuses the frame so every stored `name_z` resolves to
+  the last iteration's name buffer. Looks fine on a 1-profile
+  config (no second iteration), breaks loudly on 2+: GtkStack
+  rejects every non-eager add with `duplicate child name`,
+  `set_visible_child_name` always picks the same slot, switching
+  is a visible no-op. Always `append` first then write through
+  `&entries.items[i]`; `ensureTotalCapacity(n)` reserved up front
+  guarantees no realloc-induced pointer drift.
 - **Per-target root source file.** `build.zig` selects `src/main.zig`
   on darwin and `src/main_linux.zig` on linux. Two roots are simpler
   than gating each `@import("objc")` site.
@@ -416,6 +713,17 @@ Tested on CachyOS + KDE Plasma Wayland 6.x.
   4.x naming pass. When a CSS rule "looks right but does nothing,"
   the FIRST thing to check is the node name with GtkInspector or
   the GTK source.
+- **`gtk_css_provider_load_from_string` needs a NUL terminator.**
+  The function takes `const char*` — passing
+  `buf.items.ptr` from a `std.ArrayList(u8)` reads past
+  `len` into uninitialized capacity / neighbouring allocations
+  until it hits a `\0` somewhere downstream. Symptom is garbage
+  `Theme parser error: <data>:N:M: Expected '{' after
+  selectors` warnings that mention line numbers PAST the actual
+  CSS content. log_pane appends `0` to the buffer for this
+  reason; tab_strip + palette do the same. Latent for ages until
+  the palette provider's allocation pattern shifted layout and
+  surfaced it.
 - **Initial focus grab on the VTE is mandatory.** Once the VTE
   lives inside a `GtkPaned` (for the log pane sibling), the paned's
   divider holds keyboard focus by default — arrow-key navigable.
@@ -466,6 +774,8 @@ src/
       panel.zig             # GtkWindow + gtk4-layer-shell + show/hide/toggle
       terminal.zig          # VteTerminal + shell spawn
       theme.zig             # VTE font / colors / palette / padding / opacity
+      find_overlay.zig      # GtkPopover + VTE PCRE2 search
+      cheatsheet.zig        # GtkPopover keymap reference
       ipc.zig               # Unix-socket toggle bridge
       hotkey.zig            # xdg-desktop-portal.GlobalShortcuts client
       tray.zig              # StatusNotifierItem + dbusmenu
@@ -474,6 +784,9 @@ src/
       autostart.zig         # XDG .desktop autostart entry
       dragdrop.zig          # GtkDropTarget on the VTE widget
       keymap.zig            # GtkShortcutController actions table
+      session_host.zig      # GtkStack of N VTEs (one per profile)
+      tab_strip.zig         # GtkBox of GtkButton chips per profile
+      palette.zig           # Ctrl+Shift+P type-to-switch popover
       log_pane.zig          # GtkPaned sibling: log entries + theme
       ghostty_config.zig    # ~/.config/ghostty/config + theme parser
       gdbus.zig             # shared GDBus / GVariant surface
@@ -533,61 +846,210 @@ chain. Two gotchas the next agent should not re-discover:
   one row in `keymap.zig`'s `actions` array + a handler
   function. The `predicate` field gates whether the row
   consumes the key or propagates to VTE (`hide_panel` /
-  `Escape` is the precedent — predicate reads
-  `ctx.config.window.hide_on_escape`, returns false → handler
-  returns 0 → GTK continues propagation). `KeymapContext`
-  carries `{terminal, allocator, log_pane, panel, config}` —
-  trending toward god-object (see Minor backlog).
+  `Escape` and the `tab_*` family are the precedents —
+  predicate returns false → handler returns 0 → GTK continues
+  propagation). `KeymapContext` carries
+  `{session_host, allocator, log_pane, panel, config,
+  reapply_config, find_overlay, cheatsheet}` — trending
+  toward god-object (see Minor backlog).
 
-### Multi-profile *(deferred — needs design)*
+### Multi-profile rollout
 
-Linux runs one VTE; darwin runs N ghostty surfaces with siblings
-hidden + a tab strip + `Cmd+Shift+P` palette switcher.
-SessionManager core is platform-agnostic but its surface_host
-wiring is darwin-only. Off-list until someone asks; expect a
-multi-week commitment + a design pass on whether linux uses
-N VTE widgets or N-PTYs-into-one-VTE (the latter is closer to
-ghostty's "tabs as logical sessions" but harder to surface in
-GTK).
+Decision: N VTE widgets in a `GtkStack`, one per profile, with
+custom-themed `GtkBox` + `GtkButton` chips for the tab strip and a
+`GtkPopover`-backed palette for type-to-switch. Phases 0 + 1 landed;
+Phase 2 is the next focused session.
+
+**Phase 0 — Foundation** *(landed)*
+
+`SessionHost` + `SessionManager` + MCP `djinn_active_profile`,
+`Terminal.Spawn`, find overlay `setTarget` for switch-time retarget.
+
+**Phase 1 — Tab strip + keyboard switching** *(landed)*
+
+`src/platform/linux/tab_strip.zig` (~430 LOC): horizontal `GtkBox`
+of `GtkButton` chips, one per profile, with `.djinn-tab-active`
+CSS class on the active row. CSS via reload-in-place provider.
+Hidden when `sm.count() < 2`. `pairWithChild(paned)` wraps
+`(strip, paned)` in a vertical `GtkBox`. Keymap rows landed:
+`next_tab` (Ctrl+Tab), `prev_tab` (Ctrl+Shift+Tab), `tab_1..9`
+(Alt+1..9), all gated by `predHasMultipleProfiles` so single-
+profile setups propagate the keys. SessionHost gained an
+`on_switch` hook that fires after every successful activate;
+main_linux wires it onto `TabStrip.markActive` so keymap- and
+click-driven switches share one chip-update path.
+
+**Phase 2 — `Ctrl+Shift+P` palette switcher** *(landed)*
+
+`src/platform/linux/palette.zig` (~520 LOC): `GtkPopover` anchored
+to `host.widget()` (the GtkStack) so it survives profile switches.
+Children: `GtkSearchEntry` (built-in 150ms debounce) plus a
+`GtkScrolledWindow → GtkListBox` of profile rows. Filter via
+`gtk_list_box_set_filter_func` reading a cached lowercased needle
+(rebuilt on each `search-changed`); each row carries pre-
+lowercased label + name slices in a per-row buffer so the hot
+path is two `mem.indexOf` calls. CAPTURE-phase
+`GtkEventControllerKey` on the entry intercepts Up/Down/Return/
+Escape — keyboard moves selection while the entry keeps focus.
+Activation routes through `host.activate(idx)` via the same
+`OnActivate` callback shape `tab_strip.zig` uses; the
+`SessionHost.on_switch` hook then fans the chip-row re-skin so
+palette- and click-driven switches converge on one code path.
+Keymap row `palette_open` is gated by `predHasMultipleProfiles`,
+banner reads `installed 30/30`. Side-effect: tab_strip + palette
+`gtk_css_provider_load_from_string` calls both append `\0` now
+(palette landing surfaced tab_strip's pre-existing missing-
+sentinel bug).
+
+**Phase 3 — restart-session + per-profile window-size memory** *(landed)*
+
+`SessionHost.restartActive(override_cmd)` replaces the active VTE
+widget in place. First-cut shape was in-place re-spawn:
+`vte_terminal_set_pty(t, NULL)` to hangup + deferred
+`spawn_async`; that path NULL-derefs at +0x18 inside VTE 0.84's
+PTY dispose (`set_pty -> inner helper -> libvte+0x4a7b4`) and
+crashed every Ctrl+R. The deployed shape: build a fresh
+`Terminal` first (so an OOM doesn't strand the slot empty),
+`Terminal.detachExitHandler` on the old (so widget destroy
+can't fan child-exited out as `panel.quit`), `gtk_stack_remove`
+the old widget (closes the pty, child gets SIGHUP), `deinit`
+the old's owned strings, then `gtk_stack_add_named` the fresh
+widget under the same stack name. Tab strip, log pane, window
+position all preserved. Mirrors darwin's
+`restartSurfaceCallback` (free old surface, bind a fresh one
+to the same NSView). `null` keeps the profile command
+(Ctrl+R), `"/bin/zsh"` drops to the shell fallback
+(Ctrl+Shift+R). Keymap action table grew to 32 rows.
+
+Tangent that surfaced during the restart bring-up:
+`SessionHost.init` was writing each Entry's `name_z` as a
+pointer to a stack-local's `name` buffer, then copying the
+value into the ArrayList. Every stored `name_z` aliased the
+last iteration's stack frame (resolved to `"session-N-1"`),
+so `gtk_stack_add_named` collided on every non-eager spawn
+and `set_visible_child_name` always selected the same slot —
+profile switching was visually a no-op. Fix: append the entry
+first, then `bufPrintZ` into the stored slot's `name` and
+point `name_z` at it.
+
+Per-profile window-size memory rides the `on_switch` hook: the
+hook's ctx flipped from `&tab_strip` to `&g_dispatch` so the
+callback can fan to both the chip refresh and a new
+`Dispatch.applyProfileWindowSize` that reads `state.json` and
+resizes the panel to the per-profile dims. Mirrors darwin's
+`applyProfileWindowSize` in `src/ghostty/surface_lifecycle.zig`.
+Config-pinned `window-width` / `window-height` short-circuit so
+editing the file always wins over state.json.
+
+**Follow-up multi-profile items**
+
+- **Hot-reload reconcile.** Linux analogue of
+  `src/session/live.zig`: add / remove / re-point sessions on
+  watcher fire. The tab strip is built once at startup today —
+  reconcile needs to also rebuild the chip row when a profile is
+  added / removed / renamed.
+- **Per-profile bell** (`profile.<name>.bell-*`). Fields already
+  parsed; needs a `playBell(profile)` route + VTE `bell` signal.
+
+### Darwin parity (May 2026 Tier A)
+
+A pass on the darwin-side `TODO.md`'s Tier A landed five log-pane /
+chrome features. Each translates to Linux but waits on platform
+mappings since the underlying widget stack diverges (NSTextView ↔
+GtkListBox, NSPanel chip ↔ GtkPopover etc.). Names below are the
+darwin module / pull-request that landed each; grep there for the
+shape before porting.
+
+- **Right-click "Copy entry"** in the log pane.
+  Darwin: subclassed NSTextView (`DjinnLogTextView` in
+  `agent/log_view.zig`) with `menuForEvent:` override + per-entry
+  character-range table.
+  Linux equivalent: each `GtkListBoxRow` already has its own
+  `GtkLabel`; bind a `GtkGestureClick` (right-button) on the row
+  that writes `entry.message` to `GDK_SELECTION_CLIPBOARD` via
+  `gdk_display_get_clipboard`. Probably one new helper in
+  `log_pane.zig` + a small per-row signal hookup; no schema change
+  needed (the message lives on `LogEntry.message`).
+- **Per-client color in log header.**
+  Darwin: `chrome.Style.client_palette[6]` (palette[9..15] minus
+  bright_white) + a stable hash of the resolved client label picks
+  the accent.
+  Linux: extend `log_pane.zig`'s row builder to attach a Pango
+  span with `<span color='#...'>` around the `{client}` portion of
+  the header. Palette source: `theme.palette[9..15]`, same
+  Wyhash-mod-6 mapping as darwin so the same client lands on the
+  same color across the two platforms.
+- **Filter prefix syntax** (`level:info,warn,err`, `client:<name>`)
+  + **clickable level pills** `[i][w][e]`.
+  Darwin: `FilterSpec` + `parseFilterSpec` in
+  `agent/log_view.zig` (pure-zig, already unit-tested); pills are
+  a `DjinnLevelPills` NSView in `session/log_filter.zig` with a
+  `composeNeedle` rewriter that keeps pill state + chip text in
+  sync via the needle string.
+  Linux: `parseFilterSpec` is platform-agnostic — extract from
+  `agent/log_view.zig` into a shared `agent/log_filter_spec.zig`
+  and import on both sides. Pills are a three-`GtkToggleButton`
+  row inside the existing `GtkSearchEntry` container (or
+  immediately above it); the toggle's `notify::active` handler
+  rewrites the entry text via `composeNeedle`. Cheatsheet update
+  in `linux/cheatsheet.zig` mirrors darwin's footer block.
+- **Tab strip agent-state dot** (global, trailing edge).
+  Darwin: `session/tab_strip.zig:drawRectImpl` paints a 7pt circle
+  at `bounds.size.width - 12` with color from
+  `app.g.agent.state.snapshot().state` (working=info,
+  attention=warn, error=err, idle/done=invisible). Refresh path
+  hooks into the `tickImpl` state-flip branch in
+  `terminal/view.zig`.
+  Linux: append a small `GtkDrawingArea` (or a `.djinn-state-dot`
+  `GtkLabel` with a CSS-painted `:before`) to
+  `linux/tab_strip.zig`'s container. Drive it from the existing
+  agent-state poll already running for the tray icon
+  (`tray.zig::observeAgentState`) — share the snapshot rather
+  than spinning a second timer.
+- **Profile palette enrichment + "+ duplicate active profile" row.**
+  Darwin: `session/palette.zig` row renderer now emits
+  `{label}  ·  {cwd or command}`; a synthetic row past the last
+  real session triggers `profile_manager.duplicateActive` on
+  Enter. Single-session setups can still open the palette to
+  reach the duplicate affordance.
+  Linux: each profile `GtkListBoxRow` in `linux/palette.zig` is
+  already a label child — swap the child for a horizontal `GtkBox`
+  carrying the label + a dim cwd/command label. Append a
+  sentinel row with `+ duplicate active profile` text; route its
+  `OnActivate` through a new `linux/profile_manager.zig` (mirror
+  the darwin module's append-only writeback to
+  `~/.config/djinn/config`). FSEvent watcher reload handles the
+  reconcile on disk-write completion.
+
+None of these are urgent; the structural refactors at the head of
+the priority order rank above darwin parity. Porting is
+opportunistic — pick one up when its surrounding code is already
+open for another reason.
 
 ### Independent small bites *(any order)*
 
 Don't depend on each other or on multi-profile. Sized so each
 is one focused session.
 
-- **Find overlay** (`<Control><Shift>f`, ~1 day).
-  VTE has `vte_terminal_search_set_regex` +
-  `vte_terminal_search_find_next` / `_find_previous`.
-  Surface a `GtkPopover` anchored to the top of the panel with
-  a `GtkEntry` + prev/next buttons. Darwin uses ghostty's
-  built-in find via `forwardBindingAction("search:foo")`;
-  linux is greenfield.
-- **Command palette** (`<Control><Shift>p`, ~1 day).
-  `GtkPopover` with `GtkEntry` fuzzy-filter + `GtkListView`
-  of matching actions; invoke via the same handler chain
-  keymap.zig uses. Caveat: with ~10 actions and no
-  multi-profile, value-per-effort is low — palette earns its
-  keep once multi-profile lands and profile-switching needs
-  a search UI.
 - **Per-state djinn tray icon** (small).
   `tray.zig` currently uses generic freedesktop names
   (`utilities-terminal`, `dialog-warning`, …). Ship per-state
   SVGs into a hicolor theme path during packaging and swap
   `iconName` to `djinn-idle` / `djinn-working` / etc.
-- **Log pane divider persistence.** GtkPaned tracks position
-  via user drag automatically; persist to `state.json`
-  (`state/persist.zig` is wired on linux; add a divider-fraction
-  field) and restore on next launch. Defer until multi-profile
-  since per-profile widths are the natural unit.
+- **IME / preedit support** (`vte 0.74+ commit / preedit-changed`,
+  ~2 days). Matters for CJK + dead-key keyboard layouts. Wire
+  the signals into the input pipeline so composed text reaches
+  the PTY as a single sequence instead of per-keystroke garbage.
 
 ## Known issues
 
-- **No per-profile window size memory.** Top-level size persists
-  via `persist.saveDebounced(allocator, w, h, null)` — SessionManager
-  not wired yet, so the `null` profile name means every profile
-  (when multi-profile lands) would clobber the same slot. Plumb
-  the active profile name through `Dispatch.onPanelResize` once #6
-  ships.
+- **No per-profile window size memory.** `Dispatch.onPanelResize`
+  now routes `sm.active().profile.name` into `persist.saveDebounced`,
+  but `state.json` itself still carries a single global `{w, h}` —
+  every profile writes the same slot. Reader side is missing too:
+  `SessionHost.activate` doesn't consult per-profile dims. Mirror
+  darwin's `applyProfileWindowSize` when state.json grows the
+  `profiles[<name>]` slot.
 - **Tray uses generic themed icons.** Each state maps to a
   freedesktop name (`utilities-terminal`, `dialog-warning`,
   `task-due`, `task-complete`, `dialog-error`). Swap for per-state
@@ -668,24 +1130,23 @@ Build + packaging:
   package builds in the sandbox while `checks` retains
   `__noChroot`.
 
-MCP cross-OS refactor:
-
-- **`mcp/tools.zig:43`** — `session_manager: ?*SessionManager`
-  imports `../session/manager.zig` from linux. Verify the type
-  alone is platform-agnostic; if `session/manager.zig` transitively
-  pulls darwin-specific code, linux build breaks.
-
 ### Minor — track, not blocking
 
 Code-shape:
 
-- **`terminal.zig:243`** — `argv[0..2]` magic number duplicated
-  against the `alloc(?[*:0]u8, 2)` site. Field or const.
-- **`keymap.zig` `Context`** — five fields (`terminal`, `allocator`,
-  `log_pane`, `panel`, `config`) trending toward god-object as
-  find_overlay + command_palette land. Consider per-action
-  `*anyopaque` user_data or a `Services` registry.
-- **`log_pane.zig` size** — 1373 lines, multiple concerns. Extract
+- **`terminal.zig`** — argv slot count is still a magic `2` between
+  the alloc and the deinit slice reconstitution. Plus the new
+  `cwd_path: ?[:0]u8` parallels `command_path` — could be one
+  helper that owns "this is a string we dup'd for VTE's deferred
+  spawn." Field or const.
+- **`keymap.zig` `Context`** — nine fields (`session_host`,
+  `allocator`, `log_pane`, `panel`, `config`, `reapply_config`,
+  plus the late-stamped `find_overlay` + `cheatsheet` + `palette`
+  optionals). 32-row action table now that restart_session +
+  shell_session have landed alongside palette + tab keys.
+  Consider per-action `*anyopaque` user_data or a `Services`
+  registry before the next field gets added.
+- **`log_pane.zig` size** — 1485 lines, multiple concerns. Extract
   `writeThemedCss` (~280 lines) to `log_pane_css.zig`; pull
   filter+header bookkeeping into a `LogModel` struct.
 - **`hotkey.zig` errdefer cleanup gap** on init failure between
@@ -804,6 +1265,125 @@ Packaging:
 History (landed themes — kept for context, `git log --grep=linux`
 has the chain):
 
+- **log_pane visibility toggle repair + cheatsheet popover render**
+  — `log_pane.pairWithSibling` now passes `self.container` (not
+  `self.scrolled`) to `gtk_paned_set_end_child`; scrolled is
+  already a child of container from init, and the prior code
+  tripped the `gtk_paned_set_end_child: assertion ... parent ==
+  NULL` Gtk-CRITICAL, leaving container orphaned so Ctrl+/ did
+  nothing. Cheatsheet popover flipped to `autohide=false` (the
+  label has no focusable child, so autohide's grab flipped the
+  panel window inactive and `hide-on-blur=true` hid the whole
+  panel right after popup), and `open()` now sets an explicit
+  1×1 `gtk_popover_set_pointing_to` rect at the anchor's
+  horizontal center / ~1/8 from the top each popup (without an
+  explicit pointing-to the full anchor allocation was used and
+  GTK clipped the 400px-tall popover off-screen). Recomputed
+  each open so panel resizes keep it centered. Find overlay +
+  palette stay autohide=true because their `GtkSearchEntry`
+  anchors focus.
+- **`just install-arch` rewrites ExecStart for /usr/local** —
+  `contrib/packaging/djinn.service` bakes `ExecStart=/usr/bin/
+  djinn` (the AUR install path). The recipe now `sed`s that to
+  `/usr/local/bin/djinn` after the install copy so a same-
+  system AUR-then-/usr/local install doesn't leave systemd
+  spinning on `status=203/EXEC` until `start-limit-hit`.
+- **Multi-profile Phase 2 — Ctrl+Shift+P palette switcher** —
+  new `src/platform/linux/palette.zig` (~520 LOC) wires a
+  `GtkPopover` anchored on the `SessionHost` GtkStack with a
+  `GtkSearchEntry` + scrolled `GtkListBox` of profile rows.
+  Filter via `set_filter_func` reading a cached lowercased
+  needle; each row carries pre-lowercased `label + name` slices
+  in a per-row buffer so the per-keystroke hot path is two
+  `mem.indexOf` calls per row. CAPTURE-phase
+  `GtkEventControllerKey` on the entry intercepts Up/Down/Return/
+  Escape — selection moves through the filtered rows while the
+  entry keeps focus. Selection mode BROWSE so Enter always has a
+  target. `OnActivate` callback reuses the tab strip's
+  `onTabActivate` route so palette- and click-driven switches
+  both flow through `host.activate(idx)` and the existing
+  `on_switch` hook re-skins the chip strip on both paths.
+  Module-local `GtkCssProvider` reload-in-place on `applyTheme`;
+  selected-row accent picks `palette[4]` with `@accent_color`
+  fallback, mirroring tab_strip. Drive-by: tab_strip + palette
+  both `append(0)` their CSS build buffer before
+  `gtk_css_provider_load_from_string` — palette's second
+  provider shifted allocator layout enough to surface
+  tab_strip's pre-existing missing-sentinel bug as garbage
+  `Theme parser error: <data>:N:M: Expected '{' after selectors`
+  warnings; log_pane already does this. Keymap action table grew
+  to 30 rows (`palette_open` gated by `predHasMultipleProfiles`,
+  banner reads `installed 30/30`).
+- **Multi-profile Phase 1 — tab strip + keyboard switching** —
+  new `src/platform/linux/tab_strip.zig` (430 LOC) wires a
+  horizontal `GtkBox` of `GtkButton` chips, one per session, with
+  `.djinn-tab-active` driving the active-row accent underline.
+  Module-local `GtkCssProvider` reloads in place on `applyTheme`
+  (palette[4] for the accent, `@accent_color` as GTK-named-color
+  fallback; inactive chips reserve a 2px transparent
+  border-bottom so the active accent doesn't shift the row
+  vertically on switch). Strip hidden when `sm.count() < 2`;
+  `pairWithChild(paned)` returns the vertical GtkBox that
+  main_linux hands to `panel.attachChild`. `session_host.zig`
+  gained an `OnSwitch` callback fired once per successful
+  `activate(idx)`; main_linux wires it onto `TabStrip.markActive`
+  so click + keymap paths converge on one chip-update site
+  without session_host importing tab_strip. Keymap action table
+  grew 11 rows: `next_tab`, `prev_tab`, and `tab_1..tab_9`,
+  gated by the new `predHasMultipleProfiles` predicate so
+  single-profile setups propagate Alt+N to readline. `tab_N`
+  handlers are comptime-built via `makeTabHandler(n)`.
+  `Dispatch` carries a `tab_strip` slot so `onConfigChanged`
+  fans `applyTheme` across VTE / log pane / strip in lockstep.
+- **Multi-profile foundation** — `src/platform/linux/session_host.zig`
+  owns a `GtkStack` of one VTE per profile, lazy-spawned on
+  first activate; the active-at-startup session spawns eagerly
+  so the first paint shows its shell. `Terminal.open` grew a
+  `Spawn { command, cwd }` parameter; SessionHost feeds each
+  profile's resolved command + cwd (`script > command >
+  provider > /bin/zsh`, same precedence as darwin). main_linux
+  builds `SessionManager` from config and wires
+  `&session_manager` into `ToolTable` so `djinn_active_profile`
+  returns real `{name, label, cwd, command}` instead of
+  `{"name":null}`. `onPanelResize` plumbs
+  `sm.active().profile.name` into `persist.saveDebounced` so
+  per-profile window-size memory can land later.
+  `keymap.Context.terminal` became
+  `keymap.Context.session_host`; handlers reach through
+  `currentTerminal()` so font / scroll / copy / paste / clear
+  always operate on the visible VTE. `find_overlay` anchors on
+  `host.widget()` (the stack) and gained
+  `setTarget(*GtkWidget)` — `SessionHost.activate` retargets the
+  search needle on switch without reparenting the popover.
+- **Parity easy-pickings pass** — five small parity gaps with
+  darwin filled in one session. Shift+PgUp / Shift+PgDn drive
+  VTE's GtkScrollable vadjustment by one page (universal
+  terminal-emulator scrollback gesture). Ctrl+Shift+T cycles
+  `ghostty_config.appearance_override` (null → light → dark)
+  and triggers a reapply via the new `reapply_config` hook on
+  the keymap Context — same flow a config save would invoke,
+  so the new `theme = light:X,dark:Y` variant gets baked in.
+  `state.divider` persists the log-pane GtkPaned position via
+  a debounce-shared worker (`saveDividerDebounced`) with an
+  independent dirty bit from window dims; the worker's
+  `flushOnce` reads existing disk state and only overlays the
+  dirty fields, so a 60Hz drag burst doesn't flush stale w/h
+  and vice versa. Ctrl+Shift+F opens a VTE-backed find overlay
+  (`find_overlay.zig`) — GtkPopover + GtkSearchEntry +
+  Prev/Next icon buttons; each text change recompiles a PCRE2
+  regex via `vte_regex_new_for_search` (CASELESS + MULTILINE)
+  and feeds it to `vte_terminal_search_set_regex`. Ctrl+G /
+  Ctrl+Shift+G step matches via VTE's
+  `search_find_next`/`_find_previous`. Ctrl+? opens a Pango-
+  markup cheatsheet popover (`cheatsheet.zig`) sourced from
+  the keymap action table, which grew `display` (e.g. "Ctrl+=")
+  and `description` (e.g. "Increase font size") fields. The
+  cheatsheet skips rows with empty description so the
+  layout-cover `font_inc_shift` dup doesn't double-list. New
+  tests cover the readParentInode-free building blocks: the
+  `appearance_override` cycle, the divider serializer's
+  zero-vs-non-zero branch, and the cheatsheet markup's
+  description-filter behavior.
 - **Resilience polish pass** — `watcher.zig` now survives
   destroy-and-recreate of the config dir (`rm -rf ~/.config/djinn;
   mkdir ~/.config/djinn`, an editor that does the same, a config

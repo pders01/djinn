@@ -10,6 +10,7 @@
 //! Current action set:
 //!   - font_inc / font_dec / font_reset  (Ctrl+=, Ctrl+-, Ctrl+0)
 //!   - clear_scrollback                   (Ctrl+Shift+K)
+//!   - restart_session / shell_session    (Ctrl+R / Ctrl+Shift+R)
 //!   - open_settings                      (Ctrl+,)
 //!   - mcp_copy_endpoint                  (Ctrl+Shift+M)
 //!   - copy / paste                       (Ctrl+Shift+C / Ctrl+Shift+V)
@@ -37,7 +38,12 @@ const gtk = @import("gtk.zig");
 const Config = @import("../../config.zig").Config;
 const Panel = @import("panel.zig").Panel;
 const Terminal = @import("terminal.zig").Terminal;
+const SessionHost = @import("session_host.zig").SessionHost;
 const LogPane = @import("log_pane.zig").LogPane;
+const FindOverlay = @import("find_overlay.zig").FindOverlay;
+const Cheatsheet = @import("cheatsheet.zig").Cheatsheet;
+const Palette = @import("palette.zig").Palette;
+const ghostty_config = @import("ghostty_config.zig");
 
 const GtkWidget = gtk.GtkWidget;
 const GtkWindow = gtk.GtkWindow;
@@ -91,13 +97,60 @@ extern "c" fn gtk_shortcut_new(trigger: *GtkShortcutTrigger, action: *GtkShortcu
 /// heap buffer). `log_pane` is used by `toggle_log_pane`. `panel` +
 /// `config` are used by `hide_panel` (gated on
 /// `config.window.hide_on_escape`). The font/scrollback/copy/paste
-/// handlers ignore the rest.
+/// handlers ignore the rest. `reapply_config`, when set, fires the
+/// theme-toggle path: cycle the override, then re-run the config
+/// apply chain so the new appearance variant gets baked in. Same
+/// shape as the watcher's `Handler` — main_linux.zig points it at
+/// `Dispatch.onConfigChanged`.
 pub const Context = struct {
-    terminal: *Terminal,
+    /// Multi-profile container. Handlers that need the visible VTE
+    /// (font scale, clipboard, scrollback, scroll) reach via
+    /// `session_host.currentTerminal()` so they always operate on
+    /// the currently-visible session rather than a captured Terminal
+    /// pointer that would silently address the wrong profile after
+    /// a switch.
+    session_host: *SessionHost,
     allocator: std.mem.Allocator,
     log_pane: *LogPane,
     panel: *Panel,
     config: *const Config,
+    reapply_config: ?ReapplyHook = null,
+    /// Late-stamped by main_linux after `FindOverlay.init`. Null
+    /// while the field is still under construction (the keymap_ctx
+    /// lives on the same frame so we'd otherwise need a re-stamp
+    /// step). Find handlers no-op when null instead of crashing on
+    /// a partial-init dispatch.
+    find_overlay: ?*FindOverlay = null,
+    /// Same late-stamped pattern as `find_overlay` for the
+    /// cheatsheet popover. `cheatsheet_open` no-ops when null.
+    cheatsheet: ?*Cheatsheet = null,
+    /// Multi-profile palette switcher (Ctrl+Shift+P). Late-stamped
+    /// for the same reason as the rest: its anchor (the GtkStack)
+    /// is built mid-`runWithIpc` and the keymap context lives on the
+    /// same frame, so the slot is stamped right after the palette
+    /// construction. `palette_open` no-ops when null AND the
+    /// `predHasMultipleProfiles` predicate already gates the row
+    /// against single-profile setups (belt-and-suspenders against a
+    /// future reorder dropping the palette from the wiring).
+    palette: ?*Palette = null,
+};
+
+/// Helper for handlers that operate on the active session's Terminal.
+/// Returns null when the active session's VTE isn't spawned yet
+/// (should never happen post-init — the active-at-startup session is
+/// eagerly spawned). Wrapping the unwrap here keeps the per-handler
+/// code shape `const t = activeTerminal(ctx) orelse return;` clean.
+fn activeTerminal(ctx: *Context) ?*Terminal {
+    return ctx.session_host.currentTerminal();
+}
+
+/// Callback shape main_linux.zig uses to wire `Dispatch.onConfigChanged`
+/// into `onThemeToggle`. Mirrors `watcher.Handler` deliberately so
+/// the same dispatch function services both file-save events and
+/// runtime appearance flips.
+pub const ReapplyHook = struct {
+    ctx: *anyopaque,
+    on_invoke: *const fn (ctx: *anyopaque) void,
 };
 
 /// One row of the linux action table. `accel` follows GTK's
@@ -105,40 +158,212 @@ pub const Context = struct {
 /// "<Control><Shift>k". Wiring is at install-time; the table itself
 /// is comptime-known so adding an entry is one line.
 ///
+/// `display` is the human-readable form of `accel` ("Ctrl+=", "Esc")
+/// rendered by the cheatsheet; kept alongside the GTK parse string
+/// rather than derived at runtime so the cheatsheet doesn't have to
+/// re-implement GTK's accel→label transform for our small set.
+/// `description` is the short one-line phrase the cheatsheet shows.
+/// Both default to empty for rows we don't want surfaced (mostly
+/// font_inc_shift, which is a layout-coverage dup of font_inc).
+///
 /// `predicate`, when set, gates whether the row fires for a given
 /// keypress: returning false skips the handler AND tells GTK the
 /// event wasn't consumed, so it continues to bubble (VTE / shell get
 /// it). Used by `hide_panel` so the Escape binding only swallows the
 /// key when `config.window.hide_on_escape` is on — without that gate,
 /// every TUI in the terminal (vim, less, htop, …) breaks.
-const Action = struct {
+pub const Action = struct {
     name: []const u8,
     accel: [*:0]const u8,
     handler: *const fn (ctx: *Context) void,
     predicate: ?*const fn (ctx: *Context) bool = null,
+    display: []const u8 = "",
+    description: []const u8 = "",
 };
 
+/// Public surface for the cheatsheet — `cheatsheet.zig` walks this
+/// to render the popover content. Filter rule: drop rows whose
+/// `description` is empty so the table can include rows we don't
+/// want surfaced (the font_inc_shift dup).
+pub fn actionList() []const Action {
+    return &actions;
+}
+
 const actions = [_]Action{
-    .{ .name = "font_inc", .accel = "<Control>equal", .handler = onFontInc },
+    .{
+        .name = "font_inc",
+        .accel = "<Control>equal",
+        .display = "Ctrl+=",
+        .description = "Increase font size",
+        .handler = onFontInc,
+    },
     // Ctrl+Shift+= (Ctrl++) — keyboards put '+' on the shifted '='
     // key, so the unshifted Ctrl+= binding doesn't reliably fire on
     // layouts where the user presses Shift to type '+'. Two bindings
-    // cover both muscle-memory patterns.
+    // cover both muscle-memory patterns. Cheatsheet skips this row
+    // (empty description) since it's a layout-dup of the previous.
     .{ .name = "font_inc_shift", .accel = "<Control><Shift>equal", .handler = onFontInc },
-    .{ .name = "font_dec", .accel = "<Control>minus", .handler = onFontDec },
-    .{ .name = "font_reset", .accel = "<Control>0", .handler = onFontReset },
-    .{ .name = "clear_scrollback", .accel = "<Control><Shift>k", .handler = onClearScrollback },
-    .{ .name = "open_settings", .accel = "<Control>comma", .handler = onOpenSettings },
-    .{ .name = "mcp_copy_endpoint", .accel = "<Control><Shift>m", .handler = onMcpCopyEndpoint },
-    .{ .name = "copy", .accel = "<Control><Shift>c", .handler = onCopy },
-    .{ .name = "paste", .accel = "<Control><Shift>v", .handler = onPaste },
-    .{ .name = "toggle_log_pane", .accel = "<Control>slash", .handler = onToggleLogPane },
+    .{
+        .name = "font_dec",
+        .accel = "<Control>minus",
+        .display = "Ctrl+-",
+        .description = "Decrease font size",
+        .handler = onFontDec,
+    },
+    .{
+        .name = "font_reset",
+        .accel = "<Control>0",
+        .display = "Ctrl+0",
+        .description = "Reset font size",
+        .handler = onFontReset,
+    },
+    .{
+        .name = "clear_scrollback",
+        .accel = "<Control><Shift>k",
+        .display = "Ctrl+Shift+K",
+        .description = "Clear scrollback + redraw prompt",
+        .handler = onClearScrollback,
+    },
+    .{
+        .name = "restart_session",
+        .accel = "<Control>r",
+        .display = "Ctrl+R",
+        .description = "Restart active session",
+        .handler = onRestartSession,
+    },
+    .{
+        .name = "shell_session",
+        .accel = "<Control><Shift>r",
+        .display = "Ctrl+Shift+R",
+        .description = "Restart active session as /bin/zsh",
+        .handler = onShellSession,
+    },
+    .{
+        .name = "open_settings",
+        .accel = "<Control>comma",
+        .display = "Ctrl+,",
+        .description = "Open ~/.config/djinn/config in editor",
+        .handler = onOpenSettings,
+    },
+    .{
+        .name = "mcp_copy_endpoint",
+        .accel = "<Control><Shift>m",
+        .display = "Ctrl+Shift+M",
+        .description = "Copy MCP endpoint JSON to clipboard",
+        .handler = onMcpCopyEndpoint,
+    },
+    .{
+        .name = "copy",
+        .accel = "<Control><Shift>c",
+        .display = "Ctrl+Shift+C",
+        .description = "Copy selection to clipboard",
+        .handler = onCopy,
+    },
+    .{
+        .name = "paste",
+        .accel = "<Control><Shift>v",
+        .display = "Ctrl+Shift+V",
+        .description = "Paste from clipboard",
+        .handler = onPaste,
+    },
+    .{
+        .name = "toggle_log_pane",
+        .accel = "<Control>slash",
+        .display = "Ctrl+/",
+        .description = "Toggle agent log pane",
+        .handler = onToggleLogPane,
+    },
+    .{
+        .name = "scroll_page_up",
+        .accel = "<Shift>Page_Up",
+        .display = "Shift+PgUp",
+        .description = "Scroll one page up",
+        .handler = onScrollPageUp,
+    },
+    .{
+        .name = "scroll_page_down",
+        .accel = "<Shift>Page_Down",
+        .display = "Shift+PgDn",
+        .description = "Scroll one page down",
+        .handler = onScrollPageDown,
+    },
+    .{
+        .name = "theme_toggle",
+        .accel = "<Control><Shift>t",
+        .display = "Ctrl+Shift+T",
+        .description = "Cycle theme override (system → light → dark)",
+        .handler = onThemeToggle,
+    },
+    .{
+        .name = "find_open",
+        .accel = "<Control><Shift>f",
+        .display = "Ctrl+Shift+F",
+        .description = "Open find overlay",
+        .handler = onFindOpen,
+    },
+    .{
+        .name = "find_next",
+        .accel = "<Control>g",
+        .display = "Ctrl+G",
+        .description = "Find next match",
+        .handler = onFindNext,
+    },
+    .{
+        .name = "find_prev",
+        .accel = "<Control><Shift>g",
+        .display = "Ctrl+Shift+G",
+        .description = "Find previous match",
+        .handler = onFindPrev,
+    },
+    .{
+        .name = "cheatsheet_open",
+        .accel = "<Control><Shift>question",
+        .display = "Ctrl+?",
+        .description = "Open cheatsheet (this popover)",
+        .handler = onCheatsheetOpen,
+    },
     .{
         .name = "hide_panel",
         .accel = "Escape",
+        .display = "Esc",
+        .description = "Hide panel (when hide_on_escape = true)",
         .handler = onHidePanel,
         .predicate = predHideOnEscape,
     },
+    // ─── Multi-profile switching (gated on count() > 1) ──────────
+    .{
+        .name = "palette_open",
+        .accel = "<Control><Shift>p",
+        .display = "Ctrl+Shift+P",
+        .description = "Open profile palette (type to switch)",
+        .handler = onPaletteOpen,
+        .predicate = predHasMultipleProfiles,
+    },
+    .{
+        .name = "next_tab",
+        .accel = "<Control>Tab",
+        .display = "Ctrl+Tab",
+        .description = "Switch to next profile",
+        .handler = onNextTab,
+        .predicate = predHasMultipleProfiles,
+    },
+    .{
+        .name = "prev_tab",
+        .accel = "<Control><Shift>Tab",
+        .display = "Ctrl+Shift+Tab",
+        .description = "Switch to previous profile",
+        .handler = onPrevTab,
+        .predicate = predHasMultipleProfiles,
+    },
+    .{ .name = "tab_1", .accel = "<Alt>1", .display = "Alt+1", .description = "Switch to profile 1", .handler = makeTabHandler(1), .predicate = predHasMultipleProfiles },
+    .{ .name = "tab_2", .accel = "<Alt>2", .display = "Alt+2", .description = "Switch to profile 2", .handler = makeTabHandler(2), .predicate = predHasMultipleProfiles },
+    .{ .name = "tab_3", .accel = "<Alt>3", .display = "Alt+3", .description = "Switch to profile 3", .handler = makeTabHandler(3), .predicate = predHasMultipleProfiles },
+    .{ .name = "tab_4", .accel = "<Alt>4", .display = "Alt+4", .description = "Switch to profile 4", .handler = makeTabHandler(4), .predicate = predHasMultipleProfiles },
+    .{ .name = "tab_5", .accel = "<Alt>5", .display = "Alt+5", .description = "Switch to profile 5", .handler = makeTabHandler(5), .predicate = predHasMultipleProfiles },
+    .{ .name = "tab_6", .accel = "<Alt>6", .display = "Alt+6", .description = "Switch to profile 6", .handler = makeTabHandler(6), .predicate = predHasMultipleProfiles },
+    .{ .name = "tab_7", .accel = "<Alt>7", .display = "Alt+7", .description = "Switch to profile 7", .handler = makeTabHandler(7), .predicate = predHasMultipleProfiles },
+    .{ .name = "tab_8", .accel = "<Alt>8", .display = "Alt+8", .description = "Switch to profile 8", .handler = makeTabHandler(8), .predicate = predHasMultipleProfiles },
+    .{ .name = "tab_9", .accel = "<Alt>9", .display = "Alt+9", .description = "Switch to profile 9", .handler = makeTabHandler(9), .predicate = predHasMultipleProfiles },
 };
 
 /// Install every shortcut from the action table onto the panel
@@ -218,31 +443,94 @@ fn makeCallback(
 }
 
 fn onFontInc(ctx: *Context) void {
-    ctx.terminal.fontScaleAdjust(0.1);
+    if (activeTerminal(ctx)) |t| t.fontScaleAdjust(0.1);
 }
 
 fn onFontDec(ctx: *Context) void {
-    ctx.terminal.fontScaleAdjust(-0.1);
+    if (activeTerminal(ctx)) |t| t.fontScaleAdjust(-0.1);
 }
 
 fn onFontReset(ctx: *Context) void {
-    ctx.terminal.fontScaleReset();
+    if (activeTerminal(ctx)) |t| t.fontScaleReset();
 }
 
 fn onClearScrollback(ctx: *Context) void {
-    ctx.terminal.clearScrollback();
+    if (activeTerminal(ctx)) |t| t.clearScrollback();
+}
+
+/// Hangup the active session's shell and re-spawn the same profile's
+/// command. Mirrors darwin's `Cmd+R` — escape hatch when a profile
+/// script wedges (config reload doesn't fix it because the broken
+/// child is still occupying the PTY) without losing the tab strip,
+/// log pane, or window position.
+fn onRestartSession(ctx: *Context) void {
+    _ = ctx.session_host.restartActive(null);
+}
+
+/// Hangup the active session's shell and re-spawn into `/bin/zsh`.
+/// Mirrors darwin's `Cmd+Shift+R` — escape hatch for when the
+/// configured profile script itself is broken (typo, missing
+/// dependency) so even `restart_session` would spawn the same broken
+/// process. `/bin/zsh` matches darwin's literal; users on systems
+/// without zsh fall through to whatever zsh shim ships, or this fails
+/// visibly with a VTE spawn error and the user can switch profiles
+/// to a working shell.
+fn onShellSession(ctx: *Context) void {
+    _ = ctx.session_host.restartActive("/bin/zsh");
 }
 
 fn onCopy(ctx: *Context) void {
-    ctx.terminal.copySelectionToClipboard();
+    if (activeTerminal(ctx)) |t| t.copySelectionToClipboard();
 }
 
 fn onPaste(ctx: *Context) void {
-    ctx.terminal.pasteFromClipboard();
+    if (activeTerminal(ctx)) |t| t.pasteFromClipboard();
 }
 
 fn onToggleLogPane(ctx: *Context) void {
     ctx.log_pane.toggleVisible();
+}
+
+fn onScrollPageUp(ctx: *Context) void {
+    if (activeTerminal(ctx)) |t| t.scrollPages(-1.0);
+}
+
+fn onScrollPageDown(ctx: *Context) void {
+    if (activeTerminal(ctx)) |t| t.scrollPages(1.0);
+}
+
+/// Cycle the appearance override (null → light → dark → null) and
+/// trigger the same theme apply chain a config save would. Mirrors
+/// darwin's `actionThemeToggle`. The visible chrome flip only happens
+/// when the user's ghostty config has `theme = light:X,dark:Y`;
+/// without that split the override is applied internally but the
+/// palette doesn't change, so we surface the new state in the log
+/// pane to keep the action observable in both cases.
+fn onThemeToggle(ctx: *Context) void {
+    const new_override = ghostty_config.cycleAppearanceOverride();
+    if (ctx.reapply_config) |hook| hook.on_invoke(hook.ctx);
+
+    const label: []const u8 = if (new_override) |o| switch (o) {
+        .light => "theme override → light",
+        .dark => "theme override → dark",
+    } else "theme override cleared (follow system)";
+    ctx.log_pane.appendInfo(label);
+}
+
+fn onFindOpen(ctx: *Context) void {
+    if (ctx.find_overlay) |fo| fo.open();
+}
+
+fn onFindNext(ctx: *Context) void {
+    if (ctx.find_overlay) |fo| fo.findNext();
+}
+
+fn onFindPrev(ctx: *Context) void {
+    if (ctx.find_overlay) |fo| fo.findPrevious();
+}
+
+fn onCheatsheetOpen(ctx: *Context) void {
+    if (ctx.cheatsheet) |cs| cs.toggle();
 }
 
 /// Hide the panel on Escape — Raycast/Spotlight muscle memory.
@@ -262,6 +550,41 @@ fn onHidePanel(ctx: *Context) void {
 /// no-op-with-propagation when the flag flips off.
 fn predHideOnEscape(ctx: *Context) bool {
     return ctx.config.window.hide_on_escape;
+}
+
+/// Predicate for the tab-switch family (`next_tab`, `prev_tab`,
+/// `tab_1..9`). Returns false (= propagate) on single-profile setups
+/// so the keys reach VTE / the shell unchanged — gnome-terminal /
+/// konsole convention is to bind these only in multi-tab contexts,
+/// and eating Alt+N from readline in single-profile mode would break
+/// shell history-prefix gestures.
+fn predHasMultipleProfiles(ctx: *Context) bool {
+    return ctx.session_host.sm.count() > 1;
+}
+
+fn onPaletteOpen(ctx: *Context) void {
+    if (ctx.palette) |p| p.toggle();
+}
+
+fn onNextTab(ctx: *Context) void {
+    _ = ctx.session_host.activateNext();
+}
+
+fn onPrevTab(ctx: *Context) void {
+    _ = ctx.session_host.activatePrev();
+}
+
+/// Comptime factory for `tab_N` handlers. Each call returns a fresh
+/// fn that calls `session_host.activate(N - 1)`. `SessionHost.activate`
+/// already bounds-checks, so `tab_9` with only 3 profiles is a quiet
+/// no-op (the predicate path consumes the event regardless — see
+/// `predHasMultipleProfiles` for the trade-off).
+fn makeTabHandler(comptime n: usize) *const fn (ctx: *Context) void {
+    return struct {
+        fn handle(ctx: *Context) void {
+            _ = ctx.session_host.activate(n - 1);
+        }
+    }.handle;
 }
 
 /// Open `~/.config/djinn/config` in the desktop-registered text

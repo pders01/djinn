@@ -27,13 +27,26 @@ const max_rows: usize = 9;
 pub fn open() void {
     if (app.g.palette.mode) return;
     const sm = app.g.session_manager orelse return;
-    if (sm.sessions.items.len < 2) return; // nothing to switch between
+    // Single-session setups still benefit from the palette: it exposes
+    // the "+ duplicate active profile" affordance even when there are
+    // no other sessions to switch between.
+    if (sm.sessions.items.len == 0) return;
 
     app.g.palette.mode = true;
     app.g.palette.query_len = 0;
     app.g.palette.selected = sm.active_idx;
 
     mountOverlay();
+}
+
+/// Synthetic row index for the "+ duplicate active profile" affordance.
+/// Lives one slot past the last real session so the existing
+/// `selected: usize` field can address it without introducing a tagged
+/// enum (the palette has one tab-style selection model — adding a
+/// second variant just for one row isn't worth the churn).
+fn duplicateRowIdx() usize {
+    const sm = app.g.session_manager orelse return 0;
+    return sm.sessions.items.len;
 }
 
 pub fn close() void {
@@ -90,7 +103,10 @@ pub fn handleKey(event: objc.Object, keycode: u16) void {
         if (app.g.palette.query_len > 0) {
             app.g.palette.query_len -= 1;
             // Re-clamp selection to a still-matching row.
-            if (firstMatch()) |idx| app.g.palette.selected = idx;
+            // Fall back to the synthetic duplicate row when the query
+    // excludes every real session — the user always has at least one
+    // valid Enter target.
+    app.g.palette.selected = firstMatch() orelse duplicateRowIdx();
         }
         refresh();
         return;
@@ -108,14 +124,21 @@ pub fn handleKey(event: objc.Object, keycode: u16) void {
     const take = @min(s.len, room);
     @memcpy(app.g.palette.query_buf[app.g.palette.query_len .. app.g.palette.query_len + take], s[0..take]);
     app.g.palette.query_len += take;
-    if (firstMatch()) |idx| app.g.palette.selected = idx;
+    // Fall back to the synthetic duplicate row when the query
+    // excludes every real session — the user always has at least one
+    // valid Enter target.
+    app.g.palette.selected = firstMatch() orelse duplicateRowIdx();
     refresh();
 }
 
 /// Move the selection cursor by `delta` (-1 / +1) through the
-/// filtered list. Wraps neither end — Up at top is a no-op.
+/// filtered list **plus** the synthetic "+ duplicate active" row at
+/// the end. Wraps neither end — Up at top is a no-op.
 fn moveSelection(delta: i32) void {
     const sm = app.g.session_manager orelse return;
+    const dup_idx = duplicateRowIdx();
+
+    // Count visible rows: filtered sessions + 1 for the duplicate row.
     var sessions: usize = 0;
     var current_ordinal: usize = 0;
     var found_current = false;
@@ -127,7 +150,12 @@ fn moveSelection(delta: i32) void {
         }
         sessions += 1;
     }
-    if (sessions == 0) return;
+    // Duplicate row's ordinal sits just past the last real session.
+    if (app.g.palette.selected == dup_idx) {
+        current_ordinal = sessions;
+        found_current = true;
+    }
+    const total = sessions + 1; // +1 for the duplicate row
     if (!found_current) current_ordinal = 0;
 
     const next_ordinal: usize = blk: {
@@ -135,9 +163,15 @@ fn moveSelection(delta: i32) void {
             if (current_ordinal == 0) break :blk 0;
             break :blk current_ordinal - 1;
         }
-        if (current_ordinal + 1 >= sessions) break :blk sessions - 1;
+        if (current_ordinal + 1 >= total) break :blk total - 1;
         break :blk current_ordinal + 1;
     };
+
+    // Last ordinal = duplicate row.
+    if (next_ordinal == sessions) {
+        app.g.palette.selected = dup_idx;
+        return;
+    }
 
     var seen: usize = 0;
     for (sm.sessions.items, 0..) |sess, i| {
@@ -153,6 +187,18 @@ fn moveSelection(delta: i32) void {
 fn commitSelection() void {
     const sm = app.g.session_manager orelse return;
     const idx = app.g.palette.selected;
+
+    // Synthetic "+ duplicate active profile" row — `idx` equals the
+    // first slot past the real sessions array. Closes the palette
+    // before calling duplicateActive so the new profile (which
+    // reconciles + activates on the next FSEvent tick) doesn't have
+    // to fight an open overlay for focus.
+    if (idx == duplicateRowIdx()) {
+        close();
+        @import("profile_manager.zig").duplicateActive();
+        return;
+    }
+
     if (idx >= sm.sessions.items.len) {
         close();
         return;
@@ -218,7 +264,8 @@ fn mountOverlay() void {
     registerClass();
     const cls = objc.getClass("DjinnPalette") orelse return;
     const sm = app.g.session_manager orelse return;
-    const visible_rows = @min(sm.sessions.items.len, max_rows);
+    // +1 row for the synthetic "+ duplicate active profile" affordance.
+    const visible_rows = @min(sm.sessions.items.len + 1, max_rows);
     const palette_h = header_h + @as(f64, @floatFromInt(visible_rows)) * row_h + 8;
     const x = (c_bounds.size.width - palette_w) / 2.0;
     const y = c_bounds.size.height - palette_h - 80; // anchored ~80pt below top edge
@@ -290,19 +337,26 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
     const font_key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "NSFont")});
     const fg_key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "NSColor")});
 
-    // Header: "switch profile" hint + live query text.
+    // Header: "profile" hint + live query text. Single word covers
+    // both the switch + duplicate use cases the palette now handles —
+    // the "+ duplicate active profile" row makes the second role
+    // self-documenting once visible.
     var header_buf: [192]u8 = undefined;
     const q = app.g.palette.query_buf[0..app.g.palette.query_len];
-    const header_z = std.fmt.bufPrintZ(&header_buf, "switch profile · {s}", .{q}) catch return;
+    const header_z = std.fmt.bufPrintZ(&header_buf, "profile · {s}", .{q}) catch return;
     const header_str = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, header_z.ptr)});
     const header_attrs = NSMutableDictionary.msgSend(objc.Object, "dictionaryWithCapacity:", .{@as(c_ulong, 2)});
     header_attrs.msgSend(void, "setObject:forKey:", .{ font, font_key });
     header_attrs.msgSend(void, "setObject:forKey:", .{ chrome.nsColorFromRgb(NSColor, style.fg), fg_key });
     header_str.msgSend(void, "drawAtPoint:withAttributes:", .{ NSPoint{ .x = 12, .y = 8 }, header_attrs });
 
-    // Rows: one per matching profile, capped at max_rows.
+    // Rows: one per matching profile, capped at max_rows. Each row
+    // gets `{label}  ·  {cwd_or_command}` so the user can tell which
+    // profile maps to which working dir / spawn target without first
+    // activating it.
     var y: f64 = header_h;
     var shown: usize = 0;
+    const dim_color = chrome.nsColorFromRgb(NSColor, style.chip.dim);
     for (sm.sessions.items, 0..) |sess, i| {
         if (shown >= max_rows) break;
         const label = sess.profile.label();
@@ -322,18 +376,61 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
             NSBezierPath.msgSend(void, "fillRect:", .{row_rect});
         }
         const text_color = chrome.nsColorFromRgb(NSColor, if (is_selected) style.fg else style.chip.dim);
-        const row_attrs = NSMutableDictionary.msgSend(objc.Object, "dictionaryWithCapacity:", .{@as(c_ulong, 2)});
-        row_attrs.msgSend(void, "setObject:forKey:", .{ font, font_key });
-        row_attrs.msgSend(void, "setObject:forKey:", .{ text_color, fg_key });
-        var row_buf: [128]u8 = undefined;
-        const row_z = std.fmt.bufPrintZ(&row_buf, "{s}", .{label}) catch continue;
-        const row_str = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, row_z.ptr)});
-        // Vertical center within the row.
-        const text_size = row_str.msgSend(NSSize, "sizeWithAttributes:", .{row_attrs});
-        const text_y = y + (row_h - text_size.height) / 2.0;
-        row_str.msgSend(void, "drawAtPoint:withAttributes:", .{ NSPoint{ .x = 16, .y = text_y }, row_attrs });
+
+        // Profile label run.
+        const label_attrs = NSMutableDictionary.msgSend(objc.Object, "dictionaryWithCapacity:", .{@as(c_ulong, 2)});
+        label_attrs.msgSend(void, "setObject:forKey:", .{ font, font_key });
+        label_attrs.msgSend(void, "setObject:forKey:", .{ text_color, fg_key });
+        var label_buf: [128]u8 = undefined;
+        const label_z = std.fmt.bufPrintZ(&label_buf, "{s}", .{label}) catch continue;
+        const label_str = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, label_z.ptr)});
+        const label_size = label_str.msgSend(NSSize, "sizeWithAttributes:", .{label_attrs});
+        const text_y = y + (row_h - label_size.height) / 2.0;
+        label_str.msgSend(void, "drawAtPoint:withAttributes:", .{ NSPoint{ .x = 16, .y = text_y }, label_attrs });
+
+        // Detail run (cwd preferred; falls back to command). Always
+        // dim, regardless of selection — keeps the label as the
+        // primary read while detail is supporting context.
+        const detail: []const u8 = sess.profile.cwd orelse sess.profile.command;
+        var detail_buf: [128]u8 = undefined;
+        const detail_z = std.fmt.bufPrintZ(&detail_buf, "{s}", .{detail}) catch null;
+        if (detail_z) |z| {
+            const detail_attrs = NSMutableDictionary.msgSend(objc.Object, "dictionaryWithCapacity:", .{@as(c_ulong, 2)});
+            detail_attrs.msgSend(void, "setObject:forKey:", .{ font, font_key });
+            detail_attrs.msgSend(void, "setObject:forKey:", .{ dim_color, fg_key });
+            const detail_str = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, z.ptr)});
+            const detail_x = 16 + label_size.width + 12; // 12pt gap after label
+            detail_str.msgSend(void, "drawAtPoint:withAttributes:", .{ NSPoint{ .x = detail_x, .y = text_y }, detail_attrs });
+        }
 
         y += row_h;
         shown += 1;
+    }
+
+    // Synthetic "+ duplicate active profile" row. Always visible
+    // (even when the filter hides all real rows) so the user can
+    // always add a new profile from the palette — matches the
+    // "discovery surface" framing in `TODO.md`'s Tier A item 4.
+    if (shown < max_rows) {
+        const dup_idx = duplicateRowIdx();
+        const dup_rect = NSRect{
+            .origin = .{ .x = 0, .y = y },
+            .size = .{ .width = bounds.size.width, .height = row_h },
+        };
+        const is_selected = dup_idx == app.g.palette.selected;
+        if (is_selected) {
+            const sel = chrome.nsColorFromRgb(NSColor, style.chip.bg);
+            sel.msgSend(void, "set", .{});
+            NSBezierPath.msgSend(void, "fillRect:", .{dup_rect});
+        }
+        const dup_color = chrome.nsColorFromRgb(NSColor, if (is_selected) style.info else style.chip.dim);
+        const dup_attrs = NSMutableDictionary.msgSend(objc.Object, "dictionaryWithCapacity:", .{@as(c_ulong, 2)});
+        dup_attrs.msgSend(void, "setObject:forKey:", .{ font, font_key });
+        dup_attrs.msgSend(void, "setObject:forKey:", .{ dup_color, fg_key });
+        const dup_z: [:0]const u8 = "+ duplicate active profile";
+        const dup_str = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, dup_z.ptr)});
+        const dup_size = dup_str.msgSend(NSSize, "sizeWithAttributes:", .{dup_attrs});
+        const dup_y = y + (row_h - dup_size.height) / 2.0;
+        dup_str.msgSend(void, "drawAtPoint:withAttributes:", .{ NSPoint{ .x = 16, .y = dup_y }, dup_attrs });
     }
 }

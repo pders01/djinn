@@ -122,6 +122,7 @@ extern "c" fn gtk_paned_new(orientation: c_int) *GtkWidget;
 extern "c" fn gtk_paned_set_start_child(paned: *GtkPaned, child: *GtkWidget) void;
 extern "c" fn gtk_paned_set_end_child(paned: *GtkPaned, child: *GtkWidget) void;
 extern "c" fn gtk_paned_set_position(paned: *GtkPaned, position: c_int) void;
+extern "c" fn gtk_paned_get_position(paned: *GtkPaned) c_int;
 
 extern "c" fn gtk_box_new(orientation: c_int, spacing: c_int) *GtkWidget;
 extern "c" fn gtk_box_append(box: *GtkBox, child: *GtkWidget) void;
@@ -155,6 +156,17 @@ const gdk_display_get_default = gtk.gdk_display_get_default;
 /// looking at an empty pane needs to know whether their filter is
 /// too narrow vs. their agent is just quiet.
 const Placeholder = enum { none, no_activity, no_matches };
+
+/// Caller-supplied handler for divider drags. Fires on each
+/// `notify::position` emission from the paned — typically ~60Hz
+/// during an interactive drag. `position` is the start-child width
+/// in pixels (matches `gtk_paned_get_position`'s units). main_linux
+/// routes this to `persist.saveDividerDebounced` so the 300ms worker
+/// flattens the burst into one disk write per gesture.
+pub const DividerHandler = struct {
+    ctx: *anyopaque,
+    on_change: *const fn (ctx: *anyopaque, position: i32) void,
+};
 
 /// The log pane is constructed once at startup and lives until the
 /// panel does. `container` is the outer vertical box the caller hands
@@ -239,6 +251,16 @@ pub const LogPane = struct {
     /// (never observed in practice) would otherwise collapse the
     /// "unknown" and "matched empty" cases.
     last_client_known: bool = false,
+    /// Cached GtkPaned built by `pairWithSibling`. Null until that
+    /// method runs. `setOnDividerChange` reads it to connect the
+    /// `notify::position` signal so divider drags can persist to
+    /// state.json without main_linux.zig holding its own paned
+    /// pointer.
+    paned: ?*GtkPaned = null,
+    divider_handler: ?DividerHandler = null,
+    /// `notify::position` signal id (0 = unwired), disconnected by
+    /// `deinit` before the paned drops.
+    divider_signal_id: c_ulong = 0,
 
     pub fn init(allocator: std.mem.Allocator) !LogPane {
         // Outer scrolled window. Horizontal scrollbar never appears
@@ -443,6 +465,11 @@ pub const LogPane = struct {
             g_signal_handler_disconnect(@ptrCast(self.search_entry), self.search_changed_id);
             self.search_changed_id = 0;
         }
+        if (self.divider_signal_id != 0) {
+            if (self.paned) |p|
+                g_signal_handler_disconnect(@ptrCast(p), self.divider_signal_id);
+            self.divider_signal_id = 0;
+        }
         // Widgets are owned by their parent (GtkPaned → GtkWindow);
         // GTK reclaims them when the window is destroyed. We only
         // own the CSS provider's local ref beyond what
@@ -490,6 +517,18 @@ pub const LogPane = struct {
     /// here (not in init) keeps them from firing before
     /// `observed_state` is set, and the `was_unobserved` gate makes
     /// re-calls idempotent so duplicate handlers don't stack.
+    /// Best-effort info-log append on the observed AgentState. No-op
+    /// when `observeAgentState` hasn't been called yet — used by
+    /// keymap actions (theme_toggle today) that want to surface a
+    /// status line in the log pane without threading a separate
+    /// AgentState pointer through Context. The OOM path is swallowed
+    /// because callers are typically running on the GLib main thread
+    /// and would have nothing better to do with the error.
+    pub fn appendInfo(self: *LogPane, message: []const u8) void {
+        const state = self.observed_state orelse return;
+        state.appendLog(.info, message) catch {};
+    }
+
     pub fn observeAgentState(self: *LogPane, state: *AgentState) void {
         if (self.poll_source_id != 0) _ = g_source_remove(self.poll_source_id);
         const was_unobserved = self.observed_state == null;
@@ -538,11 +577,62 @@ pub const LogPane = struct {
     ) *GtkWidget {
         const paned = gtk_paned_new(GTK_ORIENTATION_HORIZONTAL);
         gtk_paned_set_start_child(@ptrCast(paned), left_child);
-        gtk_paned_set_end_child(@ptrCast(paned), self.scrolled);
+        // end_child must be `self.container` (the outer vertical box
+        // holding attention chip + scrolled list + search entry), NOT
+        // `self.scrolled`. `scrolled` is already a child of
+        // `self.container` from init; passing it here trips a
+        // `gtk_paned_set_end_child: assertion ... gtk_widget_get_parent
+        // (child) == NULL' failed` Gtk-CRITICAL and either silently
+        // no-ops the assignment OR reparents scrolled out of container.
+        // Either outcome leaves `self.container` (the widget that
+        // `setVisible`/`toggleVisible` toggle) orphaned outside the
+        // widget tree; Ctrl+/ then does nothing visible.
+        gtk_paned_set_end_child(@ptrCast(paned), self.container);
         gtk_paned_set_position(@ptrCast(paned), divider_position);
+        self.paned = @ptrCast(paned);
         return paned;
     }
+
+    /// Connect a handler that fires on every GtkPaned `notify::position`
+    /// emission — main_linux uses this to forward divider drags into
+    /// the persist worker. Must be called AFTER `pairWithSibling` so
+    /// the paned exists. Idempotent: a second call replaces the prior
+    /// handler so a hypothetical re-wire (e.g. config-driven persist
+    /// disable) doesn't stack subscriptions. Stores the signal id so
+    /// `deinit` can disconnect before the paned drops.
+    pub fn setOnDividerChange(self: *LogPane, handler: DividerHandler) void {
+        const paned = self.paned orelse return;
+        if (self.divider_signal_id != 0) {
+            g_signal_handler_disconnect(@ptrCast(paned), self.divider_signal_id);
+            self.divider_signal_id = 0;
+        }
+        self.divider_handler = handler;
+        self.divider_signal_id = g_signal_connect_data(
+            @ptrCast(paned),
+            "notify::position",
+            @ptrCast(&onPanedNotifyPosition),
+            @ptrCast(self),
+            null,
+            0,
+        );
+    }
 };
+
+/// GObject `notify::<prop>` signal shape: `(instance, pspec, user_data)`.
+/// We don't need the pspec (we only subscribed to `position`), so it's
+/// ignored. The handler reads the live position from the paned and
+/// fans out to the caller's debounce hook.
+fn onPanedNotifyPosition(
+    paned_ptr: *GObject,
+    _: ?*anyopaque,
+    user_data: gpointer,
+) callconv(.c) void {
+    const self: *LogPane = @ptrCast(@alignCast(user_data orelse return));
+    const handler = self.divider_handler orelse return;
+    const paned: *GtkPaned = @ptrCast(paned_ptr);
+    const pos = gtk_paned_get_position(paned);
+    handler.on_change(handler.ctx, @intCast(pos));
+}
 
 // ─── Implementation ──────────────────────────────────────────────────
 

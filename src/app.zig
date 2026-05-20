@@ -218,6 +218,11 @@ pub const AppState = struct {
         /// indicator even after the user moves focus back to the
         /// terminal.
         field_id: ?objc.c.id = null,
+        /// `DjinnLevelPills` NSView — three click-toggle pills (i/w/e)
+        /// sitting to the left of the chip. mouseDown rewrites the
+        /// `level:` portion of `query_buf` so pill state + chip text
+        /// stay in sync (single source of truth = the needle string).
+        pill_view_id: ?objc.c.id = null,
     };
 
     pub const CheatsheetState = struct {

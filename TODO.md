@@ -71,27 +71,34 @@ overrides. Reuses `chrome.Style`; standalone module
 
 **Tier A — high value, medium cost (target this pass):**
 
-1. **Log pane v2** — filter chips (per-client, per-level, free-text
-   search debounced), click-to-copy entry, sticky "active
-   attentions" pinned until acked. Backfill: extend `djinn_log`
-   schema with optional `kind` / `file` / `line` / `tag`. Per-row
-   NSView refactor still gated by per-call expansion (see deferred
-   section below).
-2. **Per-client identity surface** — replace 6-hex client id with
-   user-set nickname (`client.<hash>.name = "review-bot"` in
-   config). Color-coded chip per client in log + tab strip dot when
-   client is active. Per-client mute toggle (notifications off,
-   still logged).
-3. **Notification policy** — coalesce `djinn_progress` (max 1
-   banner per 30s per client); banner only on attention / error /
-   done by default. Config keys
-   `notifications.progress_rate_limit_ms`,
-   `notifications.banner_states`.
-4. **Profile manager overlay (Cmd+Shift+N)** — append-only
-   writeback to config (path 1 from the deferred "dynamic profile
-   creation" section above); "duplicate active profile" preset;
-   show resolved cwd + spawn command per profile. The
-   palette-switcher UX is the natural surface.
+1. **Log pane v2** — sticky attentions ✅, free-text filter chip ✅,
+   per-client color in header ✅, right-click "Copy entry" ✅,
+   prefix-syntax filter (`level:warn,err`, `client:<name>`) ✅,
+   clickable level pills (`[i][w][e]` next to the chip) ✅. Pills
+   rewrite the chip needle on click so the prefix-syntax and visual
+   state share one source of truth. Per-client pill UI deferred
+   (would need dynamic palette as clients appear — not blocking;
+   `client:` prefix covers the keyboard path). Remaining:
+   `djinn_log` schema `kind`/`file`/`line`/`tag` extension +
+   per-row NSView refactor — still gated by per-call expansion.
+2. **Per-client identity surface** — nickname ✅, mute toggle ✅,
+   color-coded client name in log header ✅, tab strip status dot
+   (global agent state, not per-client) ✅. The dot lives at the
+   trailing edge of the tab strip, mirrors the menubar SF Symbol
+   coloring (working / attention / error), and gives the user a
+   near-eye-line state cue while focused on the panel. Per-client
+   per-tab variant still deferred — needs per-profile MCP client
+   routing first.
+3. **Notification policy** ✅ — `Notifier.sendKind` rate-limits per
+   (client, kind) tuple via `notifications.rate_limit_ms`; per-
+   state gates (`notifications.notify_on_{attention,error,done,
+   progress}`) suppress chatter classes by default.
+4. **Profile manager overlay** ✅ — folded into the Cmd+Shift+P
+   palette (same surface, no new module). Rows now render
+   `{label}  ·  {cwd or command}` and a synthetic "+ duplicate
+   active profile" row sits at the bottom, auto-selected when the
+   filter excludes every real session. Cmd+Shift+N still maps to
+   the direct `profile_duplicate` action for muscle-memory users.
 5. **Session resume** *(deferred — ghostty API gap)*. ghostty
    exposes `ghostty_surface_read_text` (selection-based) but no
    `inject_text` / `write_to_scrollback`. We can dump scrollback

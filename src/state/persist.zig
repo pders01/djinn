@@ -14,6 +14,13 @@ pub const ProfileSize = struct {
 pub const State = struct {
     width: u32 = 0,
     height: u32 = 0,
+    /// Persisted log-pane divider position in pixels (the VTE-side
+    /// width of the horizontal GtkPaned). 0 means "not yet saved" —
+    /// caller falls through to the config-derived default in that
+    /// case. Per-profile divider isn't wired yet; this is a single
+    /// global slot. Once SessionManager lands on linux the field
+    /// can grow into the `profiles` map alongside width/height.
+    divider: u32 = 0,
     /// Owned by `arena`. Slices point into the arena. Use
     /// `profileSize(name)` instead of iterating directly.
     profiles: []const ProfileSize = &.{},
@@ -75,6 +82,9 @@ pub fn load(allocator: std.mem.Allocator) ?State {
     if (root.object.get("height")) |v| if (v == .integer) {
         s.height = @intCast(v.integer);
     };
+    if (root.object.get("divider")) |v| if (v == .integer) {
+        s.divider = @intCast(v.integer);
+    };
     if (root.object.get("profiles")) |v| if (v == .object) {
         var list: std.ArrayList(ProfileSize) = .{};
         var it = v.object.iterator();
@@ -97,17 +107,24 @@ pub fn load(allocator: std.mem.Allocator) ?State {
     // Treat the file as absent when nothing useful was parsed. Keeps
     // `restoreWindowSize`'s "fall through to config default" path
     // working when state.json is empty `{}` or has lost its data.
-    if (s.width == 0 and s.height == 0 and s.profiles.len == 0) {
+    if (s.width == 0 and s.height == 0 and s.divider == 0 and s.profiles.len == 0) {
         s.deinit(allocator);
         return null;
     }
     return s;
 }
 
-/// Atomically rewrite state.json with the given top-level dims and
-/// per-profile map. The map is the source of truth — callers compose
-/// it via `updateProfile` rather than writing files directly.
-pub fn save(allocator: std.mem.Allocator, width: u32, height: u32, profiles: []const ProfileSize) void {
+/// Atomically rewrite state.json with the given top-level dims,
+/// log-pane divider position, and per-profile map. The map is the
+/// source of truth — callers compose it via `updateProfile` rather
+/// than writing files directly.
+pub fn save(
+    allocator: std.mem.Allocator,
+    width: u32,
+    height: u32,
+    divider: u32,
+    profiles: []const ProfileSize,
+) void {
     const path = statePath(allocator) catch return;
     defer allocator.free(path);
 
@@ -118,7 +135,7 @@ pub fn save(allocator: std.mem.Allocator, width: u32, height: u32, profiles: []c
     var buf: std.ArrayList(u8) = .{};
     defer buf.deinit(allocator);
 
-    writeJson(&buf, allocator, width, height, profiles) catch return;
+    writeJson(&buf, allocator, width, height, divider, profiles) catch return;
 
     const file = std.fs.createFileAbsolute(path, .{ .truncate = true }) catch return;
     defer file.close();
@@ -130,10 +147,14 @@ fn writeJson(
     allocator: std.mem.Allocator,
     width: u32,
     height: u32,
+    divider: u32,
     profiles: []const ProfileSize,
 ) !void {
     var w = buf.writer(allocator);
     try w.print("{{\"width\":{d},\"height\":{d}", .{ width, height });
+    if (divider != 0) {
+        try w.print(",\"divider\":{d}", .{divider});
+    }
     if (profiles.len > 0) {
         try w.writeAll(",\"profiles\":{");
         for (profiles, 0..) |p, i| {
@@ -178,10 +199,16 @@ fn writeEscaped(w: anytype, s: []const u8) !void {
 var g_mutex: std.Thread.Mutex = .{};
 var g_pending_width: u32 = 0;
 var g_pending_height: u32 = 0;
+var g_pending_size_dirty: bool = false;
+var g_pending_divider: u32 = 0;
+/// Independent dirty bit so a divider drag (Ctrl-key, mouse) doesn't
+/// have to know window dimensions, and a window resize doesn't have
+/// to know the divider position. The worker flushes whichever bits
+/// are dirty, preserving the unset fields from the on-disk state.
+var g_pending_divider_dirty: bool = false;
 var g_pending_profile_buf: [128]u8 = undefined;
 var g_pending_profile_len: usize = 0;
 var g_pending_has_profile: bool = false;
-var g_pending_dirty: bool = false;
 /// In-flight worker handle. Set on spawn, cleared by the next spawn
 /// (after joining the previous, stale handle) or by `joinPendingSave`.
 /// Non-null does NOT imply the worker is currently executing —
@@ -214,9 +241,37 @@ pub fn saveDebounced(allocator: std.mem.Allocator, width: u32, height: u32, prof
         g_pending_profile_len = trim_len;
         g_pending_has_profile = true;
     }
-    g_pending_dirty = true;
+    g_pending_size_dirty = true;
 
-    // Existing worker re-checks `g_pending_dirty` after every sleep
+    armWorkerLocked(allocator);
+}
+
+/// Same debounce machinery as `saveDebounced` but updates only the
+/// log-pane divider position. Called from a `notify::position` signal
+/// on the GtkPaned at ~60Hz during a user drag — the 300ms worker
+/// sleep flattens the burst into a single disk write per gesture.
+/// Window dims pending from a concurrent `saveDebounced` flush in the
+/// same window; if only one of them is dirty the worker preserves the
+/// untouched fields from on-disk state.
+pub fn saveDividerDebounced(allocator: std.mem.Allocator, position: u32) void {
+    g_mutex.lock();
+    defer g_mutex.unlock();
+
+    if (g_shutdown) return;
+
+    g_pending_divider = position;
+    g_pending_divider_dirty = true;
+
+    armWorkerLocked(allocator);
+}
+
+/// Spawn the debounce worker if not already running, joining any
+/// previously-completed handle first. Called under `g_mutex` from
+/// every `save*Debounced` entry point. Extracted so adding a new
+/// dirty-bit family (e.g. per-profile divider, future state fields)
+/// is one line at the call site rather than four lines of bookkeeping.
+fn armWorkerLocked(allocator: std.mem.Allocator) void {
+    // Existing worker re-checks the dirty flags after every sleep
     // and picks up the new values without a fresh spawn.
     if (g_worker_alive) return;
 
@@ -252,11 +307,14 @@ fn debounceWorker(allocator: std.mem.Allocator) void {
         std.Thread.sleep(300 * std.time.ns_per_ms);
 
         g_mutex.lock();
-        if (g_shutdown or !g_pending_dirty) {
+        if (g_shutdown or (!g_pending_size_dirty and !g_pending_divider_dirty)) {
             g_worker_alive = false;
             g_mutex.unlock();
             return;
         }
+        // Snapshot pending values + dirty bits under the mutex so the
+        // worker can spend the rest of the cycle outside it.
+        const size_dirty = g_pending_size_dirty;
         const w = g_pending_width;
         const h = g_pending_height;
         const has_p = g_pending_has_profile;
@@ -266,18 +324,41 @@ fn debounceWorker(allocator: std.mem.Allocator) void {
             profile_len = g_pending_profile_len;
             @memcpy(profile_buf[0..profile_len], g_pending_profile_buf[0..profile_len]);
         }
-        g_pending_dirty = false;
+        const divider_dirty = g_pending_divider_dirty;
+        const div = g_pending_divider;
+
+        g_pending_size_dirty = false;
+        g_pending_divider_dirty = false;
         g_mutex.unlock();
 
-        flushOnce(allocator, w, h, has_p, profile_buf[0..profile_len]);
+        flushOnce(allocator, .{
+            .size = if (size_dirty) .{ .w = w, .h = h } else null,
+            .divider = if (divider_dirty) div else null,
+            .profile = if (size_dirty and has_p) profile_buf[0..profile_len] else null,
+        });
     }
 }
 
-fn flushOnce(allocator: std.mem.Allocator, w: u32, h: u32, has_profile: bool, name: []const u8) void {
-    // Merge with what's on disk so the per-profile map persists across
-    // saves that target a different profile.
+const FlushUpdate = struct {
+    size: ?struct { w: u32, h: u32 } = null,
+    divider: ?u32 = null,
+    /// When set, the worker writes a per-profile entry for this name
+    /// using `size.w`/`size.h`. `flushOnce` enforces that `profile` is
+    /// only non-null when `size` is also non-null (a profile entry
+    /// needs dimensions to record).
+    profile: ?[]const u8 = null,
+};
+
+fn flushOnce(allocator: std.mem.Allocator, update: FlushUpdate) void {
+    // Merge with what's on disk so the unset (non-dirty) fields keep
+    // their previous values across saves that target a different
+    // subset.
     var existing = load(allocator);
     defer if (existing) |*e| e.deinit(allocator);
+
+    const final_w: u32 = if (update.size) |s| s.w else if (existing) |e| e.width else 0;
+    const final_h: u32 = if (update.size) |s| s.h else if (existing) |e| e.height else 0;
+    const final_div: u32 = if (update.divider) |d| d else if (existing) |e| e.divider else 0;
 
     var merged: std.ArrayList(ProfileSize) = .{};
     defer merged.deinit(allocator);
@@ -285,12 +366,13 @@ fn flushOnce(allocator: std.mem.Allocator, w: u32, h: u32, has_profile: bool, na
         merged.appendSlice(allocator, e.profiles) catch {};
     }
 
-    if (has_profile) {
+    if (update.profile) |name| {
+        const sz = update.size orelse return; // unreachable per FlushUpdate contract
         var found = false;
         for (merged.items) |*p| {
             if (std.mem.eql(u8, p.name, name)) {
-                p.width = w;
-                p.height = h;
+                p.width = sz.w;
+                p.height = sz.h;
                 found = true;
                 break;
             }
@@ -298,17 +380,17 @@ fn flushOnce(allocator: std.mem.Allocator, w: u32, h: u32, has_profile: bool, na
         if (!found) {
             const owned = allocator.dupe(u8, name) catch return;
             defer allocator.free(owned);
-            merged.append(allocator, .{ .name = owned, .width = w, .height = h }) catch return;
-            save(allocator, w, h, merged.items);
+            merged.append(allocator, .{ .name = owned, .width = sz.w, .height = sz.h }) catch return;
+            save(allocator, final_w, final_h, final_div, merged.items);
             return;
         }
     }
 
-    save(allocator, w, h, merged.items);
+    save(allocator, final_w, final_h, final_div, merged.items);
 }
 
 test "State: round-trip via load/save" {
-    save(std.testing.allocator, 1024, 600, &.{});
+    save(std.testing.allocator, 1024, 600, 0, &.{});
 }
 
 test "State: writeJson encodes profile map" {
@@ -318,9 +400,20 @@ test "State: writeJson encodes profile map" {
         .{ .name = "main", .width = 1200, .height = 700 },
         .{ .name = "shell", .width = 600, .height = 300 },
     };
-    try writeJson(&buf, std.testing.allocator, 1024, 600, &profiles);
+    try writeJson(&buf, std.testing.allocator, 1024, 600, 0, &profiles);
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"main\":{\"width\":1200,\"height\":700}") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"shell\":{\"width\":600,\"height\":300}") != null);
+}
+
+test "State: writeJson encodes divider only when nonzero" {
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(std.testing.allocator);
+    try writeJson(&buf, std.testing.allocator, 1024, 600, 0, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "divider") == null);
+
+    buf.clearRetainingCapacity();
+    try writeJson(&buf, std.testing.allocator, 1024, 600, 720, &.{});
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "\"divider\":720") != null);
 }
 
 test "State: writeJson escapes name" {
@@ -329,7 +422,7 @@ test "State: writeJson escapes name" {
     const profiles = [_]ProfileSize{
         .{ .name = "weird\"name", .width = 100, .height = 200 },
     };
-    try writeJson(&buf, std.testing.allocator, 1024, 600, &profiles);
+    try writeJson(&buf, std.testing.allocator, 1024, 600, 0, &profiles);
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "\\\"name") != null);
 }
 

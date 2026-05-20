@@ -23,6 +23,19 @@ const theme = @import("theme.zig");
 
 pub const ThemeOptions = theme.Options;
 
+/// Per-session spawn payload. SessionManager resolves the command
+/// (script > command > provider > /bin/zsh) so VTE just exec's
+/// `command`; no argv splitting here. Tilde in cwd is NOT expanded
+/// (matches darwin) — users supply absolute paths or rely on the
+/// inherited cwd via `null`. When null is passed for the whole
+/// struct, Terminal falls back to $SHELL → /bin/sh resolution
+/// (legacy single-shell path; main_linux always passes a profile-
+/// derived Spawn once SessionHost lands).
+pub const Spawn = struct {
+    command: []const u8,
+    cwd: ?[]const u8 = null,
+};
+
 const GtkWidget = gtk.GtkWidget;
 const VteTerminal = gtk.VteTerminal;
 const GCancellable = gtk.GCancellable;
@@ -79,6 +92,18 @@ extern "c" fn vte_terminal_set_font_scale(terminal: *VteTerminal, scale: f64) vo
 extern "c" fn vte_terminal_get_font_scale(terminal: *VteTerminal) f64;
 extern "c" fn vte_terminal_reset(terminal: *VteTerminal, clear_tabstops: c_int, clear_history: c_int) void;
 extern "c" fn vte_terminal_feed_child(terminal: *VteTerminal, data: [*]const u8, length: isize) void;
+
+// VTE inherits GtkScrollable since 0.40 — its vertical GtkAdjustment
+// is the canonical scrollback driver. `vte_terminal_get_vadjustment`
+// was deprecated in 0.60; the modern path is gtk_scrollable_get_*.
+const GtkAdjustment = opaque {};
+const GtkScrollable = opaque {};
+extern "c" fn gtk_scrollable_get_vadjustment(scrollable: *GtkScrollable) ?*GtkAdjustment;
+extern "c" fn gtk_adjustment_get_value(adj: *GtkAdjustment) f64;
+extern "c" fn gtk_adjustment_get_lower(adj: *GtkAdjustment) f64;
+extern "c" fn gtk_adjustment_get_upper(adj: *GtkAdjustment) f64;
+extern "c" fn gtk_adjustment_get_page_size(adj: *GtkAdjustment) f64;
+extern "c" fn gtk_adjustment_set_value(adj: *GtkAdjustment, value: f64) void;
 // VTE 0.74+ removed default copy/paste keybindings; host apps must
 // drive these themselves. VteFormat enum starts at 1, not 0 —
 // passing 0 trips a g_return_if_fail assertion ("check_enum_value"
@@ -127,7 +152,15 @@ const VTE_SPAWN_NO_SYSTEMD_SCOPE: c_int = 1 << 26;
 pub const Terminal = struct {
     widget: *GtkWidget,
     allocator: std.mem.Allocator,
-    shell_path: [:0]u8,
+    /// Owned argv[0] string. Either a profile.command dupe (multi-
+    /// profile path) or the $SHELL resolution (legacy single-session).
+    /// VTE retains the pointer until the deferred fork-and-exec
+    /// completes; Terminal frees on deinit.
+    command_path: [:0]u8,
+    /// Owned cwd string, null when the spawn inherits djinn's cwd.
+    /// Same lifetime story as command_path — VTE reads it during the
+    /// deferred fork, so it has to outlive the async spawn.
+    cwd_path: ?[:0]u8 = null,
     /// Heap-resident argv handed to VTE. The trailing slot stores the
     /// required null terminator. VTE retains this pointer until the
     /// async child-spawn fires, so Terminal owns it until deinit.
@@ -146,7 +179,8 @@ pub const Terminal = struct {
     /// Resolve $SHELL falling back to /bin/sh. Returns the dup'd
     /// sentinel-terminated slice. $SHELL is the freedesktop convention;
     /// /bin/sh is the POSIX guarantee, fine as fallback even on
-    /// systems where /bin is a symlink to /usr/bin (Arch).
+    /// systems where /bin is a symlink to /usr/bin (Arch). Used only
+    /// when `open` is called with `spawn = null`.
     fn resolveShell(allocator: std.mem.Allocator) ![:0]u8 {
         const shell = std.posix.getenv("SHELL") orelse "/bin/sh";
         return try allocator.dupeZ(u8, shell);
@@ -156,6 +190,7 @@ pub const Terminal = struct {
         allocator: std.mem.Allocator,
         theme_opts: ThemeOptions,
         handler: ?Handler,
+        spawn: ?Spawn,
     ) !Terminal {
         const widget = vte_terminal_new();
         const terminal: *VteTerminal = @ptrCast(widget);
@@ -171,25 +206,37 @@ pub const Terminal = struct {
         // converts file-manager drops (text/uri-list) to shell-quoted
         // paths and pastes them through VTE's paste path (bracketed
         // paste mode aware). The controller's lifetime is tied to the
-        // widget — no separate handle to manage.
+        // widget — no separate handle to manage. Attaching per-VTE
+        // (instead of once on the SessionHost stack) means each
+        // profile's terminal can accept drops without re-targeting
+        // the drop target on every profile switch.
         dragdrop.attach(widget);
 
-        const shell_path = try resolveShell(allocator);
-        errdefer allocator.free(shell_path);
+        const command_path = if (spawn) |s|
+            try allocator.dupeZ(u8, s.command)
+        else
+            try resolveShell(allocator);
+        errdefer allocator.free(command_path);
+
+        const cwd_path: ?[:0]u8 = if (spawn) |s|
+            if (s.cwd) |c| try allocator.dupeZ(u8, c) else null
+        else
+            null;
+        errdefer if (cwd_path) |p| allocator.free(p);
 
         // Heap-allocate argv: [argv0, null]. VTE's C signature is
         // `char **` (mutable strings, mutable array). We back it with
         // `?[*:0]u8` slots so the type system matches. The string the
-        // first slot points at is `shell_path.ptr` — owned by `self`.
+        // first slot points at is `command_path.ptr` — owned by `self`.
         const argv = try allocator.alloc(?[*:0]u8, 2);
         errdefer allocator.free(argv);
-        argv[0] = @ptrCast(shell_path.ptr);
+        argv[0] = @ptrCast(command_path.ptr);
         argv[1] = null;
 
         vte_terminal_spawn_async(
             terminal,
             VTE_PTY_DEFAULT,
-            null, // working_directory: inherit djinn's cwd
+            if (cwd_path) |p| p.ptr else null,
             argv.ptr,
             null, // envv: inherit djinn's env
             G_SPAWN_DEFAULT | VTE_SPAWN_NO_SYSTEMD_SCOPE,
@@ -229,7 +276,8 @@ pub const Terminal = struct {
         return .{
             .widget = widget,
             .allocator = allocator,
-            .shell_path = shell_path,
+            .command_path = command_path,
+            .cwd_path = cwd_path,
             .argv = argv.ptr,
             .handler_box = handler_box,
             .child_exited_handler_id = child_exited_id,
@@ -250,7 +298,8 @@ pub const Terminal = struct {
         // (alloc'd as 2 above) so we can hand it back to the allocator.
         const argv_slice = self.argv[0..2];
         self.allocator.free(argv_slice);
-        self.allocator.free(self.shell_path);
+        self.allocator.free(self.command_path);
+        if (self.cwd_path) |p| self.allocator.free(p);
         if (self.handler_box) |box| self.allocator.destroy(box);
     }
 
@@ -322,6 +371,46 @@ pub const Terminal = struct {
         vte_terminal_reset(terminal, 0, 1);
         const ctrl_l = "\x0c";
         vte_terminal_feed_child(terminal, ctrl_l.ptr, @intCast(ctrl_l.len));
+    }
+
+    /// Disconnect the `child-exited` signal so an imminent widget
+    /// destroy (via `gtk_stack_remove` during a session restart) can
+    /// hangup the PTY child without fanning the resulting SIGHUP-then-
+    /// child-exited back into the host's `panel.quit` handler. Called
+    /// by `SessionHost.restartActive` right before tearing the old
+    /// VTE widget down. Idempotent — `deinit`'s own disconnect
+    /// short-circuits when `child_exited_handler_id == 0`.
+    ///
+    /// Why we don't use `vte_terminal_set_pty(t, NULL)` for the
+    /// hangup: VTE 0.84's set_pty(NULL) path NULL-derefs at offset
+    /// 0x18 inside the PTY dispose chain when the prior spawn's
+    /// child watch isn't fully wired (the failure mode the host hit
+    /// on the first try). The widget-replacement strategy
+    /// SessionHost uses sidesteps that path entirely — destroy the
+    /// widget, build a fresh one in the same stack slot. Tab strip,
+    /// log pane, window position all preserved.
+    pub fn detachExitHandler(self: *Terminal) void {
+        if (self.child_exited_handler_id != 0) {
+            g_signal_handler_disconnect(@ptrCast(self.widget), self.child_exited_handler_id);
+            self.child_exited_handler_id = 0;
+        }
+    }
+
+    /// Scroll the scrollback view by one screen-page in the requested
+    /// direction. Negative `pages` scrolls toward older output, positive
+    /// toward newer. The GtkAdjustment clamps `set_value` to
+    /// `[lower, upper - page_size]` internally, so a value past the
+    /// bottom resolves to the bottom — no manual clamping needed.
+    /// No-op on the (rare) path where VTE's GtkScrollable interface
+    /// hasn't materialized a vadjustment yet (widget not yet mapped).
+    /// Bound to Shift+PgUp / Shift+PgDn — universal terminal scrollback
+    /// gesture (gnome-terminal, konsole, xterm, foot, kitty).
+    pub fn scrollPages(self: *Terminal, pages: f64) void {
+        const scrollable: *GtkScrollable = @ptrCast(self.widget);
+        const adj = gtk_scrollable_get_vadjustment(scrollable) orelse return;
+        const cur = gtk_adjustment_get_value(adj);
+        const page = gtk_adjustment_get_page_size(adj);
+        gtk_adjustment_set_value(adj, cur + page * pages);
     }
 };
 

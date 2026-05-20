@@ -64,7 +64,12 @@ install-arch:
     {{arch_zig}} build -Doptimize=ReleaseSafe
     sudo install -Dm755 zig-out/bin/djinn /usr/local/bin/djinn
     sudo install -Dm644 contrib/packaging/djinn.desktop /usr/local/share/applications/djinn.desktop
+    # The packaged unit has ExecStart=/usr/bin/djinn (the AUR install
+    # path); when landing under /usr/local we rewrite it in place so
+    # systemd doesn't fail with status=203/EXEC against a missing
+    # /usr/bin/djinn after a same-system AUR uninstall.
     sudo install -Dm644 contrib/packaging/djinn.service /usr/local/lib/systemd/user/djinn.service
+    sudo sed -i 's|^ExecStart=/usr/bin/djinn$|ExecStart=/usr/local/bin/djinn|' /usr/local/lib/systemd/user/djinn.service
     @echo "djinn installed under /usr/local. Run 'systemctl --user daemon-reload' if you plan to enable the user unit."
 
 # Remove a system install made by `just install-arch`. Idempotent.

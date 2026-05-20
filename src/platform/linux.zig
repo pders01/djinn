@@ -10,13 +10,31 @@ pub const Panel = panel.Panel;
 pub const terminal = @import("linux/terminal.zig");
 pub const Terminal = terminal.Terminal;
 pub const TerminalHandler = terminal.Handler;
+pub const TerminalSpawn = terminal.Spawn;
 pub const ThemeOptions = terminal.ThemeOptions;
+
+pub const session_host = @import("linux/session_host.zig");
+pub const SessionHost = session_host.SessionHost;
+
+pub const tab_strip = @import("linux/tab_strip.zig");
+pub const TabStrip = tab_strip.TabStrip;
+pub const TabStripOnActivate = tab_strip.OnActivate;
+
+pub const palette = @import("linux/palette.zig");
+pub const Palette = palette.Palette;
+pub const PaletteOnActivate = palette.OnActivate;
 
 pub const keymap = @import("linux/keymap.zig");
 pub const KeymapContext = keymap.Context;
 
 pub const log_pane = @import("linux/log_pane.zig");
 pub const LogPane = log_pane.LogPane;
+
+pub const find_overlay = @import("linux/find_overlay.zig");
+pub const FindOverlay = find_overlay.FindOverlay;
+
+pub const cheatsheet = @import("linux/cheatsheet.zig");
+pub const Cheatsheet = cheatsheet.Cheatsheet;
 
 pub const ghostty_config = @import("linux/ghostty_config.zig");
 pub const GhosttyColors = ghostty_config.Colors;

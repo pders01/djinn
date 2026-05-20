@@ -170,6 +170,17 @@ fn populateTextView(tv: objc.Object, style: chrome.Style) void {
         appendRun(root, NSString, NSColor, NSFont, NSDictionary, line, style.fg, style, true);
     }
 
+    // Log-filter UI + prefix syntax (Cmd+Shift+L). Pills are the
+    // primary level-filter surface; the typed `level:`/`client:`
+    // prefixes are documented here because they're otherwise
+    // invisible. Kept terse so the cheatsheet still fits on one
+    // popover.
+    appendRun(root, NSString, NSColor, NSFont, NSDictionary, "\nLog filter (Cmd+Shift+L)\n", style.fg, style, false);
+    appendRun(root, NSString, NSColor, NSFont, NSDictionary, "  click [i] [w] [e]    toggle info / warn / err\n", style.dim, style, true);
+    appendRun(root, NSString, NSColor, NSFont, NSDictionary, "  level:info,warn,err   keyboard equivalent\n", style.dim, style, true);
+    appendRun(root, NSString, NSColor, NSFont, NSDictionary, "  client:<name>         match nickname or id\n", style.dim, style, true);
+    appendRun(root, NSString, NSColor, NSFont, NSDictionary, "  <any other tokens>    free-text on message\n", style.dim, style, true);
+
     const ts = tv.msgSend(objc.Object, "textStorage", .{});
     if (ts.value != null) {
         ts.msgSend(void, "setAttributedString:", .{root});

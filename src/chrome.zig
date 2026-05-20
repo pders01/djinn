@@ -23,6 +23,13 @@ pub const Style = struct {
     info: Rgb,
     warn: Rgb,
     err: Rgb,
+    /// 6 chromatic accents picked from the bright ANSI band
+    /// (palette[9..15], skipping bright_white). Hashed against client
+    /// id to give each MCP agent a stable color in log headers + tab
+    /// strip activity dots. Order is intentional: starts at the
+    /// info/blue end so single-client setups land on the same color
+    /// as the existing info hue.
+    client_palette: [6]Rgb,
     /// Inverted high-contrast chip for floating UI affordances (find
     /// overlay, future toasts). Reads as a distinct surface, not as
     /// blended chrome — that's the design call: chips DECLARE
@@ -48,6 +55,14 @@ pub const Style = struct {
             .info = t.palette[12],
             .warn = t.palette[11],
             .err = t.palette[9],
+            .client_palette = .{
+                t.palette[12], // bright blue
+                t.palette[10], // bright green
+                t.palette[11], // bright yellow
+                t.palette[13], // bright magenta
+                t.palette[14], // bright cyan
+                t.palette[9], // bright red
+            },
             .chip = blk: {
                 // 22% lift toward fg — strong enough to survive
                 // `background-opacity < 1` translucency over a desktop

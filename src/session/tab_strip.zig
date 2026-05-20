@@ -165,6 +165,38 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
     // Bottom hairline is a CALayer-backed subview created in
     // `create()` so it shares the log pane's separator paint path.
     // Color is set on applyStyle + refreshed on theme reload.
+
+    // Trailing-edge agent-state dot. Mirrors the menubar SF Symbol
+    // coloring so the user has a near-eye-line indicator while focused
+    // on the panel — without it the only "agent busy / waiting on me"
+    // cue lives in the menu bar, which sits far above the panel during
+    // active terminal work.
+    //
+    // A single global dot (not per-tab) because MCP agent state is
+    // process-global today — clients aren't bound to specific profile
+    // tabs. Per-tab status would need per-profile client routing
+    // first (recorded as deferred in TODO.md).
+    if (app.g.agent.state) |st| {
+        const snap = st.snapshot();
+        const dot_rgb_opt: ?chrome.Rgb = switch (snap.state) {
+            .idle, .done => null,
+            .working => style.info,
+            .attention => style.warn,
+            .@"error" => style.err,
+        };
+        if (dot_rgb_opt) |rgb| {
+            const dot_d: f64 = 7;
+            const dot_x = bounds.size.width - dot_d - 12;
+            const dot_y = (bounds.size.height - dot_d) / 2.0;
+            const path = NSBezierPath.msgSend(objc.Object, "bezierPathWithOvalInRect:", .{NSRect{
+                .origin = .{ .x = dot_x, .y = dot_y },
+                .size = .{ .width = dot_d, .height = dot_d },
+            }});
+            const dot_color = chrome.nsColorFromRgb(NSColor, rgb);
+            dot_color.msgSend(void, "set", .{});
+            path.msgSend(void, "fill", .{});
+        }
+    }
 }
 
 fn mouseDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
