@@ -102,6 +102,16 @@ pub const OnSwitch = struct {
     on_invoke: *const fn (ctx: *anyopaque, idx: usize) void,
 };
 
+/// Fan-out hook for "this entry's exited state flipped." Fires once
+/// per `markExited` call where the new value actually differs from
+/// the old. Caller wires it to `tab_strip.markExited` so the chip
+/// gains the `.djinn-tab-exited` class when an inactive session's
+/// child dies and loses it when `restartActive` revives the slot.
+pub const OnExitChanged = struct {
+    ctx: *anyopaque,
+    on_invoke: *const fn (ctx: *anyopaque, idx: usize, exited: bool) void,
+};
+
 /// Per-session bookkeeping. The `terminal` slot is null until first
 /// activate: SessionHost builds the VTE + spawns the shell on demand
 /// so a config with many profiles doesn't pay the startup cost for
@@ -115,6 +125,15 @@ const Entry = struct {
     name: [16]u8,
     name_z: [*:0]const u8,
     terminal: ?Terminal = null,
+    /// True once this session's shell has exited *without* a
+    /// SessionHost-driven restart. The active session never carries
+    /// `exited = true` for long — the host fans `on_active_exited`
+    /// at panel-quit, the panel tears down before the user can
+    /// observe the flag. Inactive sessions retain the bit until the
+    /// user activates them and hits Ctrl+R (restartActive clears it).
+    /// Tab strip reads `markExited(idx, true)` from the host's
+    /// `on_exit_changed` hook to re-skin the chip.
+    exited: bool = false,
 };
 
 pub const SessionHost = struct {
@@ -126,13 +145,12 @@ pub const SessionHost = struct {
     /// of a previously-lazy session paints with the current palette
     /// instead of VTE defaults.
     theme_opts: ThemeOptions,
-    /// Handler fanned to every spawned VTE. `child-exited` fires once
-    /// per session; the host wires this to `panel.quit` today so the
-    /// window closes when *any* profile's shell exits — matches
-    /// today's single-session semantics. Multi-session refinement
-    /// (only quit on active-session exit, mark others exited+restart-
-    /// required) still pending — `restartActive` covers the
-    /// user-initiated path so an exited inactive session is rare.
+    /// Handler template fanned to every spawned VTE. Each spawn copies
+    /// the template and stamps `extra = idx` so the host's
+    /// `on_child_exited` callback can tell which session just lost its
+    /// shell — needed to branch active (panel.quit) vs inactive (flip
+    /// `entry.exited` + re-skin the chip). The shared template's own
+    /// `extra` field is unread; SessionHost overwrites it per session.
     handler: ?TerminalHandler,
     /// Late-stamped pointer to the find overlay so each `activate`
     /// can call `setTarget(new_vte)` and keep the find chip's
@@ -146,6 +164,12 @@ pub const SessionHost = struct {
     /// activates during init are silently consumed (the initial
     /// chip state is set by the tab strip's own `buildButtons`).
     on_switch: ?OnSwitch = null,
+    /// Late-stamped exit-state hook. Fires once per `markExited`
+    /// call that actually flipped a bit. Set by main_linux after the
+    /// tab strip is built. Null during init, so any flip before
+    /// wiring is silently consumed — none happen in practice
+    /// (init's eager spawn doesn't dispatch child-exited).
+    on_exit_changed: ?OnExitChanged = null,
 
     /// Build the stack, eagerly spawn the active-at-startup session,
     /// leave the rest as lazy slots. Returns a SessionHost the caller
@@ -343,7 +367,7 @@ pub const SessionHost = struct {
             .{ .command = c, .cwd = profile.cwd }
         else
             .{ .command = profile.command, .cwd = profile.cwd };
-        const new_term = Terminal.open(self.allocator, self.theme_opts, self.handler, spawn) catch |err| {
+        const new_term = Terminal.open(self.allocator, self.theme_opts, self.handlerFor(idx), spawn) catch |err| {
             std.debug.print(
                 "session_host: restart for profile '{s}' failed: {}\n",
                 .{ profile.name, err },
@@ -370,6 +394,11 @@ pub const SessionHost = struct {
         );
         gtk_stack_set_visible_child_name(@ptrCast(self.stack), entry.name_z);
         _ = gtk_widget_grab_focus(new_term.widget);
+        // Clear the exited bit AFTER the new spawn lands so a partial
+        // failure (caught above) leaves the chip showing exited.
+        // markExited fans the hook only when the bit actually flips,
+        // so a normal "Ctrl+R on a live session" path is a no-op.
+        self.markExited(idx, false);
         return true;
     }
 
@@ -406,7 +435,7 @@ pub const SessionHost = struct {
         const term = try Terminal.open(
             self.allocator,
             self.theme_opts,
-            self.handler,
+            self.handlerFor(idx),
             .{
                 .command = profile.command,
                 .cwd = profile.cwd,
@@ -418,6 +447,39 @@ pub const SessionHost = struct {
             term.widget,
             self.entries.items[idx].name_z,
         );
+    }
+
+    /// Per-session copy of the host's child-exited handler template,
+    /// with `extra` stamped to the session index so the dispatcher
+    /// can tell which session fired. Null when no template was
+    /// supplied (no callers today, but the field is optional).
+    fn handlerFor(self: *SessionHost, idx: usize) ?TerminalHandler {
+        const tmpl = self.handler orelse return null;
+        return .{
+            .ctx = tmpl.ctx,
+            .extra = idx,
+            .on_child_exited = tmpl.on_child_exited,
+        };
+    }
+
+    /// Flip the entry's exited bit and fan `on_exit_changed` when the
+    /// value actually changes. Called by main_linux from the
+    /// child-exited dispatcher for inactive sessions, and by
+    /// `restartActive` to clear the bit after a successful revive.
+    /// Idempotent: same-value calls return without firing.
+    pub fn markExited(self: *SessionHost, idx: usize, value: bool) void {
+        if (idx >= self.entries.items.len) return;
+        if (self.entries.items[idx].exited == value) return;
+        self.entries.items[idx].exited = value;
+        if (self.on_exit_changed) |hook| hook.on_invoke(hook.ctx, idx, value);
+    }
+
+    /// True when the entry at `idx` has its child-exited bit set.
+    /// Out-of-bounds idx resolves to false. Used by callers that want
+    /// to know without subscribing to `on_exit_changed`.
+    pub fn isExited(self: *SessionHost, idx: usize) bool {
+        if (idx >= self.entries.items.len) return false;
+        return self.entries.items[idx].exited;
     }
 };
 

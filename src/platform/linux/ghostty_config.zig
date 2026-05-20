@@ -382,7 +382,6 @@ pub fn parseColor(s: []const u8) ?Rgb {
 // dead portal from blocking djinn launch; default-on-fail is `dark`.
 
 const gdbus = @import("gdbus.zig");
-const GVariant = gdbus.GVariant;
 const GVariantType = gdbus.GVariantType;
 const GError = gdbus.GError;
 const G_BUS_TYPE_SESSION = gdbus.G_BUS_TYPE_SESSION;
@@ -444,10 +443,17 @@ pub fn detectAppearance() Appearance {
     defer gdbus.g_object_unref(conn);
 
     // Build `("org.freedesktop.appearance", "color-scheme")` tuple.
-    const ns = gdbus.g_variant_new_string("org.freedesktop.appearance");
-    const key = gdbus.g_variant_new_string("color-scheme");
-    const children = [_]*GVariant{ ns, key };
-    const params = gdbus.g_variant_new_tuple(@ptrCast(@constCast(&children)), 2);
+    // Builder-based construction matches `hotkey.zig` /
+    // `tray.zig`'s style — `g_variant_builder_add_value` sinks each
+    // floating child, `g_variant_builder_end` returns the (still
+    // floating) tuple, and `g_dbus_connection_call_sync` consumes
+    // that float when we hand it over. No `@constCast` over a stack
+    // array of pointers needed.
+    const tuple = gdbus.g_variant_builder_new(vt("(ss)"));
+    gdbus.g_variant_builder_add_value(tuple, gdbus.g_variant_new_string("org.freedesktop.appearance"));
+    gdbus.g_variant_builder_add_value(tuple, gdbus.g_variant_new_string("color-scheme"));
+    const params = gdbus.g_variant_builder_end(tuple);
+    gdbus.g_variant_builder_unref(tuple);
 
     err = null;
     const reply = gdbus.g_dbus_connection_call_sync(

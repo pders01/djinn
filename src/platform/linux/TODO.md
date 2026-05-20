@@ -15,23 +15,93 @@ palette switcher) have all landed. Restart-session + per-profile
 window-size memory also landed this pass; remaining work is
 structural refactors and the opportunistic darwin-parity ports.
 
-1. **Structural refactors** — `log_pane.zig` extraction
-   (1485 lines; pull `writeThemedCss` into `log_pane_css.zig`,
-   move filter+header bookkeeping into a `LogModel`),
-   `keymap.zig` `Context` god-object split (nine fields now
-   with the palette slot; the action table grew to 32 rows
-   with restart_session + shell_session, making the case for
-   per-action `*anyopaque` user_data or a `Services` registry
-   stronger).
-2. **Multi-session exit refinement.** Today any session's
-   `child-exited` quits the panel; the active session's exit
-   should quit, but inactive sessions exiting should mark
-   `exited: true` and show a restart hint in the tab strip.
-   `restartActive` covers the user-initiated path so this is
-   less urgent — an inactive session typing `exit` is rare.
+1. **Darwin-parity opportunistic ports** — right-click "Copy entry"
+   in log pane, per-client header color, filter prefix syntax +
+   level pills, tab-strip agent-state dot, palette enrichment +
+   duplicate-active row. Each waits on a separate session because
+   the surrounding code is unfamiliar; see the Tier A darwin parity
+   block further down for the shape of each.
+2. **Per-action `*anyopaque` user_data for keymap actions** (deferred).
+   Today every handler takes `*Context` and reaches for the slots it
+   needs; the Context refactor this pass split popover slots into a
+   `Popovers` sub-struct but kept the single-context shape. A genuine
+   per-action user_data refactor would let each row carry its own
+   dependency type, with comptime-generated wrappers casting back.
+   Not justified at today's 32-row count — the cost of type-erasing
+   every handler outweighs the structural-clarity win. Revisit if
+   the action table doubles.
 
 Most recent batch (older ones are in the History block at the bottom
 of `## Code review backlog`):
+
+- **`log_pane.zig` structural refactor** — pulled `writeThemedCss`
+  (~280 lines) into `log_pane_css.zig`; pulled filter + header
+  bookkeeping (filter_buf / filter_len / last_client_*, plus
+  `matchesFilter` / `shouldEmitHeader` / `updateLastClient` /
+  `setFilter` / `resetGrouping` / `hasActiveFilter`) into a
+  `LogModel` struct in `log_model.zig`. LogPane now holds a
+  `model: LogModel = .{}` and delegates from the hot
+  `appendRangeLocked` path. log_pane.zig dropped from 1495 to 1021
+  lines; the pure-data model has its own 10-test suite that no
+  longer needs a fake LogPane stack-allocation to poke at. Filter
+  state observation (`refreshPlaceholder` checks for "no matches"
+  placeholder) goes through `model.hasActiveFilter()`. The CSS
+  extraction module mirrors `tab_strip.writeThemedCss` and
+  `palette.writeThemedCss` shape — each chrome module owns its
+  themed CSS in a sibling file rather than inline.
+- **`keymap.zig` Popovers sub-group + service-registry framing** —
+  the three late-stamped popover slots (`find_overlay`,
+  `cheatsheet`, `palette`) collapsed into a single
+  `Popovers` struct. Doc-comment now articulates the
+  service-registry pattern + a field-usage map (which actions read
+  which slot) so readers don't grep the whole file to find the
+  dependency graph. Field count dropped from 9 to 7 visible at the
+  top level. Per-action `*anyopaque` user_data refactor stays
+  available but is deferred (see priority #2 above) — at 32 rows
+  the current shape is honest about the dependency graph; a
+  per-action split would mostly type-erase the same information
+  across more pointers.
+- **Hide-on-blur popover-grab suppression** — `Ctrl+Shift+F` and
+  `Ctrl+Shift+P` were dismissing the panel on KWin Wayland: GTK4's
+  `autohide=true` popovers (find overlay, palette) grab keyboard
+  input at popup, which makes the parent toplevel report
+  `is-active=false` even though focus has just landed on the
+  popover's GtkSearchEntry. `setHideOnBlur` then fired and hid
+  djinn the instant the popover appeared. Fix is a popover-grab
+  counter on `Panel`: `pushPopoverGrab` / `popPopoverGrab` bump
+  the counter on `show` / `closed` signals from each tracked
+  popover, and `onActiveChanged` short-circuits while the
+  counter is non-zero. `Panel.trackPopoverGrabs(popover)` wires
+  the signals; `find_overlay.popoverWidget()` and
+  `palette.popoverWidget()` expose the underlying popover so
+  main_linux can register both. `popPopoverGrab` re-runs the
+  hide check when the counter drops to zero so an app-switch
+  with a popover open still lands the panel hide (the
+  active=false event was suppressed at the time it fired). A
+  `gtk_window_get_focus`-based heuristic was tempting but GTK4
+  retains the focus child across legitimate app-switches, so
+  it can't distinguish "popover grabbed focus inside me" from
+  "user clicked another app and I still remember my last focus
+  child."
+- **Multi-session exit refinement** — inactive session's
+  `child-exited` no longer quits the panel. `Terminal.Handler`
+  grew an `extra: usize` payload; SessionHost stamps the
+  session idx into each per-VTE handler (`spawnInto` and
+  `restartActive` both route through a new `handlerFor(idx)`
+  helper that copies the shared template and overwrites
+  `.extra`). `Dispatch.onChildExited(ctx, idx)` branches on
+  `sm.active_idx`: active match → `panel.quit()` (preserves
+  the "typing `exit` closes djinn" gesture); else
+  `host.markExited(idx, true)`, which flips
+  `Entry.exited` and fans the new `on_exit_changed` hook.
+  Tab strip listens via `markExited(idx, exited)` and adds /
+  removes `.djinn-tab-exited`. CSS dims the chip (alpha
+  0.35), italicizes the label, and strikes the label text
+  through (targets `> label` because GTK4 paints chip text via
+  a label child node). `restartActive` clears the bit AFTER
+  the new spawn lands (so a partial failure leaves the chip
+  showing exited), and `markExited` is idempotent so the
+  normal "Ctrl+R on a live session" path is a no-op.
 
 - **`session_host.zig` Entry.name_z stack-pointer bug fix** —
   the init loop wrote each Entry as a stack-local `e`, set
@@ -158,11 +228,17 @@ synthesized "default" profile spawns `Config.getProviderCommand()`
 Debian/Ubuntu users without zsh need `provider-command = /bin/bash`
 or `zsh` installed.
 
-Remaining Minor code-shape items (terminal.zig argv const, hotkey
-errdefer gap, unique_name re-fetch, watcher partial-init cleanup,
-ghostty_config detectAppearance GVariant ownership style) are
-small one-line edits and a good warm-up before the structural
-refactors above.
+The Minor code-shape pass landed this batch: `Terminal.argv` is a
+slice (drops the magic-2 length on the deinit reconstitution);
+hotkey's two signal subscribes carry matching errdefers so a
+future fallible insert can't leak them; `Context.unique_name`
+caches the value `g_dbus_connection_get_unique_name` was re-
+fetching from `bindShortcut`; `Watcher.init`'s built-count and
+next-write index collapse to a single counter; `detectAppearance`
+builds its params tuple through the builder API matching
+`hotkey.zig` / `tray.zig`; and `dragdrop.attach` is idempotent
+via a GObject-data marker so a refactor double-route can't stack
+four controllers on the VTE widget.
 
 The "Cross-cutting themes" subsection at the end of the backlog
 names patterns rather than files.
@@ -202,6 +278,19 @@ prevailing shape.
   sidesteps both). Source unregistered in `deinit`.
   `DJINN_NO_LAYER_SHELL=1` forces the plain-toplevel path on
   layer-shell-capable compositors (debugging utility).
+  **Popover-grab counter**: `popover_grab_count: u32` tracks
+  active `autohide=true` popovers owned by djinn (find overlay,
+  palette). `pushPopoverGrab` / `popPopoverGrab` bump the counter
+  on the popover's `show` / `closed` signals; `trackPopoverGrabs
+  (popover)` wires both. `onActiveChanged` short-circuits while
+  the counter is non-zero so the popover's input grab on KWin
+  Wayland (which flips the parent's `is-active=false` even though
+  focus is on a child popover) doesn't trigger hide-on-blur and
+  yank djinn out from under Ctrl+Shift+{F,P}. `popPopoverGrab`
+  re-checks `is-active` on counter→0 to handle the app-switch-
+  with-popover-open case (the active-false event was suppressed
+  while open and won't re-fire). Assumption: tracked popovers
+  are init-once; revisit if any popover ever gets re-created.
 - `terminal.zig` + `theme.zig` — VTE widget embedded as the panel's
   child, spawns the profile's resolved command (`script > command >
   provider > /bin/zsh`, same precedence as darwin) into the
@@ -248,6 +337,21 @@ prevailing shape.
   approach NULL-derefs at +0x18 inside VTE 0.84's PTY
   dispose; see the matching "Decisions you should not undo"
   entry.
+  **Per-session exit tracking**: `Entry.exited: bool` flips
+  true when an INACTIVE session's shell exits; the active
+  session's exit still routes to `panel.quit` so the "type
+  exit to close djinn" gesture stays intact. Per-VTE handler
+  carries the session idx via `Terminal.Handler.extra`
+  (stamped by `handlerFor(idx)`); Dispatch reads the idx and
+  branches against `host.sm.active_idx`. `markExited
+  (idx, value)` mutates the bit and fans `on_exit_changed`
+  when the value flips — caller (main_linux) wires the hook
+  to `tab_strip.markExited(idx, value)` so the chip dims +
+  gains a strikethrough on exit, drops the class on restart.
+  `restartActive` clears the bit on its success path so a
+  user reviving an exited session via Ctrl+R re-skins the
+  chip automatically. `isExited(idx)` peeks the bit without
+  subscribing.
 - `tab_strip.zig` — horizontal `GtkBox` of `GtkButton` chips, one
   per session. Active chip carries the `.djinn-tab-active` CSS
   class; inactive chips reserve a 2px transparent border-bottom so
@@ -266,6 +370,14 @@ prevailing shape.
   dependency one-way. Label buffers are owned per-chip
   (sentinel-terminated) so a Config reload arena drop can't
   invalidate the C `gtk_button_new_with_label` pointer.
+  **Exited-chip skin**: `markExited(idx, exited)` adds /
+  removes the `.djinn-tab-exited` CSS class on the chip at
+  `idx`. CSS dims color to 0.35 alpha, italicizes the label,
+  and strikes through the label text via `> label` (GTK4
+  GtkButton renders its label as a direct child label node,
+  so the selector matches across themes). Fed by SessionHost's
+  `on_exit_changed` hook so the chip stays in lockstep with
+  `Entry.exited`.
 - `palette.zig` — `Ctrl+Shift+P` type-to-switch profile palette.
   `GtkPopover` anchored to `host.widget()` (the GtkStack) so it
   survives profile switches without reparenting. Vertical box
@@ -346,11 +458,20 @@ prevailing shape.
   `ctx.outcome_reported` latches the first call so duplicate
   handler paths don't double-log. Falls through to the IPC bridge
   when no portal backend implements GlobalShortcuts.
-- `log_pane.zig` — right-hand column inside a horizontal `GtkPaned`
-  next to the VTE. Widget tree: outer vertical `GtkBox` →
-  (attention `GtkButton`, `GtkScrolledWindow → GtkListBox`,
-  `GtkSearchEntry`). CSS-node gotcha: GtkListBox's node is `list`,
-  NOT `listbox` — easy to lose hours on. Per-level CSS classes
+- `log_pane.zig` + `log_pane_css.zig` + `log_model.zig` —
+  right-hand column inside a horizontal `GtkPaned` next to the
+  VTE. `log_pane.zig` owns the widget tree + signal wiring;
+  `log_pane_css.zig` owns the themed CSS builder (extracted
+  ~280 lines); `log_model.zig` owns the filter-needle +
+  last-client-tracking pure-data model with its own unit tests
+  (`matchesFilter`, `shouldEmitHeader`, `updateLastClient`,
+  `setFilter`, `resetGrouping`, `hasActiveFilter`). LogPane
+  holds a `model: LogModel = .{}`; the hot
+  `appendRangeLocked` path delegates through it. Widget tree:
+  outer vertical `GtkBox` → (attention `GtkButton`,
+  `GtkScrolledWindow → GtkListBox`, `GtkSearchEntry`).
+  CSS-node gotcha: GtkListBox's node is `list`, NOT
+  `listbox` — easy to lose hours on. Per-level CSS classes
   (`.djinn-log-info` / `-warn` / `-err`) on a module-local
   reload-in-place provider. 250ms `g_timeout_add` poll same shape
   as tray's — diffs `(count, first_ts)` and either appends new
@@ -544,9 +665,11 @@ prevailing shape.
     NULL-deref at +0x18 inside PTY dispose.
   Action table grew `display` + `description` fields so
   cheatsheet renders human-readable text without re-implementing
-  GTK's accel→label transform. Context carries `session_host`,
-  `allocator`, `log_pane`, `panel`, `config`, `reapply_config`,
-  `find_overlay`, `cheatsheet`, `palette`. Mirrors darwin's
+  GTK's accel→label transform. Context is a service registry
+  carrying `session_host`, `allocator`, `log_pane`, `panel`,
+  `config`, `reapply_config`, plus a `popovers: Popovers`
+  sub-struct grouping the late-stamped optionals
+  (`find_overlay`, `cheatsheet`, `palette`). Mirrors darwin's
   `terminal/view.zig::actions` — entries tied to features that
   don't exist on linux yet (IME) land as their backing features
   do.
@@ -610,12 +733,6 @@ Tested on CachyOS + KDE Plasma Wayland 6.x.
   startup today — reconcile needs to also rebuild the chip row
   and the palette listbox when a profile is added / removed /
   renamed.
-- Multi-session exit refinement. Today any session's
-  `child-exited` quits the panel; the active session's exit
-  should still quit, but inactive sessions exiting should
-  mark `exited: true` and surface a restart hint in the tab
-  strip. `restartActive` covers the user-initiated path so
-  this is less urgent.
 
 ## Decisions you should not undo
 
@@ -624,6 +741,33 @@ Tested on CachyOS + KDE Plasma Wayland 6.x.
   ghostty's GTK frontend is a full `GtkApplication`, not a library.
   macOS keeps using ghostty. djinn's value-add is the chrome, not the
   terminal engine.
+- **Hide-on-blur must consult `Panel.popover_grab_count` before
+  hiding.** GTK4's `autohide=true` popovers (find overlay, palette)
+  grab keyboard input at popup. On KWin Wayland the grab makes the
+  parent toplevel report `is-active=false` even though focus is on
+  a popover child inside the same window. Without the guard,
+  `setHideOnBlur` fires the instant any tracked popover pops up
+  and yanks djinn out from under Ctrl+Shift+{F,P}. The counter is
+  incremented via the popover's `show` signal and decremented via
+  `closed`; `Panel.trackPopoverGrabs(popover)` wires both. A
+  `gtk_window_get_focus`-based heuristic looks tempting (popovers
+  parent into the window tree via `gtk_widget_set_parent`, so the
+  popover's entry shows up as `get_focus()`) but GTK4 retains the
+  focus child across legitimate app-switches, so it can't
+  distinguish "popover grabbed focus inside me" from "user clicked
+  another app and I still remember my last focus child." The
+  cheatsheet doesn't need this guard because it uses `autohide=
+  false` (its only child is a non-focusable GtkLabel; autohide
+  would race the panel-active flip itself). Add new popovers to
+  `trackPopoverGrabs` only when they use `autohide=true`.
+- **`popPopoverGrab` re-checks `is-active` on counter→0.** When
+  the user app-switches while a popover is open, the
+  `is-active=false` event fires while the count is still >0 and
+  gets suppressed. `notify::is-active` won't re-fire once the
+  popover dismisses, so without the recheck the panel would stay
+  visible after the user clearly switched away. Keep the recheck
+  call in `popPopoverGrab` even though it duplicates a snippet of
+  `onActiveChanged`.
 - **Layer-shell linked statically, listed BEFORE gtk4 on the link
   line.** ld.so processes `DT_NEEDED` in declaration order, and
   gtk4-layer-shell works by interposing one libwayland-client symbol.
@@ -787,7 +931,9 @@ src/
       session_host.zig      # GtkStack of N VTEs (one per profile)
       tab_strip.zig         # GtkBox of GtkButton chips per profile
       palette.zig           # Ctrl+Shift+P type-to-switch popover
-      log_pane.zig          # GtkPaned sibling: log entries + theme
+      log_pane.zig          # GtkPaned sibling: log entries widget
+      log_pane_css.zig      # themed CSS builder for the log pane
+      log_model.zig         # filter + header bookkeeping (LogModel)
       ghostty_config.zig    # ~/.config/ghostty/config + theme parser
       gdbus.zig             # shared GDBus / GVariant surface
       TODO.md               # this file
@@ -842,16 +988,32 @@ chain. Two gotchas the next agent should not re-discover:
   `minimum_zig_version = "0.15.2"` (revisit quarterly). On
   Nix the dev shell pins the right version; on Debian zig
   isn't in the archive so `rules` uses `$(ZIG)`.
+- **Build via nix dev shell on current Arch.** Arch's gcc
+  16.1.1 emits SFrame relocations
+  (`R_X86_64_PC64` against `crt1.o:.sframe` and
+  `libc_nonshared.a(pthread_atfork.oS/):.sframe`) that
+  zig 0.15's lld can't handle — the final link step fails
+  with `fatal linker error: unhandled relocation type
+  R_X86_64_PC64`. The Zig compile + sema steps still pass
+  (build summary will read "17/20 steps succeeded; 1
+  failed"), so AST checking and codegen are unaffected.
+  Workarounds: build inside `nix develop` (pins an older
+  glibc/crt without SFrame), or skip the link by running
+  `zig ast-check <file>` on touched files to confirm
+  semantic correctness. Linker fix lands in zig 0.16+;
+  reassess when the toolchain pin moves.
 - **Keymap shortcut extension pattern.** A new shortcut is
   one row in `keymap.zig`'s `actions` array + a handler
   function. The `predicate` field gates whether the row
   consumes the key or propagates to VTE (`hide_panel` /
   `Escape` and the `tab_*` family are the precedents —
   predicate returns false → handler returns 0 → GTK continues
-  propagation). `KeymapContext` carries
-  `{session_host, allocator, log_pane, panel, config,
-  reapply_config, find_overlay, cheatsheet}` — trending
-  toward god-object (see Minor backlog).
+  propagation). `KeymapContext` is a service registry
+  carrying `{session_host, allocator, log_pane, panel,
+  config, reapply_config, popovers: {find_overlay,
+  cheatsheet, palette}}` — popover slots clustered into a
+  sub-struct because they share the late-stamped lifetime
+  story.
 
 ### Multi-profile rollout
 
@@ -1134,44 +1296,37 @@ Build + packaging:
 
 Code-shape:
 
-- **`terminal.zig`** — argv slot count is still a magic `2` between
-  the alloc and the deinit slice reconstitution. Plus the new
-  `cwd_path: ?[:0]u8` parallels `command_path` — could be one
-  helper that owns "this is a string we dup'd for VTE's deferred
-  spawn." Field or const.
-- **`keymap.zig` `Context`** — nine fields (`session_host`,
-  `allocator`, `log_pane`, `panel`, `config`, `reapply_config`,
-  plus the late-stamped `find_overlay` + `cheatsheet` + `palette`
-  optionals). 32-row action table now that restart_session +
-  shell_session have landed alongside palette + tab keys.
-  Consider per-action `*anyopaque` user_data or a `Services`
-  registry before the next field gets added.
-- **`log_pane.zig` size** — 1485 lines, multiple concerns. Extract
-  `writeThemedCss` (~280 lines) to `log_pane_css.zig`; pull
-  filter+header bookkeeping into a `LogModel` struct.
-- **`hotkey.zig` errdefer cleanup gap** on init failure between
-  the last subscribe and the trailing alloc/dup steps. Latent
-  today (no allocs after subscribes) but trap for the next edit.
-- **`hotkey.zig:466, 553`** — `unique_name` re-fetched per call.
-  Stash once in `Context`; the unique name is fixed for the
-  connection's lifetime.
-- **`watcher.zig:140-145`** — partial init failure cleanup
-  increments `built` after a fallible alloc. Latent today;
-  refactor-prone.
-- **`ghostty_config.zig:340-376` `detectAppearance`** — builds
-  `params` without explicit floating-ref handling, while
-  `hotkey.zig` / `tray.zig` use builder-based construction. Mixed
-  GVariant ownership styles make audits harder.
-- **`dragdrop.zig:139`** — two `GtkDropTarget`s attached, neither
-  detached. Widget lifetime cleans up via parent destroy, but a
-  double `dragdrop.attach` (refactor mishap) silently stacks the
-  controllers.
+- **`keymap.zig` per-action user_data** — current shape is a
+  `Context` service registry with seven top-level fields plus a
+  `Popovers` sub-struct (three optionals). 32-row action table.
+  Per-action `*anyopaque` user_data (each row carries its own
+  dependency type via a comptime-generated wrapper) is the next
+  step if the table doubles or a new subsystem doesn't fit the
+  registry shape. At today's count the registry is honest about
+  the dependency graph and the type-erasure cost outweighs the
+  structural-clarity win.
 - **`main_linux.zig` Terminal bring-up** — `Terminal.open` takes
   the `on_child_exited` handler with `@ptrCast(&g_dispatch)` while
   `g_dispatch.terminal` is still `undefined` at that point. The
   handler doesn't read `terminal` today, but the fragility is
   load-bearing on knowing which fields each handler touches
   (subsumed by the priority-#3 Dispatch refactor).
+
+Landed in the most recent minor-pass:
+
+- **`terminal.zig`** — argv stored as a slice (`[]?[*:0]u8`)
+  rather than a many-item pointer + duplicated magic-2 length.
+- **`hotkey.zig`** — `activated_sub_id` and `create_response_sub_id`
+  carry matching errdefers so a future fallible insert between
+  the subscribes and the return can't leak them. `Context.
+  unique_name` caches the value `bindShortcut` used to re-fetch.
+- **`watcher.zig`** — init loop's `built` count is also the
+  next-write index, so a refactor can't drift the two apart.
+- **`ghostty_config.zig`** — `detectAppearance` params use the
+  builder API matching `hotkey.zig` / `tray.zig`.
+- **`dragdrop.zig`** — `attach` is idempotent via a
+  GObject-data marker so a double-route can't stack four
+  controllers on the same widget.
 
 Resilience:
 

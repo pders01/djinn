@@ -217,11 +217,42 @@ const Dispatch = struct {
     }
 
     /// VTE `child-exited` — the spawned shell terminated (typed
-    /// `exit`, was killed, etc.). Quit the panel so the window goes
-    /// away with the shell rather than presenting a blank terminal.
-    fn onChildExited(ctx: *anyopaque) void {
+    /// `exit`, was killed, etc.). `idx` carries the session index
+    /// (SessionHost stamps it into Terminal.Handler.extra at spawn
+    /// time). Active session's exit closes the panel — preserves the
+    /// "typing `exit` quits djinn" gesture across multi-profile.
+    /// Inactive session's exit flips `entry.exited`, which fans
+    /// through `on_exit_changed` into `tab_strip.markExited` so the
+    /// dead session's chip dims + gains a strikethrough. The user
+    /// activates the chip and hits Ctrl+R to revive it; restartActive
+    /// clears the bit through the same hook.
+    fn onChildExited(ctx: *anyopaque, idx: usize) void {
         const self: *Dispatch = @ptrCast(@alignCast(ctx));
-        self.panel.quit();
+        const host = self.session_host orelse {
+            // No SessionHost yet means a single-session bringup
+            // racing with init — fall back to the legacy quit so a
+            // child-exit during the eager-spawn window doesn't strand
+            // the panel with a dead VTE. session_host gets stamped
+            // before the first VTE's signal handlers can fire so this
+            // branch is theoretical, but keep it as a safety net.
+            self.panel.quit();
+            return;
+        };
+        if (idx == host.sm.active_idx) {
+            self.panel.quit();
+            return;
+        }
+        host.markExited(idx, true);
+    }
+
+    /// SessionHost.on_exit_changed hook. Re-skins the chip for `idx`
+    /// when its exited bit flips — true on inactive child-exited,
+    /// false on a successful restartActive. tab_strip is the only
+    /// observer today; future agent-state visualizations on the chip
+    /// would fan from the same callback.
+    fn onSessionExitChanged(ctx: *anyopaque, idx: usize, exited: bool) void {
+        const self: *Dispatch = @ptrCast(@alignCast(ctx));
+        if (self.tab_strip) |strip| strip.markExited(idx, exited);
     }
 
     /// Panel size changed (user dragged the window edge, or the
@@ -957,6 +988,16 @@ pub fn main() !void {
         .ctx = @ptrCast(&g_dispatch),
         .on_invoke = onSessionSwitched,
     };
+    // `on_exit_changed` fires when an entry's exited bit flips —
+    // child-exit on an inactive session (true) or restartActive
+    // success on a previously-exited session (false). Dispatch fans
+    // the call to `tab_strip.markExited` so the chip dims + gains a
+    // strikethrough (or reverts). Late-stamped so the watcher's
+    // readiness gate doesn't fire before tab_strip is built.
+    host.on_exit_changed = .{
+        .ctx = @ptrCast(&g_dispatch),
+        .on_invoke = Dispatch.onSessionExitChanged,
+    };
 
     const root = tab_strip.pairWithChild(paned);
     panel.attachChild(root);
@@ -1022,6 +1063,12 @@ pub fn main() !void {
     };
     defer find.deinit();
     find.install();
+    // Suppress hide-on-blur while the find popover holds an input
+    // grab: KWin Wayland's `autohide` grab flips the parent
+    // toplevel's `is-active` to false the moment the popover pops
+    // up, which without this guard fires hide-on-blur and yanks
+    // djinn out from under the user's Ctrl+Shift+F.
+    panel.trackPopoverGrabs(find.popoverWidget());
     host.find_overlay = &find;
 
     // Cheatsheet popover (Ctrl+?). Anchored to the GtkStack so it's
@@ -1052,6 +1099,11 @@ pub fn main() !void {
     };
     defer palette.deinit();
     palette.install();
+    // Same hide-on-blur suppression as the find overlay — the
+    // palette popover also uses `autohide=true` for click-outside
+    // dismissal, and without this guard Ctrl+Shift+P flashes the
+    // popover and hides djinn.
+    panel.trackPopoverGrabs(palette.popoverWidget());
     g_dispatch.palette = &palette;
 
     var keymap_ctx = platform.KeymapContext{
@@ -1071,9 +1123,11 @@ pub fn main() !void {
             .ctx = @ptrCast(&g_dispatch),
             .on_invoke = Dispatch.onConfigChanged,
         },
-        .find_overlay = &find,
-        .cheatsheet = &cheatsheet,
-        .palette = &palette,
+        .popovers = .{
+            .find_overlay = &find,
+            .cheatsheet = &cheatsheet,
+            .palette = &palette,
+        },
     };
     platform.keymap.install(&panel, &keymap_ctx);
 

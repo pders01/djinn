@@ -436,6 +436,14 @@ pub const Palette = struct {
         }
     }
 
+    /// Underlying popover widget. Exposed so `panel.trackPopoverGrabs`
+    /// can wire its show/closed signals — the panel suppresses
+    /// hide-on-blur while this popover holds an input grab. Not for
+    /// general consumption.
+    pub fn popoverWidget(self: *Palette) *GtkWidget {
+        return self.popover;
+    }
+
     /// Reload the palette CSS from `opts`. Same shape as tab_strip /
     /// log_pane: build a fresh string, hand it to the provider via
     /// reload-in-place. main_linux's `onConfigChanged` fans every

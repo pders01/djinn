@@ -275,6 +275,14 @@ pub const FindOverlay = struct {
         _ = gtk_widget_grab_focus(self.entry);
     }
 
+    /// Underlying popover widget. Exposed so `panel.trackPopoverGrabs`
+    /// can wire its show/closed signals — the panel needs to suppress
+    /// hide-on-blur while this popover holds an input grab. Not for
+    /// general consumption.
+    pub fn popoverWidget(self: *FindOverlay) *GtkWidget {
+        return self.popover;
+    }
+
     pub fn findNext(self: *FindOverlay) void {
         if (self.current_regex == null) return;
         _ = vte_terminal_search_find_next(self.terminal);

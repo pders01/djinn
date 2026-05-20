@@ -183,13 +183,20 @@ pub const Watcher = struct {
 
         // Track how many entries have been successfully initialized
         // so an error mid-loop can tear down only the live ones.
+        // `built` is the next-write index AND the live count — this
+        // single-variable shape makes "is slot N tracked by the
+        // errdefer?" trivially equivalent to "is N < built?". The
+        // alternative pattern (`for (files, 0..) |path, i|` writing
+        // `entries[i]` then `built += 1`) lets the two counters drift
+        // if a future edit inserts a fallible step between the
+        // assignment and the count update.
         var built: usize = 0;
         errdefer {
             for (entries[0..built]) |*e| destroyEntry(allocator, e);
         }
 
-        for (files, 0..) |path, i| {
-            entries[i] = try buildEntry(allocator, path, coalesce);
+        for (files) |path| {
+            entries[built] = try buildEntry(allocator, path, coalesce);
             built += 1;
         }
 

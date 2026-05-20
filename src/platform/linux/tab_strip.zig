@@ -235,6 +235,22 @@ pub const TabStrip = struct {
         }
     }
 
+    /// Flip the exited CSS class on the chip at `idx`. Fed by the
+    /// SessionHost `on_exit_changed` hook so the chip dims and gains
+    /// a strikethrough when an inactive session's shell dies, and
+    /// reverts when `restartActive` revives the slot. Out-of-bounds
+    /// idx is a no-op; same-value flips are cheap (GTK skips
+    /// duplicate class adds/removes).
+    pub fn markExited(self: *TabStrip, idx: usize, exited: bool) void {
+        if (idx >= self.buttons.items.len) return;
+        const button = self.buttons.items[idx];
+        if (exited) {
+            gtk_widget_add_css_class(button, "djinn-tab-exited");
+        } else {
+            gtk_widget_remove_css_class(button, "djinn-tab-exited");
+        }
+    }
+
     /// Reload the strip's CSS from `opts`. Mirrors
     /// `Terminal.applyTheme` / `LogPane.applyTheme` so the watcher's
     /// config-change handler can drive all three at once. Reload-in-
@@ -452,6 +468,45 @@ fn writeThemedCss(
             );
         }
     }
+
+    // Exited chip: heavily dim + line-through on the label. Highest-
+    // specificity selector (3 classes) so it overrides the active
+    // accent when the user activates an exited session — color is
+    // muted, border-bottom stays at the active accent so the user
+    // sees both "this is the focused slot" and "the shell here is
+    // dead." Targets the inner `label` child because GTK4's
+    // text-decoration property cascades through label nodes more
+    // reliably than through the button's own node (KDE Breeze GTK4
+    // theme paints button text via a `label` node specifically).
+    if (opts.foreground) |fg| {
+        try w.print(
+            "button.djinn-tab.djinn-tab-exited {{\n" ++
+                "  color: rgba({d}, {d}, {d}, 0.35);\n" ++
+                "  font-style: italic;\n" ++
+                "}}\n" ++
+                "button.djinn-tab.djinn-tab-exited > label {{\n" ++
+                "  text-decoration: line-through;\n" ++
+                "}}\n" ++
+                "button.djinn-tab.djinn-tab-exited:hover {{\n" ++
+                "  color: rgba({d}, {d}, {d}, 0.6);\n" ++
+                "}}\n",
+            .{ fg.r, fg.g, fg.b, fg.r, fg.g, fg.b },
+        );
+    } else {
+        try w.writeAll(
+            \\button.djinn-tab.djinn-tab-exited {
+            \\  color: alpha(@theme_fg_color, 0.35);
+            \\  font-style: italic;
+            \\}
+            \\button.djinn-tab.djinn-tab-exited > label {
+            \\  text-decoration: line-through;
+            \\}
+            \\button.djinn-tab.djinn-tab-exited:hover {
+            \\  color: alpha(@theme_fg_color, 0.6);
+            \\}
+            \\
+        );
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
@@ -489,6 +544,19 @@ test "TabStrip CSS falls back to @accent_color when palette[4] is null" {
     defer buf.deinit(a);
     try writeThemedCss(a, &buf, .{});
     try std.testing.expect(std.mem.indexOf(u8, buf.items, "@accent_color") != null);
+}
+
+test "TabStrip CSS includes exited-chip rules" {
+    if (builtin.os.tag != .linux) return;
+    const a = std.testing.allocator;
+    var buf: std.ArrayList(u8) = .{};
+    defer buf.deinit(a);
+    try writeThemedCss(a, &buf, .{});
+    // The exited chip needs a dimmed-color rule AND a line-through
+    // on the label child — both have to ship for the visual to read
+    // as "this shell is dead, restart with Ctrl+R."
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "djinn-tab-exited") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "line-through") != null);
 }
 
 test "TabStrip type compiles" {

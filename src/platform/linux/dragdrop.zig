@@ -88,6 +88,15 @@ extern "c" fn gdk_texture_save_to_png(texture: *GdkTexture, filename: [*:0]const
 // Shared GLib signal connect lives in gtk.zig.
 const g_signal_connect_data = gtk.g_signal_connect_data;
 
+// GObject data-slot accessors. Used to mark "attach already ran on
+// this widget" so a duplicate call (refactor accident) no-ops instead
+// of silently stacking controllers. Cleared automatically when the
+// widget is destroyed because GObject teardown wipes its data table.
+extern "c" fn g_object_set_data(object: *GObject, key: [*:0]const u8, data: ?*anyopaque) void;
+extern "c" fn g_object_get_data(object: *GObject, key: [*:0]const u8) ?*anyopaque;
+
+const ATTACH_MARKER_KEY: [*:0]const u8 = "djinn-dragdrop-attached";
+
 // ─── VTE paste ───────────────────────────────────────────────────────
 
 /// VTE's clipboard-paste path: applies bracketed-paste (DEC 2004)
@@ -109,7 +118,17 @@ extern "c" fn vte_terminal_paste_text(terminal: *VteTerminal, text: [*:0]const u
 /// thumbnail `image/png`) resolves to the path rather than the
 /// preview bitmap. The image target catches screenshots, browser
 /// drags, and Photos-style sources where there's no path.
+///
+/// Idempotent: a second call on the same widget no-ops via a
+/// GObject-data marker. `gtk_widget_add_controller` accepts duplicate
+/// controllers silently, so without this guard a refactor that
+/// double-routes through `Terminal.open` would stack four targets
+/// (two string + two image) and double-fire on every drop. The
+/// marker auto-clears when the widget is destroyed.
 pub fn attach(widget: *GtkWidget) void {
+    const obj: *GObject = @ptrCast(widget);
+    if (g_object_get_data(obj, ATTACH_MARKER_KEY) != null) return;
+    g_object_set_data(obj, ATTACH_MARKER_KEY, @ptrFromInt(1));
     attachString(widget);
     attachImage(widget);
 }

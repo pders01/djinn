@@ -49,9 +49,18 @@ const g_signal_handler_disconnect = gtk.g_signal_handler_disconnect;
 /// VTE emits `child-exited` — i.e. when the shell process the terminal
 /// hosts has terminated. The handler typically maps to `panel.quit()`
 /// so typing `exit` closes the window.
+///
+/// `extra` is an opaque caller-defined payload that comes back through
+/// the callback. Terminal stores whatever the caller put in here and
+/// hands it back verbatim — no semantics imposed at this layer. Use
+/// case: a host running N Terminals through one callback function
+/// would otherwise need N wrapper-context allocations to distinguish
+/// which VTE fired; `extra` collapses that to a single `usize` per
+/// Handler. Callers with one Terminal default the field to 0.
 pub const Handler = struct {
     ctx: *anyopaque,
-    on_child_exited: *const fn (ctx: *anyopaque) void,
+    extra: usize = 0,
+    on_child_exited: *const fn (ctx: *anyopaque, extra: usize) void,
 };
 
 // ─── VTE extern surface ──────────────────────────────────────────────
@@ -161,10 +170,13 @@ pub const Terminal = struct {
     /// Same lifetime story as command_path — VTE reads it during the
     /// deferred fork, so it has to outlive the async spawn.
     cwd_path: ?[:0]u8 = null,
-    /// Heap-resident argv handed to VTE. The trailing slot stores the
-    /// required null terminator. VTE retains this pointer until the
-    /// async child-spawn fires, so Terminal owns it until deinit.
-    argv: [*]?[*:0]u8,
+    /// Heap-resident argv handed to VTE. Two slots: argv[0] points at
+    /// `command_path.ptr`, argv[1] is the required null terminator.
+    /// Stored as a slice (rather than `[*]?[*:0]u8` + magic length at
+    /// the deinit site) so the allocator hand-back stays self-
+    /// describing. VTE retains the pointer until the async child-spawn
+    /// fires, so Terminal owns the backing buffer until deinit.
+    argv: []?[*:0]u8,
     /// Heap-boxed handler the C `child-exited` callback recovers via
     /// `user_data`. Boxed because Terminal lives on the caller's stack
     /// and we can't take its address before `open` returns. Null when
@@ -231,7 +243,7 @@ pub const Terminal = struct {
         const argv = try allocator.alloc(?[*:0]u8, 2);
         errdefer allocator.free(argv);
         argv[0] = @ptrCast(command_path.ptr);
-        argv[1] = null;
+        argv[1] = null; // trailing null required by exec()
 
         vte_terminal_spawn_async(
             terminal,
@@ -278,7 +290,7 @@ pub const Terminal = struct {
             .allocator = allocator,
             .command_path = command_path,
             .cwd_path = cwd_path,
-            .argv = argv.ptr,
+            .argv = argv,
             .handler_box = handler_box,
             .child_exited_handler_id = child_exited_id,
         };
@@ -294,10 +306,7 @@ pub const Terminal = struct {
             g_signal_handler_disconnect(@ptrCast(self.widget), self.child_exited_handler_id);
             self.child_exited_handler_id = 0;
         }
-        // Reconstitute the slice from the stored pointer + known length
-        // (alloc'd as 2 above) so we can hand it back to the allocator.
-        const argv_slice = self.argv[0..2];
-        self.allocator.free(argv_slice);
+        self.allocator.free(self.argv);
         self.allocator.free(self.command_path);
         if (self.cwd_path) |p| self.allocator.free(p);
         if (self.handler_box) |box| self.allocator.destroy(box);
@@ -416,7 +425,7 @@ pub const Terminal = struct {
 
 fn onChildExited(_: *VteTerminal, _: c_int, user_data: gpointer) callconv(.c) void {
     const h: *Handler = @ptrCast(@alignCast(user_data orelse return));
-    h.on_child_exited(h.ctx);
+    h.on_child_exited(h.ctx, h.extra);
 }
 
 test "Terminal type compiles" {

@@ -173,6 +173,14 @@ pub const Panel = struct {
     /// connected. Stored so we connect at most once even if
     /// `setHideOnBlur(true)` is called multiple times.
     blur_handler_id: c_ulong = 0,
+    /// Count of currently-open `autohide=true` popovers owned by
+    /// djinn (find overlay, palette). Bumped via `pushPopoverGrab`
+    /// on popup and decremented via `popPopoverGrab` on dismiss.
+    /// `onActiveChanged` short-circuits while non-zero so the
+    /// popover's input grab doesn't trip hide-on-blur on KWin
+    /// Wayland. u32 because nesting is theoretically possible — one
+    /// popover opening another — though we don't do that today.
+    popover_grab_count: u32 = 0,
     /// Signal ids for the `close-request` and `map` handlers wired in
     /// `open`. Stashed so `deinit` can disconnect them before
     /// `gtk_window_destroy` — otherwise a teardown that races a
@@ -407,6 +415,77 @@ pub const Panel = struct {
         }
     }
 
+    /// Tell the panel that a child popover with `autohide=true` just
+    /// popped up. While the count is non-zero, `onActiveChanged`
+    /// ignores `is-active=false` flips so KWin Wayland's
+    /// popover-grab-induced parent deactivation doesn't trigger
+    /// hide-on-blur. Pairs with `popPopoverGrab`; balanced by the
+    /// caller. No-op when hide-on-blur is off (count still tracks
+    /// so live-enable later sees a consistent state).
+    pub fn pushPopoverGrab(self: *Panel) void {
+        self.popover_grab_count += 1;
+    }
+
+    /// Decrement the popover-grab counter. Underflow is a hard bug
+    /// (push/pop imbalance), but we clamp at zero rather than
+    /// panicking so a missed-show signal during shutdown can't
+    /// take the whole panel down. Watch the log: a stuck panel
+    /// that won't hide-on-blur after dismissing a popover is the
+    /// symptom of a leaked push.
+    ///
+    /// If the count drops to zero AND the window is no longer
+    /// active, run the deferred hide-on-blur now. This handles the
+    /// edge case "user opens a popover, then app-switches via
+    /// compositor": the active=false event fired while the count
+    /// was non-zero (and got suppressed), and `notify::is-active`
+    /// won't re-fire once we converge.
+    pub fn popPopoverGrab(self: *Panel) void {
+        if (self.popover_grab_count == 0) {
+            std.debug.print("panel: popPopoverGrab on zero counter — likely show/closed signal imbalance\n", .{});
+            return;
+        }
+        self.popover_grab_count -= 1;
+        if (self.popover_grab_count == 0 and self.hide_on_blur) {
+            if (gtk_window_is_active(self.window) == 0) self.hide();
+        }
+    }
+
+    /// Wire `show` + `closed` signals on a child popover so its
+    /// popup increments / dismiss decrements the panel's
+    /// popover-grab counter. Call once per popover at construction
+    /// time. The signals fire on the GLib main thread (same as
+    /// everything else here), so no synchronization needed. Handler
+    /// ids aren't stored — popovers live for the panel's lifetime,
+    /// and the GtkPopover dies when its anchor's destroy chain
+    /// runs, dropping the connections naturally.
+    ///
+    /// ASSUMPTION: each tracked popover is constructed once and
+    /// never rebuilt. If a future caller re-creates a popover (hot-
+    /// reload reconcile, theme rebuild, …) the old handlers would
+    /// stay on the dropped widget AND the new widget would also
+    /// need its own trackPopoverGrabs call. Add an explicit
+    /// `untrackPopoverGrabs(popover)` (signal_handler_disconnect_by_func)
+    /// when that pattern shows up. find_overlay + palette are both
+    /// init-once today.
+    pub fn trackPopoverGrabs(self: *Panel, popover: *GtkWidget) void {
+        _ = g_signal_connect_data(
+            @ptrCast(popover),
+            "show",
+            @ptrCast(&onPopoverShow),
+            @ptrCast(self),
+            null,
+            0,
+        );
+        _ = g_signal_connect_data(
+            @ptrCast(popover),
+            "closed",
+            @ptrCast(&onPopoverClosed),
+            @ptrCast(self),
+            null,
+            0,
+        );
+    }
+
     /// Enable or disable auto-hide on focus loss. First call with
     /// `enabled = true` connects to `notify::is-active`; the handler
     /// stays connected on subsequent disable/enable cycles and gates
@@ -522,6 +601,20 @@ fn onMapped(window: *GtkWidget, _: gpointer) callconv(.c) void {
 /// active to inactive and hide-on-blur is on, drop the surface so the
 /// user-flow matches Raycast / Spotlight semantics: lose focus → tuck
 /// away. Re-focus comes via the hotkey or IPC toggle.
+///
+/// Popover-popup guard: GTK4's `autohide=true` popovers (find overlay,
+/// palette) grab input on popup; on KWin Wayland the grab flips the
+/// parent toplevel's `is-active` to false even though focus has just
+/// landed on the popover's GtkSearchEntry. Without a guard, Ctrl+Shift+F
+/// and Ctrl+Shift+P appeared as "popover flashes, panel hides" because
+/// hide-on-blur fired the instant the popover popped up. The popover
+/// modules increment `popover_grab_count` on popup and decrement on
+/// dismiss via `pushPopoverGrab` / `popPopoverGrab`; while >0 we
+/// suppress the hide. A heuristic on `gtk_window_get_focus` would
+/// have been simpler but GTK4 retains the focus child across
+/// legitimate app-switches, so it can't distinguish "popover took
+/// focus inside me" from "user clicked another app and I still
+/// remember my last focus child."
 fn onActiveChanged(
     window: *GtkWindow,
     _: ?*anyopaque,
@@ -529,7 +622,28 @@ fn onActiveChanged(
 ) callconv(.c) void {
     const self: *Panel = @ptrCast(@alignCast(user_data orelse return));
     if (!self.hide_on_blur) return;
+    if (self.popover_grab_count > 0) return;
     if (gtk_window_is_active(window) == 0) self.hide();
+}
+
+/// GtkWidget `show` signal on a tracked popover. Fires when the
+/// popover becomes visible (after `gtk_popover_popup` or any other
+/// path). Bumps the panel's popover-grab counter so a soon-to-arrive
+/// `notify::is-active=false` from the compositor (KWin Wayland's
+/// reaction to the popover's input grab) doesn't trip hide-on-blur.
+fn onPopoverShow(_: *GtkWidget, user_data: gpointer) callconv(.c) void {
+    const self: *Panel = @ptrCast(@alignCast(user_data orelse return));
+    self.pushPopoverGrab();
+}
+
+/// GtkPopover `closed` signal — fires on autohide dismissal or
+/// explicit `gtk_popover_popdown`. Decrements the panel's
+/// popover-grab counter; if the window is non-active at that moment,
+/// `popPopoverGrab` runs the deferred hide so an app-switch-with-
+/// popover-open lands the panel correctly.
+fn onPopoverClosed(_: *GtkWidget, user_data: gpointer) callconv(.c) void {
+    const self: *Panel = @ptrCast(@alignCast(user_data orelse return));
+    self.popPopoverGrab();
 }
 
 /// Resize-poll tick. Reads the window's allocated width/height,

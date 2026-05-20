@@ -165,6 +165,7 @@ pub const Hotkey = struct {
             .connection = connection,
             .handler = handler,
             .trigger = trigger,
+            .unique_name = unique_name,
             .session_handle_token = session_handle_token,
             .handle_token_create = handle_token_create,
             .handle_token_bind = handle_token_bind,
@@ -192,6 +193,8 @@ pub const Hotkey = struct {
             ctx,
             null,
         );
+        errdefer if (ctx.activated_sub_id != 0)
+            gdbus.g_dbus_connection_signal_unsubscribe(ctx.connection, ctx.activated_sub_id);
 
         // Subscribe before we call. The portal pre-creates the Request
         // object so its Response signal CAN fire as soon as the method
@@ -211,6 +214,8 @@ pub const Hotkey = struct {
             ctx,
             null,
         );
+        errdefer if (ctx.create_response_sub_id != 0)
+            gdbus.g_dbus_connection_signal_unsubscribe(ctx.connection, ctx.create_response_sub_id);
 
         const create_params = buildCreateSessionParams(
             handle_token_create,
@@ -272,6 +277,14 @@ const Context = struct {
     handler: Handler,
     /// Portal-format trigger string ("CTRL+space"). Owned.
     trigger: [:0]u8,
+    /// Our session-bus unique name (e.g. `:1.42`). Cached at init time
+    /// because `g_dbus_connection_get_unique_name` would otherwise be
+    /// re-called from `bindShortcut` — the value is connection-stable
+    /// for the connection's lifetime, so caching is safe. The backing
+    /// string is owned by the connection (per glib docs); the slice
+    /// stays valid until `g_object_unref(connection)` in deinit, which
+    /// runs strictly after every site that reads it.
+    unique_name: []const u8,
     /// Caller-chosen tokens. Portal echoes them into request/session
     /// path computation so we can predict the Request object paths.
     session_handle_token: [:0]u8,
@@ -557,12 +570,9 @@ fn onActivated(
 // ─── BindShortcuts driver ────────────────────────────────────────────
 
 fn bindShortcut(ctx: *Context) !void {
-    const unique_name_z = gdbus.g_dbus_connection_get_unique_name(ctx.connection) orelse
-        return error.NoUniqueName;
-    const unique_name = std.mem.span(unique_name_z);
     const bind_request_path = try computeRequestPath(
         ctx.allocator,
-        unique_name,
+        ctx.unique_name,
         ctx.handle_token_bind,
     );
     ctx.bind_request_path = bind_request_path;

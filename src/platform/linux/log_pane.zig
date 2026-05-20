@@ -60,6 +60,7 @@ const gtk = @import("gtk.zig");
 const AgentState = @import("../../agent/state.zig").AgentState;
 const LogEntry = @import("../../agent/state.zig").LogEntry;
 const ThemeOptions = @import("terminal.zig").ThemeOptions;
+const LogModel = @import("log_model.zig").LogModel;
 
 const GtkWidget = gtk.GtkWidget;
 const gpointer = gtk.gpointer;
@@ -221,7 +222,7 @@ pub const LogPane = struct {
     placeholder: Placeholder = .none,
     /// Number of real (non-placeholder) rows currently in the list.
     /// Bumped on append, reset on full clear. Combined with
-    /// `filter_len` + `last_seen_count`, this is what
+    /// `model.hasActiveFilter()` + `last_seen_count`, this is what
     /// `refreshPlaceholder` reads to pick the right placeholder.
     rendered_count: usize = 0,
     /// Local copy of the currently-rendered attention message so the
@@ -229,28 +230,12 @@ pub const LogPane = struct {
     /// Mirrors darwin `LogView.attention_buf` / `attention_len`.
     attention_buf: [256]u8 = undefined,
     attention_len: usize = 0,
-    /// Active filter needle. Empty (`filter_len == 0`) means "show
-    /// all entries". Case-folded to lower-case once on input so the
-    /// per-entry match path is a plain `mem.indexOf`, not a per-byte
-    /// `ascii.toLower` on both sides. 256 bytes matches the
-    /// `attention_buf` cap — anyone typing a longer needle is
-    /// probably mis-typing into the wrong field, and silently
-    /// clipping is friendlier than a hard reject.
-    filter_buf: [256]u8 = undefined,
-    filter_len: usize = 0,
-    /// Tracks the client of the last body row we rendered so we can
-    /// emit a `{client} · HH:MM` header on transitions and drop the
-    /// `{client}` prefix on consecutive entries from the same agent.
-    /// Mirrors darwin `LogView.last_client_*`. 128 bytes covers any
-    /// realistic MCP client name (claude-code, codex, …) plus headroom.
-    last_client_buf: [128]u8 = undefined,
-    last_client_len: usize = 0,
-    /// `false` after rebuild + after any null-client entry breaks the
-    /// group — the next non-null client emits a fresh header. Distinct
-    /// from `last_client_len == 0` because an empty-string client
-    /// (never observed in practice) would otherwise collapse the
-    /// "unknown" and "matched empty" cases.
-    last_client_known: bool = false,
+    /// Pure-data model: filter needle + last-client tracking for
+    /// client-grouped headers. Extracted into its own file so the
+    /// hot-path logic is unit-testable without GTK init. Methods on
+    /// `LogModel` are called inline from the tick / rebuild paths
+    /// below; see `log_model.zig` for the contract.
+    model: LogModel = .{},
     /// Cached GtkPaned built by `pairWithSibling`. Null until that
     /// method runs. `setOnDividerChange` reads it to connect the
     /// `notify::position` signal so divider drags can persist to
@@ -425,7 +410,7 @@ pub const LogPane = struct {
     ///
     ///   rendered_count > 0          → no placeholder
     ///   last_seen_count == 0        → "no agent activity yet"
-    ///   filter_len > 0              → "no matches for filter"
+    ///   model.hasActiveFilter()     → "no matches for filter"
     ///   else (defensive default)    → "no agent activity yet"
     ///
     /// The defensive branch covers a degenerate snapshot where
@@ -440,7 +425,7 @@ pub const LogPane = struct {
         }
         if (self.last_seen_count == 0) {
             self.showPlaceholder(.no_activity);
-        } else if (self.filter_len > 0) {
+        } else if (self.model.hasActiveFilter()) {
             self.showPlaceholder(.no_matches);
         } else {
             self.showPlaceholder(.no_activity);
@@ -636,302 +621,11 @@ fn onPanedNotifyPosition(
 
 // ─── Implementation ──────────────────────────────────────────────────
 
-/// Build the log pane CSS into `buf`, baking in the resolved colors
-/// from `opts`. Null fields fall back to GTK theme named colors so a
-/// no-inheritance setup still gets a coherent (if generic) look.
-///
-/// The scrolled-window background is the key one — without it, GTK4
-/// paints the pane area with the GTK theme's default `window`
-/// background (black/dark in most themes), and the inherited ghostty
-/// terminal background only fills the VTE half. Setting the
-/// scrolled-window background to the resolved VTE background +
-/// opacity makes the two halves visually continuous.
-///
-/// Palette mapping (warn → yellow, err → red) prefers the resolved
-/// palette[3] / palette[1] when ghostty inheritance populated them;
-/// without that, GTK named colors (`@warning_color` / `@error_color`)
-/// keep the level cues visible against whatever desktop theme is
-/// active.
-///
-/// Result is null-terminated for the C `load_from_string` call.
-fn writeThemedCss(
-    allocator: std.mem.Allocator,
-    buf: *std.ArrayList(u8),
-    opts: ThemeOptions,
-) !void {
-    const w = buf.writer(allocator);
-
-    // Paint the background at the deepest node in the tree — the
-    // listbox itself, not the scrolledwindow. Reasoning:
-    //
-    // - GTK4 widgets are rendered children-over-parents, so painting
-    //   on the deepest visible node sidesteps the "intermediate node
-    //   paints opaque dark on top of our bg" trap that hits the
-    //   scrolledwindow / viewport pair.
-    // - The KDE Plasma GTK theme has rules like `viewport.view` and
-    //   `listbox > row.view` that paint `@view_bg_color` (opaque
-    //   dark). Higher-specificity selectors win without needing
-    //   `!important` — GTK 4.20's CSS parser rejects `!important`
-    //   on `background-color` outright ("Junk at end of value"),
-    //   dropping the whole rule. theme.zig's comment about
-    //   `!important` working on longhand is outdated for this GTK.
-    // - `scrolledwindow.djinn-log-scroller` and
-    //   `list.djinn-log` are type+class (specificity 11) which
-    //   beats a theme's `viewport.view` (1+10 = 11) by source
-    //   order — our provider loads at PRIORITY_APPLICATION (600)
-    //   above THEME (200), so on equal specificity we win.
-    //
-    // The scrolledwindow rule stays at transparent so the listbox's
-    // colored background bleeds through; making the wrapper opaque
-    // and the listbox transparent both work, but transparent
-    // outer + colored inner composites more cleanly under the
-    // panel's overall window opacity (the compositor only sees one
-    // alpha layer for the log area).
-    try w.writeAll(
-        \\scrolledwindow.djinn-log-scroller {
-        \\  background-color: transparent;
-        \\  background-image: none;
-        \\}
-        \\scrolledwindow.djinn-log-scroller > viewport {
-        \\  background-color: transparent;
-        \\  background-image: none;
-        \\}
-        \\
-    );
-
-    if (opts.background) |bg| {
-        const alpha = opts.opacity orelse 1.0;
-        try w.print(
-            "list.djinn-log {{ background-color: rgba({d}, {d}, {d}, {d:.2}); background-image: none; }}\n",
-            .{ bg.r, bg.g, bg.b, alpha },
-        );
-    } else {
-        try w.writeAll(
-            \\list.djinn-log {
-            \\  background-color: transparent;
-            \\  background-image: none;
-            \\}
-            \\
-        );
-    }
-
-    // Rows themselves stay transparent so the listbox's themed
-    // background bleeds through unmodified — no per-row paint that
-    // would break visual continuity when scrolling.
-    try w.writeAll(
-        \\list.djinn-log > row {
-        \\  background-color: transparent;
-        \\  padding: 6px 10px;
-        \\
-    );
-
-    // Row border + info text color track the resolved foreground
-    // when available, GTK theme fg otherwise.
-    if (opts.foreground) |fg| {
-        try w.print(
-            "  border-bottom: 1px solid rgba({d}, {d}, {d}, 0.10);\n}}\n",
-            .{ fg.r, fg.g, fg.b },
-        );
-    } else {
-        try w.writeAll("  border-bottom: 1px solid alpha(@view_fg_color, 0.06);\n}\n");
-    }
-
-    try w.writeAll(
-        \\list.djinn-log > row label {
-        \\  font-family: monospace;
-        \\  font-size: 0.9em;
-        \\}
-        \\
-    );
-
-    if (opts.foreground) |fg| {
-        try w.print(
-            ".djinn-log-info {{ color: rgba({d}, {d}, {d}, 0.85); }}\n",
-            .{ fg.r, fg.g, fg.b },
-        );
-        try w.print(
-            ".djinn-log-empty {{ color: rgba({d}, {d}, {d}, 0.45); font-style: italic; }}\n",
-            .{ fg.r, fg.g, fg.b },
-        );
-        // Header is dim + italic + slightly smaller, with a top
-        // margin so each group breathes apart from the previous
-        // one's body. Bottom margin is tight so the header sits
-        // directly above its first body row.
-        try w.print(
-            ".djinn-log-header {{\n" ++
-                "  color: rgba({d}, {d}, {d}, 0.55);\n" ++
-                "  font-style: italic;\n" ++
-                "  font-size: 0.8em;\n" ++
-                "  margin-top: 6px;\n" ++
-                "}}\n",
-            .{ fg.r, fg.g, fg.b },
-        );
-    } else {
-        try w.writeAll(
-            \\.djinn-log-info {
-            \\  color: alpha(@view_fg_color, 0.85);
-            \\}
-            \\.djinn-log-empty {
-            \\  color: alpha(@view_fg_color, 0.45);
-            \\  font-style: italic;
-            \\}
-            \\.djinn-log-header {
-            \\  color: alpha(@view_fg_color, 0.55);
-            \\  font-style: italic;
-            \\  font-size: 0.8em;
-            \\  margin-top: 6px;
-            \\}
-            \\
-        );
-    }
-
-    // Level accent colors. Palette[3] is yellow, palette[1] is red
-    // in the standard 16-color ANSI layout — same indices ghostty's
-    // theme files use for the "warning" and "danger" semantics.
-    if (opts.palette[3]) |warn| {
-        try w.print(
-            ".djinn-log-warn {{ color: rgb({d}, {d}, {d}); }}\n",
-            .{ warn.r, warn.g, warn.b },
-        );
-    } else {
-        try w.writeAll(".djinn-log-warn { color: @warning_color; }\n");
-    }
-    if (opts.palette[1]) |err_color| {
-        try w.print(
-            ".djinn-log-err {{ color: rgb({d}, {d}, {d}); }}\n",
-            .{ err_color.r, err_color.g, err_color.b },
-        );
-    } else {
-        try w.writeAll(".djinn-log-err { color: @error_color; }\n");
-    }
-
-    // Sticky-attention chip. Reuses palette[3] (the "warning" slot)
-    // for both the text and a low-alpha background tint — same
-    // semantic darwin uses for the menubar attention symbol and the
-    // top-of-pane banner, so a user who's set both djinn surfaces
-    // gets a coherent visual language across them. `box-shadow: none`
-    // suppresses the default GtkButton drop-shadow some themes set
-    // (looks out of place inside the pane's bounded column).
-    //
-    // GtkButton's CSS node IS `button` (unlike GtkListBox's `list`
-    // gotcha), so the `button.djinn-log-attention` selector matches
-    // directly. The inner label gets its color via inheritance from
-    // the button rule — no separate `> label` selector needed.
-    if (opts.palette[3]) |warn_rgb| {
-        try w.print(
-            "button.djinn-log-attention {{\n" ++
-                "  background-color: rgba({d}, {d}, {d}, 0.18);\n" ++
-                "  background-image: none;\n" ++
-                "  color: rgb({d}, {d}, {d});\n" ++
-                "  border: 1px solid rgba({d}, {d}, {d}, 0.45);\n" ++
-                "  padding: 6px 10px;\n" ++
-                "  margin: 6px 6px 0 6px;\n" ++
-                "  border-radius: 4px;\n" ++
-                "  box-shadow: none;\n" ++
-                "  font-weight: bold;\n" ++
-                "}}\n" ++
-                "button.djinn-log-attention:hover {{\n" ++
-                "  background-color: rgba({d}, {d}, {d}, 0.28);\n" ++
-                "}}\n",
-            .{
-                warn_rgb.r, warn_rgb.g, warn_rgb.b,
-                warn_rgb.r, warn_rgb.g, warn_rgb.b,
-                warn_rgb.r, warn_rgb.g, warn_rgb.b,
-                warn_rgb.r, warn_rgb.g, warn_rgb.b,
-            },
-        );
-    } else {
-        try w.writeAll(
-            \\button.djinn-log-attention {
-            \\  background-color: alpha(@warning_color, 0.18);
-            \\  background-image: none;
-            \\  color: @warning_color;
-            \\  border: 1px solid alpha(@warning_color, 0.45);
-            \\  padding: 6px 10px;
-            \\  margin: 6px 6px 0 6px;
-            \\  border-radius: 4px;
-            \\  box-shadow: none;
-            \\  font-weight: bold;
-            \\}
-            \\button.djinn-log-attention:hover {
-            \\  background-color: alpha(@warning_color, 0.28);
-            \\}
-            \\
-        );
-    }
-
-    // Outer container shares the list background so the chip's
-    // margin shows the same bleed-through color as the list itself.
-    // Without this rule, the box paints the GTK theme's window
-    // background between the chip and the scrolledwindow.
-    if (opts.background) |bg| {
-        const alpha = opts.opacity orelse 1.0;
-        try w.print(
-            "box.djinn-log-container {{ background-color: rgba({d}, {d}, {d}, {d:.2}); background-image: none; }}\n",
-            .{ bg.r, bg.g, bg.b, alpha },
-        );
-    } else {
-        try w.writeAll(
-            \\box.djinn-log-container {
-            \\  background-color: transparent;
-            \\  background-image: none;
-            \\}
-            \\
-        );
-    }
-
-    // Filter entry. GtkSearchEntry's CSS node is `entry`; the
-    // `.djinn-log-filter` class lands on the outer search-entry
-    // widget, so we target `entry.djinn-log-filter`. The inner
-    // GtkText (where the typed characters actually paint) inherits
-    // color from the entry — explicit `> text` rule mirrors the
-    // listbox row trick where the inner node ignores theme overrides
-    // unless addressed directly.
-    //
-    // 6px horizontal/bottom margin matches the chip's left/right
-    // inset so the two siblings visually align in the column. The
-    // entry sits on top of the same translucent container bg so it
-    // doesn't pop visually — explicit transparent + GTK-theme
-    // border keeps the field's affordance visible without painting
-    // an opaque box that would clash with the inherited terminal
-    // background tint.
-    if (opts.foreground) |fg| {
-        try w.print(
-            "entry.djinn-log-filter {{\n" ++
-                "  background-color: rgba({d}, {d}, {d}, 0.06);\n" ++
-                "  background-image: none;\n" ++
-                "  color: rgba({d}, {d}, {d}, 0.90);\n" ++
-                "  margin: 4px 6px 6px 6px;\n" ++
-                "  padding: 2px 6px;\n" ++
-                "  border-radius: 4px;\n" ++
-                "  caret-color: rgba({d}, {d}, {d}, 0.90);\n" ++
-                "}}\n" ++
-                "entry.djinn-log-filter > text {{\n" ++
-                "  color: rgba({d}, {d}, {d}, 0.90);\n" ++
-                "}}\n",
-            .{
-                fg.r, fg.g, fg.b,
-                fg.r, fg.g, fg.b,
-                fg.r, fg.g, fg.b,
-                fg.r, fg.g, fg.b,
-            },
-        );
-    } else {
-        try w.writeAll(
-            \\entry.djinn-log-filter {
-            \\  background-color: alpha(@view_fg_color, 0.06);
-            \\  background-image: none;
-            \\  margin: 4px 6px 6px 6px;
-            \\  padding: 2px 6px;
-            \\  border-radius: 4px;
-            \\}
-            \\
-        );
-    }
-
-    // Null-terminate for the C `load_from_string` call.
-    try buf.append(allocator, 0);
-}
+/// Themed CSS builder. Extracted to `log_pane_css.zig` to keep this
+/// module focused on widget lifecycle + signal wiring. See that
+/// module's file-doc for selector inventory and the palette/theme
+/// fallback rules.
+const writeThemedCss = @import("log_pane_css.zig").writeThemedCss;
 
 fn pollTick(user_data: gpointer) callconv(.c) c_int {
     const self: *LogPane = @ptrCast(@alignCast(user_data orelse return G_SOURCE_CONTINUE));
@@ -999,8 +693,7 @@ fn pollTick(user_data: gpointer) callconv(.c) c_int {
         // rebuilt list gets a fresh header — without this, a
         // ring-evict rebuild that happens to start with the same
         // client as before the evict would silently lose the header.
-        self.last_client_known = false;
-        self.last_client_len = 0;
+        self.model.resetGrouping();
         appendRangeLocked(self, state, 0, snapshot_count) catch |err| {
             std.debug.print("log_pane: rebuild failed: {}\n", .{err});
         };
@@ -1050,7 +743,7 @@ fn appendRangeLocked(self: *LogPane, state: *AgentState, from: usize, count: usi
     if (from >= end) return;
 
     for (state.log.items[from..end]) |entry| {
-        if (!entryMatchesFilter(self, entry)) continue;
+        if (!self.model.matchesFilter(entry)) continue;
         // Lazy-clear: a tick where every new entry was filtered out
         // shouldn't churn the "no matches" placeholder. Clear only
         // when we have a real row about to land.
@@ -1062,7 +755,7 @@ fn appendRangeLocked(self: *LogPane, state: *AgentState, from: usize, count: usi
         // so a filter that hides every body in a group also hides
         // the orphan header — no degenerate "header with no rows
         // under it" state.
-        if (shouldEmitHeader(self, entry)) {
+        if (self.model.shouldEmitHeader(entry)) {
             const hdr = buildHeaderRow(self.allocator, entry) catch |err| {
                 std.debug.print("log_pane: header build failed: {}\n", .{err});
                 continue;
@@ -1070,73 +763,12 @@ fn appendRangeLocked(self: *LogPane, state: *AgentState, from: usize, count: usi
             gtk_list_box_append(@ptrCast(self.list_box), hdr);
             self.rendered_count += 1;
         }
-        updateLastClient(self, entry.client);
+        self.model.updateLastClient(entry.client);
 
         const row = try buildRow(self.allocator, entry);
         gtk_list_box_append(@ptrCast(self.list_box), row);
         self.rendered_count += 1;
     }
-}
-
-/// True when the entry needs a `{client} · HH:MM` header above it:
-/// non-null client AND (either no prior client recorded or the
-/// recorded client differs). Null-client entries (djinn-internal log
-/// lines) never trigger a header — they break the group instead, so
-/// the next non-null client gets a fresh header.
-fn shouldEmitHeader(self: *LogPane, entry: LogEntry) bool {
-    const client = entry.client orelse return false;
-    if (!self.last_client_known) return true;
-    return !std.mem.eql(u8, client, self.last_client_buf[0..self.last_client_len]);
-}
-
-/// Update `last_client_*` after rendering a row. Non-null client
-/// stamps the buffer + sets `known=true`; null client breaks the
-/// group so the next non-null client emits a fresh header. Mirrors
-/// darwin's `log_view.zig:339` reset-on-null pattern.
-fn updateLastClient(self: *LogPane, client: ?[]const u8) void {
-    if (client) |c| {
-        const n = @min(c.len, self.last_client_buf.len);
-        @memcpy(self.last_client_buf[0..n], c[0..n]);
-        self.last_client_len = n;
-        self.last_client_known = true;
-    } else {
-        self.last_client_known = false;
-        self.last_client_len = 0;
-    }
-}
-
-/// Case-insensitive substring match against `entry.message` +
-/// `entry.client`. Empty needle (filter cleared) matches everything.
-/// Haystack is built once into a stack buffer so the hot path is one
-/// `mem.indexOf` rather than a streaming comparison — entries are
-/// bounded by AgentState's message cap, so the 512-byte buffer
-/// covers the worst-case message + a long client id.
-fn entryMatchesFilter(self: *LogPane, entry: LogEntry) bool {
-    if (self.filter_len == 0) return true;
-    const needle = self.filter_buf[0..self.filter_len];
-
-    var hay_buf: [512]u8 = undefined;
-    var hay_len: usize = 0;
-
-    const msg_take = @min(entry.message.len, hay_buf.len - hay_len);
-    for (entry.message[0..msg_take]) |c| {
-        hay_buf[hay_len] = std.ascii.toLower(c);
-        hay_len += 1;
-    }
-
-    if (entry.client) |client| {
-        if (hay_len < hay_buf.len) {
-            hay_buf[hay_len] = ' ';
-            hay_len += 1;
-        }
-        const client_take = @min(client.len, hay_buf.len - hay_len);
-        for (client[0..client_take]) |c| {
-            hay_buf[hay_len] = std.ascii.toLower(c);
-            hay_len += 1;
-        }
-    }
-
-    return std.mem.indexOf(u8, hay_buf[0..hay_len], needle) != null;
 }
 
 /// Clear the list and re-walk every state entry through the active
@@ -1184,22 +816,14 @@ fn rebuildAll(self: *LogPane) void {
 }
 
 /// GtkSearchEntry `search-changed` signal — user typed (or cleared)
-/// the filter. Copy the text case-folded into `filter_buf` so the
-/// per-entry match is a single `mem.indexOf`, then force a full
-/// rebuild. GtkSearchEntry's built-in 150ms debounce keeps this
-/// from firing on every keystroke during fast typing, so the
-/// rebuild cost stays bounded even on a 256-entry log.
+/// the filter. Hand the text to the model (case-folds + stores),
+/// then force a full rebuild. GtkSearchEntry's built-in 150ms
+/// debounce keeps this from firing on every keystroke during fast
+/// typing, so the rebuild cost stays bounded even on a 256-entry log.
 fn onSearchChanged(entry: *GtkSearchEntry, user_data: gpointer) callconv(.c) void {
     const self: *LogPane = @ptrCast(@alignCast(user_data orelse return));
     const text_z = gtk_editable_get_text(@ptrCast(entry));
-    const text = std.mem.span(text_z);
-
-    const take = @min(text.len, self.filter_buf.len);
-    self.filter_len = take;
-    for (text[0..take], 0..) |c, i| {
-        self.filter_buf[i] = std.ascii.toLower(c);
-    }
-
+    self.model.setFilter(std.mem.span(text_z));
     rebuildAll(self);
 }
 
@@ -1380,53 +1004,6 @@ test "log_pane: module compiles" {
     _ = buildRow;
 }
 
-test "log_pane: entryMatchesFilter — empty needle matches everything" {
-    var pane: LogPane = undefined;
-    pane.filter_len = 0;
-    const entry: LogEntry = .{
-        .level = .info,
-        .message = "anything",
-        .client = null,
-        .timestamp_ms = 0,
-    };
-    try std.testing.expect(entryMatchesFilter(&pane, entry));
-}
-
-test "log_pane: entryMatchesFilter — case-insensitive substring on message" {
-    var pane: LogPane = undefined;
-    pane.filter_buf[0..5].* = "build".*;
-    pane.filter_len = 5;
-
-    const hit: LogEntry = .{
-        .level = .info,
-        .message = "starting BUILD now",
-        .client = null,
-        .timestamp_ms = 0,
-    };
-    const miss: LogEntry = .{
-        .level = .info,
-        .message = "unrelated",
-        .client = null,
-        .timestamp_ms = 0,
-    };
-    try std.testing.expect(entryMatchesFilter(&pane, hit));
-    try std.testing.expect(!entryMatchesFilter(&pane, miss));
-}
-
-test "log_pane: entryMatchesFilter — matches against client too" {
-    var pane: LogPane = undefined;
-    pane.filter_buf[0..6].* = "claude".*;
-    pane.filter_len = 6;
-
-    const hit: LogEntry = .{
-        .level = .info,
-        .message = "compiling",
-        .client = "claude-code",
-        .timestamp_ms = 0,
-    };
-    try std.testing.expect(entryMatchesFilter(&pane, hit));
-}
-
 test "log_pane: formatHeaderTime — epoch zero is 00:00 UTC" {
     var buf: [16]u8 = undefined;
     try std.testing.expectEqualStrings("00:00", formatHeaderTime(&buf, 0));
@@ -1439,57 +1016,6 @@ test "log_pane: formatHeaderTime — wraps modulo 24h" {
     try std.testing.expectEqualStrings("13:45", formatHeaderTime(&buf, 1778852700000));
 }
 
-test "log_pane: shouldEmitHeader — first non-null client emits" {
-    var pane: LogPane = undefined;
-    pane.last_client_known = false;
-    pane.last_client_len = 0;
-    const entry: LogEntry = .{
-        .level = .info,
-        .message = "x",
-        .client = "claude-code",
-        .timestamp_ms = 0,
-    };
-    try std.testing.expect(shouldEmitHeader(&pane, entry));
-}
 
-test "log_pane: shouldEmitHeader — same client suppresses" {
-    var pane: LogPane = undefined;
-    pane.last_client_known = true;
-    pane.last_client_buf[0..6].* = "claude".*;
-    pane.last_client_len = 6;
-    const entry: LogEntry = .{
-        .level = .info,
-        .message = "x",
-        .client = "claude",
-        .timestamp_ms = 0,
-    };
-    try std.testing.expect(!shouldEmitHeader(&pane, entry));
-}
 
-test "log_pane: shouldEmitHeader — client change emits" {
-    var pane: LogPane = undefined;
-    pane.last_client_known = true;
-    pane.last_client_buf[0..6].* = "claude".*;
-    pane.last_client_len = 6;
-    const entry: LogEntry = .{
-        .level = .info,
-        .message = "x",
-        .client = "codex",
-        .timestamp_ms = 0,
-    };
-    try std.testing.expect(shouldEmitHeader(&pane, entry));
-}
 
-test "log_pane: shouldEmitHeader — null client never emits" {
-    var pane: LogPane = undefined;
-    pane.last_client_known = true;
-    pane.last_client_buf[0..6].* = "claude".*;
-    pane.last_client_len = 6;
-    const entry: LogEntry = .{
-        .level = .info,
-        .message = "x",
-        .client = null,
-        .timestamp_ms = 0,
-    };
-    try std.testing.expect(!shouldEmitHeader(&pane, entry));
-}

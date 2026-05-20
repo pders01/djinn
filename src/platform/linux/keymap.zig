@@ -86,22 +86,58 @@ extern "c" fn gtk_callback_action_new(
 ) *GtkShortcutAction;
 extern "c" fn gtk_shortcut_new(trigger: *GtkShortcutTrigger, action: *GtkShortcutAction) *GtkShortcut;
 
-/// Dispatch context passed to each shortcut callback. Held by the
-/// caller for the lifetime of the panel — `install` stamps the
-/// address into every shortcut's user_data slot so the callbacks can
-/// reach Terminal without a global. Address must be stable; the
-/// caller (`main_linux.zig`) keeps it on `runWithIpc`'s frame.
+/// Late-stamped popover pointers. All three popovers are constructed
+/// on `runWithIpc`'s frame *after* the keymap Context literal is
+/// initialized, so the slots default to null and main_linux stamps
+/// them right after each popover's `init` returns. Handlers no-op
+/// when the slot is null instead of crashing on a partial-init
+/// dispatch.
 ///
-/// `allocator` is used by `open_settings` (compose the config path,
-/// spawn the editor) and `mcp_copy_endpoint` (read mcp.json into a
-/// heap buffer). `log_pane` is used by `toggle_log_pane`. `panel` +
-/// `config` are used by `hide_panel` (gated on
-/// `config.window.hide_on_escape`). The font/scrollback/copy/paste
-/// handlers ignore the rest. `reapply_config`, when set, fires the
-/// theme-toggle path: cycle the override, then re-run the config
-/// apply chain so the new appearance variant gets baked in. Same
-/// shape as the watcher's `Handler` — main_linux.zig points it at
-/// `Dispatch.onConfigChanged`.
+/// The cluster lives in its own struct because (a) all three share
+/// the late-stamp lifetime story and (b) the rest of the Context
+/// fields are non-null at panel-open time — separating them makes
+/// the "what's guaranteed vs. what's optional" distinction visible
+/// at a glance instead of buried in field-level docs.
+pub const Popovers = struct {
+    find_overlay: ?*FindOverlay = null,
+    cheatsheet: ?*Cheatsheet = null,
+    /// Multi-profile palette switcher (Ctrl+Shift+P). Also gated by
+    /// `predHasMultipleProfiles` so single-profile setups propagate
+    /// Ctrl+Shift+P unchanged regardless of whether the slot is
+    /// stamped — belt-and-suspenders against a future reorder
+    /// dropping the palette from the wiring.
+    palette: ?*Palette = null,
+};
+
+/// Service registry passed to every shortcut callback. Held by the
+/// caller for the lifetime of the panel — `install` stamps the
+/// address into every shortcut's user_data slot. Address must be
+/// stable; `main_linux.zig` keeps it on `runWithIpc`'s frame.
+///
+/// Treated as a registry, not a god-object: each handler reaches
+/// for exactly the slot(s) it needs (visible via the `ctx.<slot>`
+/// access). Adding a new shortcut that depends on a new subsystem
+/// is a one-line field addition here plus a one-line stamp in
+/// main_linux. Per-action `*anyopaque` user_data was considered
+/// but the type-erasure cost (every handler casts back to its
+/// concrete dep type) didn't justify the structural split at
+/// today's row count.
+///
+/// Field-usage map (so a reader knows which actions each slot
+/// touches without grepping the whole file):
+///   - `session_host`        — every VTE-driven action (font,
+///                             scroll, clear, restart, shell, copy/
+///                             paste, tab switching). `activeTerminal`
+///                             reaches through it for the visible VTE.
+///   - `allocator`           — `open_settings`, `mcp_copy_endpoint`.
+///   - `log_pane`            — `toggle_log_pane`, `theme_toggle`
+///                             (logs the new override).
+///   - `panel`               — `hide_panel`.
+///   - `config`              — `predHideOnEscape`, `open_settings`.
+///   - `reapply_config`      — `theme_toggle` (re-run config-apply
+///                             chain after cycling the override).
+///   - `popovers.*`          — `find_*`, `cheatsheet_open`,
+///                             `palette_open`.
 pub const Context = struct {
     /// Multi-profile container. Handlers that need the visible VTE
     /// (font scale, clipboard, scrollback, scroll) reach via
@@ -115,24 +151,7 @@ pub const Context = struct {
     panel: *Panel,
     config: *const Config,
     reapply_config: ?ReapplyHook = null,
-    /// Late-stamped by main_linux after `FindOverlay.init`. Null
-    /// while the field is still under construction (the keymap_ctx
-    /// lives on the same frame so we'd otherwise need a re-stamp
-    /// step). Find handlers no-op when null instead of crashing on
-    /// a partial-init dispatch.
-    find_overlay: ?*FindOverlay = null,
-    /// Same late-stamped pattern as `find_overlay` for the
-    /// cheatsheet popover. `cheatsheet_open` no-ops when null.
-    cheatsheet: ?*Cheatsheet = null,
-    /// Multi-profile palette switcher (Ctrl+Shift+P). Late-stamped
-    /// for the same reason as the rest: its anchor (the GtkStack)
-    /// is built mid-`runWithIpc` and the keymap context lives on the
-    /// same frame, so the slot is stamped right after the palette
-    /// construction. `palette_open` no-ops when null AND the
-    /// `predHasMultipleProfiles` predicate already gates the row
-    /// against single-profile setups (belt-and-suspenders against a
-    /// future reorder dropping the palette from the wiring).
-    palette: ?*Palette = null,
+    popovers: Popovers = .{},
 };
 
 /// Helper for handlers that operate on the active session's Terminal.
@@ -518,19 +537,19 @@ fn onThemeToggle(ctx: *Context) void {
 }
 
 fn onFindOpen(ctx: *Context) void {
-    if (ctx.find_overlay) |fo| fo.open();
+    if (ctx.popovers.find_overlay) |fo| fo.open();
 }
 
 fn onFindNext(ctx: *Context) void {
-    if (ctx.find_overlay) |fo| fo.findNext();
+    if (ctx.popovers.find_overlay) |fo| fo.findNext();
 }
 
 fn onFindPrev(ctx: *Context) void {
-    if (ctx.find_overlay) |fo| fo.findPrevious();
+    if (ctx.popovers.find_overlay) |fo| fo.findPrevious();
 }
 
 fn onCheatsheetOpen(ctx: *Context) void {
-    if (ctx.cheatsheet) |cs| cs.toggle();
+    if (ctx.popovers.cheatsheet) |cs| cs.toggle();
 }
 
 /// Hide the panel on Escape — Raycast/Spotlight muscle memory.
@@ -563,7 +582,7 @@ fn predHasMultipleProfiles(ctx: *Context) bool {
 }
 
 fn onPaletteOpen(ctx: *Context) void {
-    if (ctx.palette) |p| p.toggle();
+    if (ctx.popovers.palette) |p| p.toggle();
 }
 
 fn onNextTab(ctx: *Context) void {
