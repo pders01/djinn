@@ -116,6 +116,9 @@ fn onConfigChanged() void {
     // resize is the common case). Bail before doing any work.
     if (!configFilesChanged()) return;
 
+    // Shallow value-copy for the comparison + warning reads below.
+    // The old arena is NOT released here — see the comment near the
+    // swap site at the end of this function.
     const old = cfg_ptr.*;
 
     // FSEvents may fire mid-rename when an atomic-write editor saves
@@ -184,6 +187,17 @@ fn onConfigChanged() void {
     // explicitly here too would do the same file-read + parse twice
     // on every save.
     view_mod.reloadTheme();
+    // Old Config's arena is NOT released here: SessionManager's
+    // `Profile.name` / `.command` / `.bell_sound` etc. point directly
+    // into the arena (see `resolveEntry` — no copy), and
+    // `updateProfileDisplay` only re-points `.title` / `.cwd`.
+    // Releasing the arena would UAF every active session on the next
+    // bell ring, status surface, or `Cmd+R` restart.
+    // Sessions tear down before `defer config.deinit()` fires at
+    // shutdown (registered later than `defer session_manager.deinit()`,
+    // so it runs first), so the on-exit deinit is safe; live-reload
+    // intentionally leaks until `resolveEntry` copies through
+    // `owned_strings`.
 }
 
 /// Emit one stderr warning per restart-required key whose value
@@ -469,11 +483,14 @@ pub fn main() !void {
 
     // Startup: missing file is fine (use defaults); any other error
     // surfaces so the user sees what's wrong instead of running with
-    // mystery defaults.
+    // mystery defaults. Config owns its duped strings via an internal
+    // arena; `defer config.deinit()` releases whichever arena is in
+    // place at shutdown (original or most-recently-reloaded).
     var config = Config.loadOrDefault(allocator) catch |err| {
         std.debug.print("error: config load failed: {}\n", .{err});
         std.process.exit(1);
     };
+    defer config.deinit();
 
     ghostty_runtime.setHost(&app.g);
     var ghostty_app_opt = ghostty_runtime.App.init(config.scrollback.size);
@@ -758,6 +775,13 @@ pub fn main() !void {
         .notify_on_error = config.notifications.notify_on_error,
         .notify_on_done = config.notifications.notify_on_done,
         .notify_on_progress = config.notifications.notify_on_progress,
+        // ToolTable used to read `app.g.config` and `app.g.session_manager`
+        // through the darwin-only `src/app.zig` global. Those reads were
+        // moved onto these fields so the same struct works on linux
+        // (which has no app.zig). Wiring them here keeps the darwin
+        // runtime behavior bit-identical.
+        .config = &config,
+        .session_manager = &session_manager,
     };
     app.g.tool_table = &tools;
     var dispatcher = Dispatcher{ .tool_table = tools.table() };

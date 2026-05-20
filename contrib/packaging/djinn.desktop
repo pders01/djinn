@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=djinn
+Comment=Drop-down terminal panel + MCP agent surface
+Exec=djinn
+Icon=utilities-terminal
+Terminal=false
+Categories=Utility;TerminalEmulator;
+StartupNotify=false
+StartupWMClass=djinn

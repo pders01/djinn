@@ -16,6 +16,13 @@ pub const McpServer = struct {
     token: []const u8,
     handler: Handler,
     stop_flag: std.atomic.Value(bool),
+    /// Set by the caller after `Thread.spawn`. When non-null, `deinit`
+    /// joins the thread before freeing `token`, closing the
+    /// thread-still-reading-token race that opens up if the server is
+    /// stopped at runtime (linux live-apply on `mcp.enabled` flip).
+    /// Stays null on darwin's path, which detaches the thread and
+    /// relies on the OS to reap it at process exit; join then skips.
+    thread: ?std.Thread = null,
 
     pub const Handler = struct {
         ctx: *anyopaque,
@@ -53,6 +60,14 @@ pub const McpServer = struct {
     pub fn deinit(self: *McpServer) void {
         self.stop_flag.store(true, .release);
         self.listener.deinit();
+        // Close the use-after-free window on `token`: an in-flight
+        // `handleConnection` reads `self.token` from `checkAuth`. If
+        // the caller registered the thread handle (linux live-apply
+        // path), wait for the accept loop + any handler to wind down
+        // before releasing the token's backing memory. Detached
+        // callers (darwin at process exit) leave `thread` null and
+        // skip the join.
+        if (self.thread) |t| t.join();
         self.allocator.free(self.token);
     }
 

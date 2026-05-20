@@ -51,6 +51,66 @@ jobs:
       - name: Run djinn --version
         run: ./zig-out/bin/djinn --version
 
+  linux:
+    # Ubuntu 24.04 LTS — has libgtk4-layer-shell-dev in the universe
+    # archive, matches the runtime targeted by
+    # contrib/packaging/debian/control. Pinned (not ubuntu-latest) so
+    # GitHub's "latest" rollover doesn't surprise the GTK / VTE pin.
+    # Bypasses scripts/build.sh because its `PATH=/usr/bin:$PATH`
+    # prefix is darwin-only (Metal Toolchain discovery) and the
+    # ghostty darwin patch the script applies is a no-op here.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GTK / VTE dev headers
+        # Matches contrib/packaging/debian/control's Build-Depends.
+        # pkg-config drives djinn's linkSystemLibrary discovery.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev \
+            libgtk4-layer-shell-dev \
+            libvte-2.91-gtk4-dev \
+            libglib2.0-dev \
+            pkg-config
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Cache zig packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Run unit suite
+        run: zig build test
+
+      - name: Build debug exe (smoke)
+        # Catches link-time regressions the test suite can't see —
+        # GTK / VTE symbols are only checked at link time, not under
+        # the test target's smaller surface.
+        run: zig build
+
+      - name: Build ReleaseSafe (distribution path)
+        # The optimization level distros + `just install-arch` ship.
+        # Catches comptime / safety regressions that only fire under
+        # release optimization.
+        run: zig build -Doptimize=ReleaseSafe
+
+      - name: Run djinn --version
+        # Smoke: the binary loads (no missing symbols, runtime
+        # ld.so resolves all of libgtk-4 / libgtk4-layer-shell / libvte).
+        run: ./zig-out/bin/djinn --version
+
   bundle:
     # Exercises the full distributable path: Metal shader compile via
     # xcrun, install_name_tool rpath rewrite, plist version

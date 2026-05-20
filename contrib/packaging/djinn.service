@@ -1,0 +1,39 @@
+[Unit]
+Description=djinn drop-down terminal panel + MCP agent surface
+Documentation=https://github.com/derscheid/djinn
+
+# Wait for the graphical session to be up before launching — djinn
+# needs WAYLAND_DISPLAY / DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR
+# and the portal backends to exist before it can register the
+# GlobalShortcuts hotkey and StatusNotifierItem. `graphical-session`
+# is the cross-compositor target (KDE, GNOME, Hyprland, sway all
+# populate it via their respective session services).
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+
+# Hardcoded to /usr/bin/djinn — matches the canonical install path
+# the Arch / Debian / nix packages use (`--prefix /usr` or its
+# equivalent). Manual installs to /usr/local should drop their own
+# copy of this file into /usr/local/lib/systemd/user/ with the
+# ExecStart adjusted.
+ExecStart=/usr/bin/djinn
+
+# Restart on crash, not on clean exit. Quitting via the tray menu or
+# closing the panel should NOT respawn the process — that's a user
+# decision to stop. `on-failure` covers SIGSEGV / panic / nonzero
+# exit only.
+Restart=on-failure
+RestartSec=2s
+
+# main_linux.zig wires a SIGTERM handler via g_unix_signal_add that
+# calls panel.quit() for a clean GLib loop teardown. `systemctl
+# --user stop djinn` therefore tears down through the same path as
+# closing the window, without escalating to SIGKILL.
+KillSignal=SIGTERM
+TimeoutStopSec=5s
+
+[Install]
+WantedBy=graphical-session.target

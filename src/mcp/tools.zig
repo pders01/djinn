@@ -4,15 +4,19 @@ const Dispatcher = @import("dispatch.zig").Dispatcher;
 const AgentState = @import("../agent/state.zig").AgentState;
 const Agent = @import("../agent/state.zig").Agent;
 const LogEntry = @import("../agent/state.zig").LogEntry;
-const Notifier = @import("../notify/darwin.zig").Notifier;
-const app_state = @import("../app.zig");
+const platform = @import("../platform.zig");
+const Notifier = platform.Notifier;
+const Config = @import("../config.zig").Config;
+const SessionManager = @import("../session/manager.zig").SessionManager;
 
-/// Look up the per-client mute flag. Wired through `app.g.config` so
-/// hot-config-reload edits take effect on the next tool call without
-/// rebuilding the ToolTable. Anonymous (null) client always passes.
-fn clientMuted(client: ?[]const u8) bool {
+/// Look up the per-client mute flag. Reads `self.config` so the
+/// linux path doesn't have to go through the darwin-only
+/// `src/app.zig` global. Wired by the host (main.zig / main_linux.zig)
+/// at ToolTable construction; null means "no mute info available,
+/// every client passes". Anonymous (null) client always passes too.
+fn clientMuted(self: *const ToolTable, client: ?[]const u8) bool {
     const id = client orelse return false;
-    const cfg = app_state.g.config orelse return false;
+    const cfg = self.config orelse return false;
     if (cfg.findClient(id)) |e| return e.mute;
     return false;
 }
@@ -26,6 +30,17 @@ pub const ToolTable = struct {
     /// ring under an internal mutex.
     notifier: ?*Notifier = null,
     attention_sound: ?[]const u8 = null,
+    /// Live config pointer, used by `clientMuted` for the per-client
+    /// mute lookup and by `renderActiveProfile` (indirectly through
+    /// session_manager) for profile rendering. Caller-owned; lifetime
+    /// matches the host process. Null in tests + linux-without-config
+    /// fallback paths.
+    config: ?*const Config = null,
+    /// Session manager pointer for `djinn_active_profile`. Same
+    /// ownership story as `config`. Null today on linux (no
+    /// SessionManager wired yet); `renderActiveProfile` returns
+    /// `{"name":null}` in that case.
+    session_manager: ?*SessionManager = null,
     /// Per-state banner gates. Pushed from `config.notifications.*`
     /// at startup and on hot-config-reload. Defaults match
     /// NotifyConfig so test ToolTables (constructed without a config)
@@ -61,7 +76,7 @@ pub const ToolTable = struct {
             const msg = stringArg(args, "message") orelse "agent needs attention";
             try self.state.setState(.attention, msg);
             try self.state.appendLogFrom(.warn, msg, client);
-            if (self.notify_on_attention and !clientMuted(client)) {
+            if (self.notify_on_attention and !clientMuted(self, client)) {
                 if (self.notifier) |n| {
                     if (n.sendKind(.attention, client, "djinn", msg)) {
                         n.playSound(self.attention_sound);
@@ -74,7 +89,7 @@ pub const ToolTable = struct {
         if (std.mem.eql(u8, name, "djinn_progress")) {
             const msg = stringArg(args, "message") orelse "working";
             try self.state.setState(.working, msg);
-            if (self.notify_on_progress and !clientMuted(client)) {
+            if (self.notify_on_progress and !clientMuted(self, client)) {
                 if (self.notifier) |n| _ = n.sendKind(.working, client, "djinn", msg);
             }
             return .{ .text = "ack" };
@@ -84,7 +99,7 @@ pub const ToolTable = struct {
             const msg = stringArg(args, "message") orelse "done";
             try self.state.setState(.done, msg);
             try self.state.appendLogFrom(.info, msg, client);
-            if (self.notify_on_done and !clientMuted(client)) {
+            if (self.notify_on_done and !clientMuted(self, client)) {
                 if (self.notifier) |n| _ = n.sendKind(.done, client, "djinn", msg);
             }
             return .{ .text = "ack" };
@@ -94,7 +109,7 @@ pub const ToolTable = struct {
             const msg = stringArg(args, "message") orelse "error";
             try self.state.setState(.@"error", msg);
             try self.state.appendLogFrom(.err, msg, client);
-            if (self.notify_on_error and !clientMuted(client)) {
+            if (self.notify_on_error and !clientMuted(self, client)) {
                 if (self.notifier) |n| _ = n.sendKind(.@"error", client, "djinn", msg);
             }
             return .{ .text = "ack" };
@@ -135,7 +150,7 @@ pub const ToolTable = struct {
         }
 
         if (std.mem.eql(u8, name, "djinn_active_profile")) {
-            const text = try renderActiveProfile(allocator);
+            const text = try renderActiveProfile(allocator, self.session_manager);
             return .{ .text = text };
         }
 
@@ -249,9 +264,11 @@ fn renderRecentAttentions(allocator: std.mem.Allocator, state: *AgentState) ![]c
 
 /// Build a JSON object describing the active profile:
 /// `{"name":"…","label":"…","cwd":"…"|null,"command":"…"}`. Pulls
-/// from `app.g.session_manager.active()`.
-fn renderActiveProfile(allocator: std.mem.Allocator) ![]const u8 {
-    const sm = app_state.g.session_manager orelse return try allocator.dupe(u8, "{\"name\":null}");
+/// from the SessionManager the host plugged into `ToolTable.session_manager`.
+/// Null on linux today — returns `{"name":null}` so the agent can
+/// detect "no active profile" without a separate sentinel.
+fn renderActiveProfile(allocator: std.mem.Allocator, sm_opt: ?*SessionManager) ![]const u8 {
+    const sm = sm_opt orelse return try allocator.dupe(u8, "{\"name\":null}");
     if (sm.sessions.items.len == 0) return try allocator.dupe(u8, "{\"name\":null}");
     const active = sm.active();
 

@@ -1,0 +1,43 @@
+Source: djinn
+Section: utils
+Priority: optional
+Maintainer: Paul Derscheid <paulderscheid@gmail.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ pkg-config,
+ libgtk-4-dev,
+ libgtk4-layer-shell-dev,
+ libvte-2.91-gtk4-dev,
+ libglib2.0-dev,
+Standards-Version: 4.6.0
+Homepage: https://github.com/derscheid/djinn
+Rules-Requires-Root: no
+
+# zig 0.15+ isn't in any Debian / Ubuntu release archive yet, so we
+# can't list it as a Build-Depends — the resolver would reject the
+# source. Builders need a zig binary on PATH before `dpkg-buildpackage`
+# runs (asdf, snap, or a manual download from ziglang.org). The
+# `debian/rules` invocation uses `$(ZIG)` so a custom path can be
+# threaded in with e.g. `DEB_BUILD_OPTIONS=… ZIG=/opt/zig/zig`.
+
+Package: djinn
+Architecture: any
+Depends:
+ ${shlibs:Depends},
+ ${misc:Depends},
+ libgtk-4-1,
+ libgtk4-layer-shell-0,
+ libvte-2.91-gtk4-0,
+ xdg-desktop-portal,
+Recommends:
+ xdg-desktop-portal-kde | xdg-desktop-portal-hyprland | xdg-desktop-portal-wlr,
+Suggests:
+ libnotify-bin,
+ socat,
+Description: Drop-down terminal panel + MCP agent surface (Wayland)
+ djinn is a Quake-style drop-down terminal that doubles as an
+ agent-host surface. The MCP server exposes notification + log tools
+ to Claude / Codex sessions running in the embedded shell.
+ GlobalShortcuts via xdg-desktop-portal; falls back to a Unix socket
+ bridge for compositors without a portal backend (KDE Plasma,
+ Hyprland, sway / wlroots-likes are the tested matrix).

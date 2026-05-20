@@ -11,6 +11,13 @@
 # `nix develop` so the flake's pinned zig_0_15 takes over.
 nix := if `command -v zig >/dev/null 2>&1 && printf '0.15.2\n%s\n' "$(zig version 2>/dev/null)" | sort -V -C 2>/dev/null && echo yes || echo no` == "yes" { "bash -c" } else { "nix develop --command bash -c" }
 
+# Arch-native zig: prefer the AUR `zig0.15` binary at /usr/bin/zig-0.15
+# (matches contrib/packaging/arch/PKGBUILD's makedepend), fall back to
+# the nix dev shell when AUR isn't installed. The plain `zig` binary
+# on Arch is the stock 0.16 package, which ghostty's `requireZig`
+# rejects with a @compileError — never use it directly.
+arch_zig := if `command -v zig-0.15 >/dev/null 2>&1 && echo yes || echo no` == "yes" { "zig-0.15" } else { "nix develop --command zig" }
+
 default:
     @just --list
 
@@ -41,6 +48,31 @@ sign:
 # Build + sign + rsync Djinn.app into ~/Applications.
 install-app:
     {{nix}} './scripts/build.sh install-app'
+
+# Arch (and Arch-likes): build ReleaseSafe + sudo-install the binary,
+# .desktop entry, and systemd user unit under /usr/local. Pacman does
+# not track these; for a tracked install use the PKGBUILD at
+# contrib/packaging/arch/ (slower — makepkg clones from GitHub).
+# Bypasses scripts/build.sh because its `PATH=/usr/bin:$PATH` prefix
+# is darwin-specific (Metal Toolchain discovery) and would shadow the
+# AUR zig0.15 with Arch's stock zig 0.16 on linux. The ghostty patch
+# is also darwin-only, so we skip it here.
+# After install, run `systemctl --user daemon-reload` to pick up the
+# user unit, and ensure `/usr/local/bin` is on $PATH.
+# Arch (and Arch-likes): build ReleaseSafe + sudo-install under /usr/local.
+install-arch:
+    {{arch_zig}} build -Doptimize=ReleaseSafe
+    sudo install -Dm755 zig-out/bin/djinn /usr/local/bin/djinn
+    sudo install -Dm644 contrib/packaging/djinn.desktop /usr/local/share/applications/djinn.desktop
+    sudo install -Dm644 contrib/packaging/djinn.service /usr/local/lib/systemd/user/djinn.service
+    @echo "djinn installed under /usr/local. Run 'systemctl --user daemon-reload' if you plan to enable the user unit."
+
+# Remove a system install made by `just install-arch`. Idempotent.
+uninstall-arch:
+    sudo rm -f /usr/local/bin/djinn
+    sudo rm -f /usr/local/share/applications/djinn.desktop
+    sudo rm -f /usr/local/lib/systemd/user/djinn.service
+    @echo "djinn removed from /usr/local."
 
 # Apply patches/ghostty-001-darwin-install.patch (idempotent).
 patch:

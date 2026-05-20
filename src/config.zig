@@ -15,6 +15,13 @@ pub const Config = struct {
     keymap: KeymapConfig = .{},
     profiles: ProfilesConfig = .{},
     clients: ClientsConfig = .{},
+    /// Owns every duped string + every ArrayList backing buffer this
+    /// Config produced. Heap-allocated so the Allocator vtable produced
+    /// by `.allocator()` stays valid across moves of the Config value
+    /// (return-by-value, assignment into another struct slot, etc.).
+    /// Null on default-constructed `Config{}` — `deinit` is a no-op in
+    /// that case, so callers can defer-deinit unconditionally.
+    arena: ?*std.heap.ArenaAllocator = null,
 
     pub const WindowConfig = struct {
         /// Optional so the runtime can tell "user set this explicitly"
@@ -41,6 +48,11 @@ pub const Config = struct {
         /// e.g. user invokes Raycast/Spotlight. Off by default because users
         /// who toggle frequently typically want the popup to stay put.
         hide_on_blur: bool = false,
+        /// Linux-only: when true, Escape hides the panel (Raycast/Spotlight
+        /// muscle memory). Off by default because intercepting Esc breaks
+        /// every TUI that uses it (vim insert-mode exit, less quit, htop
+        /// quit, …). Users who don't run TUIs in djinn can opt in.
+        hide_on_escape: bool = false,
 
         pub const Position = enum {
             top_left,
@@ -272,16 +284,26 @@ pub const Config = struct {
 
     /// Parse config in ghostty's `key = value` format. Comments start with
     /// `#` at column 0 (inline `#` is reserved for hex colors). Unknown
-    /// keys log a warning and continue. String values are duped with the
-    /// allocator; lifetime is the parsed Config's lifetime.
-    pub fn parse(allocator: std.mem.Allocator, contents: []const u8) !Config {
+    /// keys log a warning and continue. All duped strings and ArrayList
+    /// backing buffers are owned by an internal arena; call `deinit` to
+    /// release them as a single transaction.
+    pub fn parse(parent: std.mem.Allocator, contents: []const u8) !Config {
+        const arena = try parent.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(parent);
+        errdefer {
+            arena.deinit();
+            parent.destroy(arena);
+        }
+        const alloc = arena.allocator();
+
         var config = Config{};
-        var keymap_list = std.ArrayList(KeymapEntry){};
-        defer keymap_list.deinit(allocator);
-        var profile_list = std.ArrayList(ProfileEntry){};
-        defer profile_list.deinit(allocator);
-        var client_list = std.ArrayList(ClientEntry){};
-        defer client_list.deinit(allocator);
+        // No `defer .deinit` on the ArrayLists: on success they end up
+        // `.empty` after toOwnedSlice (empty-slice free is a vtable
+        // no-op); on error the arena reclaims their backing storage in
+        // a single sweep.
+        var keymap_list: std.ArrayList(KeymapEntry) = .{};
+        var profile_list: std.ArrayList(ProfileEntry) = .{};
+        var client_list: std.ArrayList(ClientEntry) = .{};
 
         var lines = std.mem.splitScalar(u8, contents, '\n');
         var line_no: u32 = 0;
@@ -297,41 +319,30 @@ pub const Config = struct {
             const key = std.mem.trim(u8, line[0..eq_idx], " \t");
             const val = unquote(std.mem.trim(u8, line[eq_idx + 1 ..], " \t"));
 
-            applyKey(&config, &keymap_list, &profile_list, &client_list, allocator, key, val) catch |err| {
+            applyKey(&config, &keymap_list, &profile_list, &client_list, alloc, key, val) catch |err| {
                 std.debug.print("warning: config:{d}: '{s}' = '{s}' ({})\n", .{ line_no, key, val, err });
             };
         }
 
-        // toOwnedSlice can OOM. On failure, free the per-item duped
-        // strings so we don't leak them when we drop to an empty slice.
-        // The list itself is `defer .deinit`'d; this loop just covers
-        // the strings each entry holds.
-        config.keymap.entries = keymap_list.toOwnedSlice(allocator) catch blk: {
-            for (keymap_list.items) |e| {
-                allocator.free(e.name);
-                allocator.free(e.binding);
-            }
-            break :blk &.{};
-        };
-        config.profiles.entries = profile_list.toOwnedSlice(allocator) catch blk: {
-            for (profile_list.items) |e| {
-                allocator.free(e.name);
-                if (e.provider) |s| allocator.free(s);
-                if (e.command) |s| allocator.free(s);
-                if (e.cwd) |s| allocator.free(s);
-                if (e.title) |s| allocator.free(s);
-                if (e.script) |s| allocator.free(s);
-            }
-            break :blk &.{};
-        };
-        config.clients.entries = client_list.toOwnedSlice(allocator) catch blk: {
-            for (client_list.items) |e| {
-                allocator.free(e.id);
-                if (e.name) |s| allocator.free(s);
-            }
-            break :blk &.{};
-        };
+        config.keymap.entries = try keymap_list.toOwnedSlice(alloc);
+        config.profiles.entries = try profile_list.toOwnedSlice(alloc);
+        config.clients.entries = try client_list.toOwnedSlice(alloc);
+        config.arena = arena;
         return config;
+    }
+
+    /// Release every string and ArrayList buffer this Config allocated.
+    /// Safe to call on a default-constructed Config (no-op when
+    /// `arena == null`). After deinit the Config is no longer
+    /// usable — any slice that was reachable through the freed arena
+    /// is now dangling.
+    pub fn deinit(self: *Config) void {
+        if (self.arena) |a| {
+            const parent = a.child_allocator;
+            a.deinit();
+            parent.destroy(a);
+        }
+        self.arena = null;
     }
 
     fn applyKey(
@@ -396,6 +407,8 @@ pub const Config = struct {
             config.window.topmost = try parseBool(val);
         } else if (eq(key, "hide-on-blur")) {
             config.window.hide_on_blur = try parseBool(val);
+        } else if (eq(key, "hide-on-escape")) {
+            config.window.hide_on_escape = try parseBool(val);
         } else if (eq(key, "window-opacity")) {
             // Legacy. Prefer `opacity` (theme-level). Kept for back-compat.
             config.window.opacity = try std.fmt.parseFloat(f64, val);
@@ -684,7 +697,8 @@ fn dashToUnder(s: []const u8, buf: []u8) []const u8 {
 
 // Tests
 test "Config: parse defaults from empty input" {
-    const config = try Config.parse(std.testing.allocator, "");
+    var config = try Config.parse(std.testing.allocator, "");
+    defer config.deinit();
     try std.testing.expect(config.window.width == null);
     try std.testing.expect(config.window.height == null);
     try std.testing.expectEqualStrings("ctrl+space", config.hotkey.toggle);
@@ -698,52 +712,49 @@ test "Config: parse window settings" {
         \\window-opacity = 0.9
         \\window-font-size = 16
     ;
-    const config = try Config.parse(std.testing.allocator, src);
+    var config = try Config.parse(std.testing.allocator, src);
+    defer config.deinit();
     try std.testing.expectEqual(@as(u32, 1024), config.window.width.?);
     try std.testing.expectEqual(@as(u32, 600), config.window.height.?);
     try std.testing.expect(config.window.opacity < 0.91 and config.window.opacity > 0.89);
 }
 
 test "Config: parse provider" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     const src =
         \\provider = claude
         \\provider-command = /usr/local/bin/claude
     ;
-    const config = try Config.parse(arena.allocator(), src);
+    var config = try Config.parse(std.testing.allocator, src);
+    defer config.deinit();
     try std.testing.expectEqualStrings("claude", config.provider.name);
     try std.testing.expectEqualStrings("/usr/local/bin/claude", config.provider.command.?);
 }
 
 test "Config: parse hotkey" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const config = try Config.parse(arena.allocator(), "hotkey = cmd+grave\n");
+    var config = try Config.parse(std.testing.allocator, "hotkey = cmd+grave\n");
+    defer config.deinit();
     try std.testing.expectEqualStrings("cmd+grave", config.hotkey.toggle);
 }
 
 test "Config: comments + blank lines + unknown keys" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     const src =
         \\# comment
         \\
         \\hotkey = ctrl+space
         \\unknown-key = whatever
     ;
-    const config = try Config.parse(arena.allocator(), src);
+    var config = try Config.parse(std.testing.allocator, src);
+    defer config.deinit();
     try std.testing.expectEqualStrings("ctrl+space", config.hotkey.toggle);
 }
 
 test "Config: keybind syntax" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     const src =
         \\keybind = clear_scrollback=cmd+l
         \\keybind = copy=cmd+c
     ;
-    const config = try Config.parse(arena.allocator(), src);
+    var config = try Config.parse(std.testing.allocator, src);
+    defer config.deinit();
     try std.testing.expectEqual(@as(usize, 2), config.keymap.entries.len);
     try std.testing.expectEqualStrings("clear_scrollback", config.keymap.entries[0].name);
     try std.testing.expectEqualStrings("cmd+l", config.keymap.entries[0].binding);
@@ -772,14 +783,13 @@ test "Config: getProviderCommand explicit override" {
 }
 
 test "Config: parse bell settings" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     const src =
         \\bell-audible = false
         \\bell-visual = on
         \\bell-sound = Glass
     ;
-    const config = try Config.parse(arena.allocator(), src);
+    var config = try Config.parse(std.testing.allocator, src);
+    defer config.deinit();
     try std.testing.expect(!config.bell.audible);
     try std.testing.expect(config.bell.visual);
     try std.testing.expectEqualStrings("Glass", config.bell.sound.?);
@@ -790,7 +800,8 @@ test "Config: parse scrollback + system" {
         \\scrollback-size = 50000
         \\open-at-login = yes
     ;
-    const config = try Config.parse(std.testing.allocator, src);
+    var config = try Config.parse(std.testing.allocator, src);
+    defer config.deinit();
     try std.testing.expectEqual(@as(?u32, 50000), config.scrollback.size);
     try std.testing.expect(config.system.open_at_login);
 }
@@ -802,7 +813,8 @@ test "Config: parse log pane" {
         \\log-pane-width-min = 180
         \\log-pane-width-max = 420
     ;
-    const config = try Config.parse(std.testing.allocator, src);
+    var config = try Config.parse(std.testing.allocator, src);
+    defer config.deinit();
     try std.testing.expect(config.log_pane.enabled);
     try std.testing.expect(config.log_pane.width_fraction > 0.39 and config.log_pane.width_fraction < 0.41);
     try std.testing.expectEqual(@as(f64, 180), config.log_pane.width_min);
@@ -810,7 +822,8 @@ test "Config: parse log pane" {
 }
 
 test "Config: window-position dash → enum" {
-    const config = try Config.parse(std.testing.allocator, "window-position = top-left\n");
+    var config = try Config.parse(std.testing.allocator, "window-position = top-left\n");
+    defer config.deinit();
     try std.testing.expectEqual(Config.WindowConfig.Position.top_left, config.window.position);
     try std.testing.expectEqual(@as(?f64, null), config.window.position_x);
     try std.testing.expectEqual(@as(?f64, null), config.window.position_y);
@@ -819,18 +832,21 @@ test "Config: window-position dash → enum" {
 test "Config: window-position 9-grid arms" {
     inline for ([_][]const u8{ "bottom_right", "center_left", "center", "bottom-center" }) |name| {
         const src = "window-position = " ++ name ++ "\n";
-        _ = try Config.parse(std.testing.allocator, src);
+        var config = try Config.parse(std.testing.allocator, src);
+        config.deinit();
     }
 }
 
 test "Config: window-position X,Y coord pair" {
-    const config = try Config.parse(std.testing.allocator, "window-position = 100,250\n");
+    var config = try Config.parse(std.testing.allocator, "window-position = 100,250\n");
+    defer config.deinit();
     try std.testing.expectEqual(@as(?f64, 100), config.window.position_x);
     try std.testing.expectEqual(@as(?f64, 250), config.window.position_y);
 }
 
 test "Config: window-position-x / -y override" {
-    const config = try Config.parse(std.testing.allocator, "window-position-x = 50\nwindow-position-y = 75\n");
+    var config = try Config.parse(std.testing.allocator, "window-position-x = 50\nwindow-position-y = 75\n");
+    defer config.deinit();
     try std.testing.expectEqual(@as(?f64, 50), config.window.position_x);
     try std.testing.expectEqual(@as(?f64, 75), config.window.position_y);
 }
@@ -841,51 +857,48 @@ test "Config: window-position enum clears earlier manual coords" {
         \\window-position-y = 200
         \\window-position = top_left
     ;
-    const config = try Config.parse(std.testing.allocator, src);
+    var config = try Config.parse(std.testing.allocator, src);
+    defer config.deinit();
     try std.testing.expectEqual(Config.WindowConfig.Position.top_left, config.window.position);
     try std.testing.expectEqual(@as(?f64, null), config.window.position_x);
     try std.testing.expectEqual(@as(?f64, null), config.window.position_y);
 }
 
 test "Config: window-toggle-style enum" {
-    const config = try Config.parse(std.testing.allocator, "window-toggle-style = minimize\n");
+    var config = try Config.parse(std.testing.allocator, "window-toggle-style = minimize\n");
+    defer config.deinit();
     try std.testing.expectEqual(Config.WindowConfig.ToggleStyle.minimize, config.window.toggle_style);
 }
 
 test "Config: quoted string value" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const config = try Config.parse(arena.allocator(), "font-family = \"JetBrains Mono\"\n");
+    var config = try Config.parse(std.testing.allocator, "font-family = \"JetBrains Mono\"\n");
+    defer config.deinit();
     try std.testing.expectEqualStrings("JetBrains Mono", config.terminal.font_family.?);
 }
 
 test "Config: theme hex value preserved (inline # not a comment)" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     const src =
         \\background = #112233
         \\foreground = #aabbcc
     ;
-    const config = try Config.parse(arena.allocator(), src);
+    var config = try Config.parse(std.testing.allocator, src);
+    defer config.deinit();
     try std.testing.expectEqualStrings("#112233", config.theme.background.?);
     try std.testing.expectEqualStrings("#aabbcc", config.theme.foreground.?);
 }
 
 test "Config: malformed keybind warns but parse succeeds" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     const src =
         \\keybind = no_equals_here
         \\hotkey = ctrl+space
     ;
-    const config = try Config.parse(arena.allocator(), src);
+    var config = try Config.parse(std.testing.allocator, src);
+    defer config.deinit();
     try std.testing.expectEqual(@as(usize, 0), config.keymap.entries.len);
     try std.testing.expectEqualStrings("ctrl+space", config.hotkey.toggle);
 }
 
 test "Config: parse profile entries" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     const src =
         \\default-profile = main
         \\profile.main.provider = claude
@@ -894,7 +907,8 @@ test "Config: parse profile entries" {
         \\profile.codex.provider = codex
         \\profile.codex.command = /opt/bin/codex
     ;
-    const config = try Config.parse(arena.allocator(), src);
+    var config = try Config.parse(std.testing.allocator, src);
+    defer config.deinit();
     try std.testing.expectEqualStrings("main", config.profiles.default.?);
     try std.testing.expectEqual(@as(usize, 2), config.profiles.entries.len);
     try std.testing.expectEqualStrings("main", config.profiles.entries[0].name);
@@ -906,25 +920,23 @@ test "Config: parse profile entries" {
 }
 
 test "Config: malformed profile key warns + skips" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     const src =
         \\profile.no_field = whatever
         \\profile..provider = bogus
         \\profile.good.provider = claude
     ;
-    const config = try Config.parse(arena.allocator(), src);
+    var config = try Config.parse(std.testing.allocator, src);
+    defer config.deinit();
     try std.testing.expectEqual(@as(usize, 1), config.profiles.entries.len);
     try std.testing.expectEqualStrings("good", config.profiles.entries[0].name);
 }
 
 test "Config: profile.script parses + survives roundtrip" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     const src =
         \\profile.main.script = ~/.config/djinn/profiles/main.sh
     ;
-    const config = try Config.parse(arena.allocator(), src);
+    var config = try Config.parse(std.testing.allocator, src);
+    defer config.deinit();
     try std.testing.expectEqual(@as(usize, 1), config.profiles.entries.len);
     try std.testing.expectEqualStrings(
         "~/.config/djinn/profiles/main.sh",
@@ -933,13 +945,12 @@ test "Config: profile.script parses + survives roundtrip" {
 }
 
 test "Config: unknown profile field warns + skips" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     const src =
         \\profile.main.provider = claude
         \\profile.main.bogus_field = nope
     ;
-    const config = try Config.parse(arena.allocator(), src);
+    var config = try Config.parse(std.testing.allocator, src);
+    defer config.deinit();
     // The "bogus_field" warning fires but the provider field stuck.
     try std.testing.expectEqual(@as(usize, 1), config.profiles.entries.len);
     try std.testing.expectEqualStrings("claude", config.profiles.entries[0].provider.?);
@@ -958,14 +969,13 @@ test "Config: parseBool variants" {
 }
 
 test "Config: parse client entries + findClient" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
     const src =
         \\client.abc123.name = review-bot
         \\client.abc123.mute = true
         \\client.deadbe.name = main
     ;
-    const config = try Config.parse(arena.allocator(), src);
+    var config = try Config.parse(std.testing.allocator, src);
+    defer config.deinit();
     try std.testing.expectEqual(@as(usize, 2), config.clients.entries.len);
     const c1 = config.findClient("abc123") orelse return error.MissingClient;
     try std.testing.expectEqualStrings("review-bot", c1.name.?);
@@ -973,4 +983,41 @@ test "Config: parse client entries + findClient" {
     const c2 = config.findClient("deadbe") orelse return error.MissingClient;
     try std.testing.expect(!c2.mute);
     try std.testing.expectEqual(@as(?Config.ClientEntry, null), config.findClient("nope"));
+}
+
+test "Config: default Config{} deinit is a no-op" {
+    var config = Config{};
+    config.deinit();
+    config.deinit(); // idempotent
+    try std.testing.expectEqual(@as(?*std.heap.ArenaAllocator, null), config.arena);
+}
+
+test "Config: parse + deinit round-trip on every duped field" {
+    const src =
+        \\hotkey = ctrl+grave
+        \\provider = claude
+        \\provider-command = /opt/bin/claude
+        \\mcp-socket-path = /tmp/test.sock
+        \\font-family = "JetBrains Mono"
+        \\attention-sound = Glass
+        \\bell-sound = Tink
+        \\background = #112233
+        \\foreground = #aabbcc
+        \\cursor-color = #ff00ff
+        \\default-profile = main
+        \\profile.main.provider = claude
+        \\profile.main.command = /opt/bin/claude
+        \\profile.main.cwd = ~/repo
+        \\profile.main.title = Main
+        \\profile.main.script = ~/.config/djinn/profiles/main.sh
+        \\profile.main.bell-sound = Glass
+        \\client.abc123.name = review-bot
+        \\keybind = copy=cmd+c
+        \\keybind = paste=cmd+v
+    ;
+    var config = try Config.parse(std.testing.allocator, src);
+    config.deinit();
+    // testing.allocator reports leaks at test exit; success here
+    // means every duped string + every ArrayList buffer rode the
+    // arena to free.
 }

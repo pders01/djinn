@@ -25,6 +25,10 @@ permissions:
 
 jobs:
   publish:
+    # Darwin half runs first; it deletes the prior pre-release tag and
+    # uploads the macOS bundle. `build-linux` `needs: publish` so the
+    # linux tarball lands on the recreated release without racing the
+    # delete step.
     runs-on: macos-15
     timeout-minutes: 45
 
@@ -132,3 +136,70 @@ jobs:
             zig-out/Djinn-pre-release-${{ runner.arch }}.zip
             zig-out/Djinn-pre-release-${{ runner.arch }}.zip.sha256
             zig-out/install.sh
+
+  build-linux:
+    # Linux tarball published into the same `pre-release` GH release the
+    # darwin half rebuilds on every push to main. Sequenced AFTER
+    # `publish` so the delete-and-recreate dance in that job can't race
+    # the linux upload — softprops/action-gh-release UPSERTs against an
+    # existing release, which is exactly what we want here.
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install GTK / VTE dev headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev \
+            libgtk4-layer-shell-dev \
+            libvte-2.91-gtk4-dev \
+            libglib2.0-dev \
+            pkg-config
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Cache zig packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build + stage tarball
+        run: |
+          OUT="djinn-pre-release-x86_64-linux"
+          zig build install -Doptimize=ReleaseSafe --prefix "${OUT}"
+          cp LICENSE NOTICES.md README.md "${OUT}/"
+          tar -czf "${OUT}.tar.gz" "${OUT}"
+          # coreutils on Linux ships `sha256sum`; BSD's `shasum -a 256`
+          # is what the macOS half uses. Keep them split rather than
+          # depending on `shasum` everywhere (Arch's coreutils doesn't
+          # bundle it).
+          sha256sum "${OUT}.tar.gz" > "${OUT}.tar.gz.sha256"
+          mkdir -p zig-out
+          mv "${OUT}.tar.gz" "${OUT}.tar.gz.sha256" zig-out/
+
+      - name: Smoke binary
+        run: ./djinn-pre-release-x86_64-linux/bin/djinn --version
+
+      - name: Upload linux tarball to pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: pre-release
+          name: pre-release (rolling)
+          prerelease: true
+          make_latest: false
+          # Don't overwrite the body the darwin half wrote — leaving
+          # `body` unset on an existing release preserves it.
+          files: |
+            zig-out/djinn-pre-release-x86_64-linux.tar.gz
+            zig-out/djinn-pre-release-x86_64-linux.tar.gz.sha256

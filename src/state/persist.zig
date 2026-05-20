@@ -161,8 +161,20 @@ fn writeEscaped(w: anytype, s: []const u8) !void {
 
 /// Debounced per-profile save. Callers fire on every resize tick; the
 /// first call schedules a single disk write 300ms later that flushes
-/// the latest pending value. `profile_name` may be null to update only
-/// the global top-level dims (legacy single-profile setups).
+/// the latest pending value. Subsequent calls within the 300ms window
+/// (and during the disk write that follows) are coalesced into the
+/// same worker — at most one in-flight thread, newer saves supersede
+/// older ones by overwriting the pending slot. `profile_name` may be
+/// null to update only the global top-level dims (legacy
+/// single-profile setups).
+///
+/// Worker lifetime: the spawned `std.Thread` handle lives in
+/// `g_thread` and is joined by `joinPendingSave` on shutdown — the
+/// previous design detached, which let a mid-sleep worker outlive
+/// the GeneralPurposeAllocator's `deinit` and dereference freed
+/// allocator state. `joinPendingSave` flips `g_shutdown` so the
+/// worker exits its next loop and gates further `saveDebounced`
+/// calls into no-ops.
 var g_mutex: std.Thread.Mutex = .{};
 var g_pending_width: u32 = 0;
 var g_pending_height: u32 = 0;
@@ -170,10 +182,28 @@ var g_pending_profile_buf: [128]u8 = undefined;
 var g_pending_profile_len: usize = 0;
 var g_pending_has_profile: bool = false;
 var g_pending_dirty: bool = false;
-var g_thread_running: bool = false;
+/// In-flight worker handle. Set on spawn, cleared by the next spawn
+/// (after joining the previous, stale handle) or by `joinPendingSave`.
+/// Non-null does NOT imply the worker is currently executing —
+/// `g_worker_alive` is the live flag.
+var g_thread: ?std.Thread = null;
+/// True while a worker is inside its loop. The worker clears it
+/// under the mutex before returning, so `saveDebounced` reading it
+/// false is a guarantee the thread is no longer touching the
+/// allocator (safe to `join()` while holding the mutex).
+var g_worker_alive: bool = false;
+/// Set by `joinPendingSave`. Worker observes on its next wake from
+/// sleep and exits without writing. `saveDebounced` becomes a no-op
+/// so late GLib firings after shutdown don't spawn a thread the
+/// join has already passed.
+var g_shutdown: bool = false;
 
 pub fn saveDebounced(allocator: std.mem.Allocator, width: u32, height: u32, profile_name: ?[]const u8) void {
     g_mutex.lock();
+    defer g_mutex.unlock();
+
+    if (g_shutdown) return;
+
     g_pending_width = width;
     g_pending_height = height;
     g_pending_has_profile = false;
@@ -185,37 +215,65 @@ pub fn saveDebounced(allocator: std.mem.Allocator, width: u32, height: u32, prof
         g_pending_has_profile = true;
     }
     g_pending_dirty = true;
-    const need_spawn = !g_thread_running;
-    if (need_spawn) g_thread_running = true;
+
+    // Existing worker re-checks `g_pending_dirty` after every sleep
+    // and picks up the new values without a fresh spawn.
+    if (g_worker_alive) return;
+
+    // Reap the previous worker's handle before spawning a replacement.
+    // `g_worker_alive` is false, so the thread has already returned;
+    // `join()` just collects the exit status and does not contend on
+    // the mutex we hold.
+    if (g_thread) |old| old.join();
+    g_thread = null;
+
+    const t = std.Thread.spawn(.{}, debounceWorker, .{allocator}) catch return;
+    g_thread = t;
+    g_worker_alive = true;
+}
+
+/// Wait for any in-flight debounce worker to finish and stop
+/// accepting new saves. Call before destroying the allocator the
+/// worker holds — a mid-sleep worker that survives `gpa.deinit()`
+/// dereferences freed state on its next `load`/`save` call.
+/// Idempotent; after the first call `saveDebounced` is a no-op.
+pub fn joinPendingSave() void {
+    g_mutex.lock();
+    g_shutdown = true;
+    const t = g_thread;
+    g_thread = null;
     g_mutex.unlock();
 
-    if (need_spawn) {
-        const t = std.Thread.spawn(.{}, debounceWorker, .{allocator}) catch {
-            g_mutex.lock();
-            g_thread_running = false;
-            g_mutex.unlock();
-            return;
-        };
-        t.detach();
-    }
+    if (t) |handle| handle.join();
 }
 
 fn debounceWorker(allocator: std.mem.Allocator) void {
-    std.Thread.sleep(300 * std.time.ns_per_ms);
-    g_mutex.lock();
-    const w = g_pending_width;
-    const h = g_pending_height;
-    const has_p = g_pending_has_profile;
-    var profile_buf: [128]u8 = undefined;
-    var profile_len: usize = 0;
-    if (has_p) {
-        profile_len = g_pending_profile_len;
-        @memcpy(profile_buf[0..profile_len], g_pending_profile_buf[0..profile_len]);
-    }
-    g_pending_dirty = false;
-    g_thread_running = false;
-    g_mutex.unlock();
+    while (true) {
+        std.Thread.sleep(300 * std.time.ns_per_ms);
 
+        g_mutex.lock();
+        if (g_shutdown or !g_pending_dirty) {
+            g_worker_alive = false;
+            g_mutex.unlock();
+            return;
+        }
+        const w = g_pending_width;
+        const h = g_pending_height;
+        const has_p = g_pending_has_profile;
+        var profile_buf: [128]u8 = undefined;
+        var profile_len: usize = 0;
+        if (has_p) {
+            profile_len = g_pending_profile_len;
+            @memcpy(profile_buf[0..profile_len], g_pending_profile_buf[0..profile_len]);
+        }
+        g_pending_dirty = false;
+        g_mutex.unlock();
+
+        flushOnce(allocator, w, h, has_p, profile_buf[0..profile_len]);
+    }
+}
+
+fn flushOnce(allocator: std.mem.Allocator, w: u32, h: u32, has_profile: bool, name: []const u8) void {
     // Merge with what's on disk so the per-profile map persists across
     // saves that target a different profile.
     var existing = load(allocator);
@@ -227,8 +285,7 @@ fn debounceWorker(allocator: std.mem.Allocator) void {
         merged.appendSlice(allocator, e.profiles) catch {};
     }
 
-    if (has_p) {
-        const name = profile_buf[0..profile_len];
+    if (has_profile) {
         var found = false;
         for (merged.items) |*p| {
             if (std.mem.eql(u8, p.name, name)) {
@@ -239,13 +296,9 @@ fn debounceWorker(allocator: std.mem.Allocator) void {
             }
         }
         if (!found) {
-            // Dupe the name for the duration of this save call.
             const owned = allocator.dupe(u8, name) catch return;
-            merged.append(allocator, .{ .name = owned, .width = w, .height = h }) catch {
-                allocator.free(owned);
-                return;
-            };
             defer allocator.free(owned);
+            merged.append(allocator, .{ .name = owned, .width = w, .height = h }) catch return;
             save(allocator, w, h, merged.items);
             return;
         }

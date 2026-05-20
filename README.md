@@ -1,15 +1,17 @@
 # djinn
 
-Quake-drop terminal for macOS, with an MCP-driven agent status surface.
+Quake-drop terminal for macOS and Linux/Wayland, with an MCP-driven agent status surface.
 
 Two products in one binary:
 
-- A native macOS Quake-drop popup terminal (NSPanel + libghostty + CoreText, with selection, blur, live resize, and a side log).
-- An HTTP MCP server that lets AI coding agents push structured status to the menubar — so you know the agent's state without keeping the terminal focused.
+- A native Quake-drop popup terminal — NSPanel + libghostty + CoreText on macOS; GTK4 + gtk4-layer-shell + VTE on Wayland (KDE Plasma, Hyprland, sway, wlroots-likes; plain undecorated toplevel fallback on GNOME).
+- An HTTP MCP server that lets AI coding agents push structured status to the menubar / system tray — so you know the agent's state without keeping the terminal focused.
 
 ## Status
 
-djinn is a libghostty-surface host. ghostty owns the visible
+The sections below cover the macOS build. **Linux users: jump to [Linux (Wayland)](#linux-wayland)** for the parallel install path, feature list, and troubleshooting.
+
+djinn is a libghostty-surface host on macOS. ghostty owns the visible
 terminal area end-to-end (PTY, render, scrollback, selection,
 hyperlink hover, search, IME). djinn keeps panel chrome, MCP
 server, agent state surface, hotkey, menubar, log pane, drag-drop,
@@ -184,6 +186,103 @@ open ~/Applications/Djinn.app                                    # re-launch
 ```
 
 After the next launch following a TCC reset, macOS prompts for Accessibility — grant it, re-launch, the hotkey is live.
+
+## Linux (Wayland)
+
+djinn runs on Wayland with the same chrome and MCP surface as the macOS build. Tested on KDE Plasma 6 (CachyOS / Arch), expected to work on Hyprland, sway, and any wlroots-based compositor; falls back to a plain undecorated toplevel on GNOME (no layer-shell protocol).
+
+The Linux build embeds VTE instead of libghostty — ghostty's embeddable surface C API is darwin/iOS-only. Most everything else is shared: same MCP server, same agent state, same config file shape. ghostty's `~/.config/ghostty/config` is honored for font / palette / theme inheritance.
+
+Working today: layer-shell Quake-drop panel · VTE terminal with the user shell · live theme + window-size reload · xdg-desktop-portal global hotkey · StatusNotifierItem tray with state-driven icon · `org.freedesktop.Notifications` desktop notifications · XDG `.desktop` autostart · drag-drop files + images into the terminal · 11-action keymap (font zoom, clear scrollback, copy/paste, open settings, copy MCP endpoint, log-pane toggle, hide-on-Escape opt-in) · MCP HTTP server · Unix-socket IPC bridge for compositor-driven hotkeys · log pane with attention chip + free-text filter + client-grouped headers.
+
+Not yet wired (darwin has these): multi-profile + tab strip + command palette + cheatsheet + in-terminal find overlay. The single-profile drop-down is fully usable today.
+
+### Install
+
+**Arch / Arch-likes** — via the AUR PKGBUILD (pacman-tracked, recommended):
+
+```sh
+# From the cloned repo:
+cd contrib/packaging/arch
+makepkg -si
+```
+
+Requires `zig0.15` from the AUR (Arch's stock `zig` is 0.16, which ghostty rejects). The PKGBUILD pulls latest `main` from GitHub.
+
+**Quick install for development** — via `justfile` (no pacman tracking):
+
+```sh
+just install-arch
+```
+
+Builds ReleaseSafe and sudo-installs the binary + `.desktop` entry + systemd user unit under `/usr/local`. Use `just uninstall-arch` to remove.
+
+**Build from source manually**:
+
+```sh
+# Runtime + dev deps on Ubuntu / Debian:
+sudo apt install libgtk-4-dev libgtk4-layer-shell-dev libvte-2.91-gtk4-dev libglib2.0-dev pkg-config
+# Or on Arch (runtime libs are runtime-only — dev headers ship with them):
+sudo pacman -S gtk4 gtk4-layer-shell vte4 glib2 pkgconf
+
+# Build with zig 0.15.2 (AUR: zig0.15 → /usr/bin/zig-0.15, Nix: nix develop)
+zig build -Doptimize=ReleaseSafe        # zig-out/bin/djinn
+zig build test                          # unit suite
+```
+
+The Nix flake's dev shell pins zig 0.15.2 if your distro doesn't have it: `nix develop --command zig build -Doptimize=ReleaseSafe`.
+
+**Pre-built tarball** (rolling pre-release from main):
+
+```sh
+curl -fsSLO https://github.com/pders01/djinn/releases/download/pre-release/djinn-pre-release-x86_64-linux.tar.gz
+tar -xzf djinn-pre-release-x86_64-linux.tar.gz
+sudo cp -r djinn-pre-release-x86_64-linux/* /usr/local/
+```
+
+### First launch
+
+```sh
+djinn   # opens the panel; layer-shell anchors to top of screen on KDE/Hyprland/sway/wlroots, plain toplevel on GNOME
+```
+
+**Global hotkey** is auto-registered through `xdg-desktop-portal.GlobalShortcuts`. On KDE the first launch pops a confirmation dialog — accept it and the binding is persisted. Then **bind a key to the registered action** in `System Settings → Shortcuts → djinn → toggle` (the portal accepts the registration but KDE doesn't auto-assign a key — this trip-up has confused a first-time user).
+
+If your compositor doesn't ship a portal backend that implements `GlobalShortcuts` (bare wlroots, some sway setups), bind your compositor's native hotkey to the IPC socket:
+
+```sh
+# Hyprland: ~/.config/hypr/hyprland.conf
+bind = ALT, space, exec, printf toggle | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/djinn.sock
+
+# sway: ~/.config/sway/config
+bindsym Mod1+space exec printf toggle | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/djinn.sock
+
+# KDE Custom Shortcut: System Settings → Shortcuts → Custom → Edit → New → Global → Command/URL
+sh -c 'printf toggle | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/djinn.sock'
+```
+
+The socket accepts `toggle` / `show` / `hide` / `quit`. Mode is `0600` (owner-only) so multi-user systems stay private.
+
+### Systemd user unit
+
+`djinn.service` is installed alongside the binary (`/usr/local/lib/systemd/user/` for `just install-arch`, `/usr/lib/systemd/user/` for the PKGBUILD path). Opt in:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now djinn.service
+```
+
+KDE / GNOME tie this into `graphical-session.target` automatically. Hyprland / sway need a session manager (`uwsm`, `niri-session`) to drive that target, or `systemctl --user start graphical-session.target` manually.
+
+### Troubleshooting
+
+- **Tray icon doesn't appear** — your compositor has no SNI host running (bare wlroots without a panel). plasmashell / waybar / xfce4-panel host the watcher. djinn re-registers automatically when one starts mid-session.
+- **Panel renders opaque even with `theme.opacity = 0.9`** — grep stderr for `Gtk-WARNING`. GTK 4.20+ drops CSS rules on parse error, and the symptoms look exactly like a compositor transparency bug. One grep beats an afternoon of red herrings.
+- **Hotkey "registration confirmed" but pressing it does nothing on KDE** — portal registration is separate from the System Settings → Shortcuts binding step. See "First launch" above.
+- **VTE renders each character double-wide** — Pango substituted a non-monospace font for your configured `font_family`. Check stderr for the warning djinn logs when this happens, and pick a font that's actually installed.
+- **Build fails with `requireZig` error** — your `zig` is 0.16 (Arch stock). Install `zig0.15` from the AUR (provides `/usr/bin/zig-0.15`), or use `nix develop`.
+
+`src/platform/linux/TODO.md` carries the deep-dive notes on every subsystem and a backlog of known issues + priorities. Read it before filing a bug — it might already be tracked.
 
 ## Wiring an agent
 

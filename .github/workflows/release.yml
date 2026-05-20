@@ -100,3 +100,85 @@ jobs:
           files: |
             zig-out/Djinn-${{ steps.tag.outputs.name }}-${{ runner.arch }}.zip
             zig-out/Djinn-${{ steps.tag.outputs.name }}-${{ runner.arch }}.zip.sha256
+
+  build-linux:
+    # Linux tarball — x86_64 today; aarch64 is a follow-up (the
+    # `ubuntu-24.04-arm` runners exist but the second arch doubles the
+    # cache + queue cost for an alpha audience that's overwhelmingly
+    # amd64). Runs in parallel with build-bundle and publishes to the
+    # same tag via softprops/action-gh-release's UPSERT semantics.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "name=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Install GTK / VTE dev headers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev \
+            libgtk4-layer-shell-dev \
+            libvte-2.91-gtk4-dev \
+            libglib2.0-dev \
+            pkg-config
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Cache zig packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/zig
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('build.zig.zon') }}
+          restore-keys: |
+            zig-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Build + stage tarball
+        # Stage into a top-level `djinn-<tag>-x86_64-linux/` directory
+        # so users extracting the tarball get a single named dir
+        # instead of files spilling into $PWD. `zig build install
+        # --prefix DIR` produces DIR/bin, DIR/share, DIR/lib —
+        # standard tarball layout out of the box.
+        run: |
+          TAG="${{ steps.tag.outputs.name }}"
+          OUT="djinn-${TAG}-x86_64-linux"
+          zig build install -Doptimize=ReleaseSafe --prefix "${OUT}"
+          cp LICENSE NOTICES.md README.md "${OUT}/"
+          tar -czf "${OUT}.tar.gz" "${OUT}"
+          # `sha256sum` is coreutils — always present on Linux. macOS
+          # builds use `shasum -a 256` because BSD coreutils doesn't
+          # ship `sha256sum`.
+          sha256sum "${OUT}.tar.gz" > "${OUT}.tar.gz.sha256"
+          mkdir -p zig-out
+          mv "${OUT}.tar.gz" "${OUT}.tar.gz.sha256" zig-out/
+
+      - name: Smoke binary
+        run: ./djinn-${{ steps.tag.outputs.name }}-x86_64-linux/bin/djinn --version
+
+      - name: Publish release
+        # softprops/action-gh-release@v2 UPSERTs the release for this
+        # tag, so build-bundle and build-linux can both target the
+        # same tag without coordination. `prerelease` flips the same
+        # way as build-bundle so dash-suffixed tags stay marked.
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}
+          name: ${{ steps.tag.outputs.name }}
+          prerelease: ${{ contains(steps.tag.outputs.name, '-') }}
+          generate_release_notes: true
+          files: |
+            zig-out/djinn-${{ steps.tag.outputs.name }}-x86_64-linux.tar.gz
+            zig-out/djinn-${{ steps.tag.outputs.name }}-x86_64-linux.tar.gz.sha256

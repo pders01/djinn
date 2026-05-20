@@ -1,0 +1,121 @@
+# Maintainer: Paul Derscheid <paulderscheid@gmail.com>
+#
+# This is the -git AUR variant — tracks the upstream main branch.
+# `sha256sums=('SKIP')` is the conventional + correct choice for a
+# git source (the commit hash is itself the integrity check via
+# git's object model). When a stable release is cut and a tagged
+# tarball is published to GitHub, a sibling release PKGBUILD will
+# live alongside this one with `source=("...tar.gz")` + a real
+# sha256sum.
+_pkgname=djinn
+pkgname=djinn-git
+pkgver=0.1.0_alpha.1.r0.0000000
+pkgrel=1
+pkgdesc="Drop-down terminal panel + MCP agent surface (Wayland) — git/main"
+arch=('x86_64' 'aarch64')
+url="https://github.com/derscheid/djinn"
+license=('MIT')
+
+# `provides` + `conflicts` against the future release package name
+# so a user who installs the stable variant later cleanly replaces
+# this one (and vice versa). Without these, pacman would let both
+# packages coexist and the second-installed binary silently
+# overwrites the first.
+provides=("$_pkgname")
+conflicts=("$_pkgname")
+
+# Runtime deps. gtk4-layer-shell is what makes Quake-drop work on
+# wlroots-likes (KDE / Hyprland / sway); on GNOME the binary falls
+# back to a plain toplevel. xdg-desktop-portal is needed for the
+# GlobalShortcuts hotkey path AND the Settings color-scheme probe
+# that drives ghostty light/dark theme switching.
+depends=(
+  'gtk4'
+  'gtk4-layer-shell'
+  'vte4'
+  'glib2'
+  'pango'
+  'cairo'
+  'harfbuzz'
+  'xdg-desktop-portal'
+)
+
+# A portal backend is required for the hotkey path. Each compositor
+# ships its own; we recommend rather than require because the IPC
+# socket bridge (printf toggle | socat …) keeps djinn useful even
+# without a backend installed.
+optdepends=(
+  'xdg-desktop-portal-kde: GlobalShortcuts on KDE Plasma'
+  'xdg-desktop-portal-hyprland: GlobalShortcuts on Hyprland'
+  'xdg-desktop-portal-wlr: GlobalShortcuts on sway / wlroots-likes'
+  'libnotify: org.freedesktop.Notifications client (for agent banners)'
+  'socat: bind the IPC socket to a compositor hotkey'
+)
+
+# Pinned to zig 0.15.x via the AUR `zig0.15` / `zig0.15-bin` packages
+# (both install `/usr/bin/zig-0.15`; the `-bin` variant `provides=zig0.15`
+# so this single name covers either install). Cannot use the official
+# `zig` package — Arch ships 0.16 there, and ghostty's `requireZig` in
+# its build.zig explicitly rejects anything outside 0.15.2 with a
+# @compileError. Several transitive deps (uucode, zig_objc) also hit
+# zig 0.16 std-lib API breakages independent of ghostty.
+makedepends=(
+  'zig0.15'
+  'pkgconf'
+  'git'
+)
+
+source=("$_pkgname::git+${url}.git")
+sha256sums=('SKIP')
+
+# Derive pkgver from git describe. Output shape:
+#   - tagged commit:   <tag>.r<commit-count>.<short-sha>
+#   - untagged:        r<commit-count>.<short-sha>
+# Underscores replace dashes so the pacman version comparator
+# handles ordering correctly (`-` is reserved as the pkgrel
+# separator).
+pkgver() {
+  cd "$_pkgname"
+  ( git describe --long --tags 2>/dev/null \
+      | sed 's/\([^-]*-g\)/r\1/;s/-/./g' ) \
+    || printf "r%s.%s" \
+         "$(git rev-list --count HEAD)" \
+         "$(git rev-parse --short HEAD)"
+}
+
+prepare() {
+  cd "$_pkgname"
+  # Pre-fetch zig deps so the build phase doesn't need network access.
+  # `zig build --fetch` is idempotent + non-destructive.
+  zig-0.15 build --fetch
+  # Apply the ghostty-darwin install patch. Cross-platform safe; the
+  # script is a no-op on linux but the build expects it to have run.
+  ./scripts/apply-ghostty-patch.sh
+}
+
+build() {
+  cd "$_pkgname"
+  # ReleaseSafe over ReleaseFast: terminal hosts get more value from
+  # the bounds checks staying live than from the few-percent runtime
+  # gain. Match the upstream default for distro builds.
+  #
+  # No --prefix here: `zig build` (default `install` step) would
+  # otherwise try to write into /usr as the build user, which fails
+  # AccessDenied under makepkg's fakeroot-less build phase. Default
+  # prefix `zig-out/` keeps the binary + .desktop in the source dir;
+  # package() then re-runs install with --prefix=$pkgdir/usr, which
+  # re-uses the build cache and just copies files.
+  zig-0.15 build -Doptimize=ReleaseSafe
+}
+
+package() {
+  cd "$_pkgname"
+  # zig's install step honors --prefix; DESTDIR-style relocation
+  # happens via --prefix-exe-dir / --prefix-lib-dir / etc., but the
+  # simpler path for makepkg is install the tree into pkgdir directly.
+  zig-0.15 build install -Doptimize=ReleaseSafe --prefix "$pkgdir/usr"
+
+  # License + readme (zig install doesn't pick these up).
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$_pkgname/LICENSE"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$_pkgname/README.md"
+}

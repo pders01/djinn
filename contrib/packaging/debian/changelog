@@ -1,0 +1,20 @@
+djinn (0.1.0~alpha.1-1) UNRELEASED; urgency=medium
+
+  * Initial Debian packaging skeleton — not yet uploaded to any
+    archive. Lives under contrib/packaging/debian/ so the repo root
+    stays clean for the darwin mainline.
+  * Source format is 3.0 (quilt); the -1 Debian revision in the
+    version string is incompatible with native (which dpkg-source
+    rejects outright). Quilt expects an upstream orig tarball
+    alongside the source tree. Packager workflow:
+        # from a release-tagged checkout:
+        git archive --format=tar.gz \
+          --prefix=djinn-0.1.0~alpha.1/ HEAD \
+          > ../djinn_0.1.0~alpha.1.orig.tar.gz
+        # then in an extracted copy of that tarball:
+        cp -r contrib/packaging/debian ./debian
+        dpkg-buildpackage -us -uc
+    `debian/patches/` is omitted (no Debian-side patches today); the
+    quilt format treats its absence as "no patches to apply".
+
+ -- Paul Derscheid <paulderscheid@gmail.com>  Sat, 16 May 2026 20:30:00 +0200

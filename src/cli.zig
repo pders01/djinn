@@ -5,7 +5,15 @@
 //! text never drifts from actual flag handling.
 
 const std = @import("std");
-const loginitem = @import("system/loginitem.zig");
+const builtin = @import("builtin");
+
+// `system/loginitem.zig` imports the darwin-only `objc` module (built
+// only on darwin per build.zig). Gating the import keeps this file
+// compilable on linux; the three login-item flag entries below drop
+// out of the table on non-darwin, so `--help` reflects the actual
+// platform surface and `--login-item-*` isn't recognized.
+const is_darwin = builtin.os.tag == .macos;
+const loginitem = if (is_darwin) @import("system/loginitem.zig") else struct {};
 
 pub const Args = struct {
     keybinding_override: ?[]const u8 = null,
@@ -30,7 +38,7 @@ const Flag = struct {
     handler: Handler,
 };
 
-const flags = [_]Flag{
+const common_flags = [_]Flag{
     .{
         .name = "--hotkey",
         .arg_label = "<binding>",
@@ -53,6 +61,35 @@ const flags = [_]Flag{
             }
         }.h,
     },
+    .{
+        .name = "--version",
+        .help = "Print version and exit",
+        .handler = struct {
+            fn h(_: *Ctx) ParseResult {
+                std.debug.print("djinn {s}\n", .{@import("version.zig").string});
+                return .exit_ok;
+            }
+        }.h,
+    },
+    .{
+        .name = "--help",
+        .help = "Show this help",
+        .handler = struct {
+            fn h(_: *Ctx) ParseResult {
+                printHelp();
+                return .exit_ok;
+            }
+        }.h,
+    },
+};
+
+// Login-item management lives on darwin only — linux uses
+// `system.open_at_login` in the config file (drives autostart.zig
+// to write / remove `~/.config/autostart/djinn.desktop`). These
+// three flags drop out of the table on non-darwin so they don't
+// appear in `--help` and `--login-item-enable` returns "unknown
+// flag" rather than a runtime "darwin only" error.
+const darwin_flags = [_]Flag{
     .{
         .name = "--login-item-enable",
         .help = "Register Djinn.app to launch at login",
@@ -96,27 +133,10 @@ const flags = [_]Flag{
             }
         }.h,
     },
-    .{
-        .name = "--version",
-        .help = "Print version and exit",
-        .handler = struct {
-            fn h(_: *Ctx) ParseResult {
-                std.debug.print("djinn {s}\n", .{@import("version.zig").string});
-                return .exit_ok;
-            }
-        }.h,
-    },
-    .{
-        .name = "--help",
-        .help = "Show this help",
-        .handler = struct {
-            fn h(_: *Ctx) ParseResult {
-                printHelp();
-                return .exit_ok;
-            }
-        }.h,
-    },
 };
+
+const flags: [if (is_darwin) common_flags.len + darwin_flags.len else common_flags.len]Flag =
+    if (is_darwin) common_flags ++ darwin_flags else common_flags;
 
 pub fn parse(args_iter: *std.process.ArgIterator, parsed: *Args) ParseResult {
     var ctx = Ctx{ .args = args_iter, .parsed = parsed };
