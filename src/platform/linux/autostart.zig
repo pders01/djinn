@@ -87,13 +87,35 @@ pub fn register(allocator: std.mem.Allocator) !void {
     const body = std.fmt.bufPrint(&body_buf, desktop_template, .{exec_path}) catch
         return Error.OperationFailed;
 
-    const file = std.fs.createFileAbsolute(path, .{ .truncate = true }) catch |err| {
-        std.debug.print("autostart: create({s}) failed: {}\n", .{ path, err });
+    // Atomic write: stage to `<path>.tmp`, then rename over `<path>`.
+    // Crash between createFile and writeAll on the prior shape left
+    // a zero-byte / partial djinn.desktop, which the user's DE
+    // would then parse as a malformed entry and silently skip — and
+    // the next launch's status() call sees the file and reports
+    // "enabled" anyway. The .tmp + rename gives the directory only
+    // ever the old-or-new state, never a torn intermediate.
+    const tmp_path = std.fmt.allocPrint(allocator, "{s}.tmp", .{path}) catch
         return Error.OperationFailed;
-    };
-    defer file.close();
-    file.writeAll(body) catch |err| {
-        std.debug.print("autostart: write failed: {}\n", .{err});
+    defer allocator.free(tmp_path);
+
+    {
+        const file = std.fs.createFileAbsolute(tmp_path, .{ .truncate = true }) catch |err| {
+            std.debug.print("autostart: create({s}) failed: {}\n", .{ tmp_path, err });
+            return Error.OperationFailed;
+        };
+        defer file.close();
+        file.writeAll(body) catch |err| {
+            std.debug.print("autostart: write failed: {}\n", .{err});
+            // Clean up the partial .tmp so we don't leave debris on
+            // the next register attempt's rename target.
+            std.fs.deleteFileAbsolute(tmp_path) catch {};
+            return Error.OperationFailed;
+        };
+    }
+
+    std.fs.renameAbsolute(tmp_path, path) catch |err| {
+        std.debug.print("autostart: rename({s} → {s}) failed: {}\n", .{ tmp_path, path, err });
+        std.fs.deleteFileAbsolute(tmp_path) catch {};
         return Error.OperationFailed;
     };
 }
@@ -148,11 +170,44 @@ fn desktopPath(allocator: std.mem.Allocator) ![]u8 {
 
 /// Read `/proc/self/exe`'s symlink target. Allocator owns the
 /// returned slice. Bounded at 4096 bytes — PATH_MAX on linux.
+///
+/// Linux appends ` (deleted)` to the link target when the underlying
+/// inode has been unlinked while the process is still running —
+/// happens routinely on a package update mid-session (pacman / apt
+/// replace the binary by unlink + create). The annotation is part
+/// of the readlink output, not just `/proc/self/status` — it would
+/// land in the .desktop's `Exec=` and the autostart entry would
+/// silently fail at the next login.
 fn resolveExePath(allocator: std.mem.Allocator) ![]u8 {
     var buf: [4096]u8 = undefined;
     const link_target = std.posix.readlink("/proc/self/exe", &buf) catch
         return Error.OperationFailed;
-    return allocator.dupe(u8, link_target);
+    const cleaned = stripDeletedAnnotation(link_target);
+    return allocator.dupe(u8, cleaned);
+}
+
+/// Trim the trailing ` (deleted)` annotation kernels append when the
+/// exe inode has been unlinked since process start.
+fn stripDeletedAnnotation(target: []const u8) []const u8 {
+    const tail = " (deleted)";
+    if (std.mem.endsWith(u8, target, tail)) {
+        return target[0 .. target.len - tail.len];
+    }
+    return target;
+}
+
+test "stripDeletedAnnotation: trailing annotation removed" {
+    try std.testing.expectEqualStrings(
+        "/usr/bin/djinn",
+        stripDeletedAnnotation("/usr/bin/djinn (deleted)"),
+    );
+}
+
+test "stripDeletedAnnotation: clean path untouched" {
+    try std.testing.expectEqualStrings(
+        "/usr/local/bin/djinn",
+        stripDeletedAnnotation("/usr/local/bin/djinn"),
+    );
 }
 
 /// `.desktop` content. `{s}` is the absolute binary path.

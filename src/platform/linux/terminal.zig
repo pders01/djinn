@@ -28,18 +28,9 @@ const VteTerminal = gtk.VteTerminal;
 const GCancellable = gtk.GCancellable;
 const gpointer = gtk.gpointer;
 
-// g_signal_connect_data is the macro-free entry point, same pattern
-// the rest of the linux platform modules use.
-const GClosureNotify = ?*const fn (data: gpointer, closure: ?*anyopaque) callconv(.c) void;
-extern "c" fn g_signal_connect_data(
-    instance: *anyopaque,
-    detailed_signal: [*:0]const u8,
-    c_handler: *const anyopaque,
-    data: gpointer,
-    destroy_data: GClosureNotify,
-    connect_flags: c_int,
-) c_ulong;
-extern "c" fn g_signal_handler_disconnect(instance: *anyopaque, handler_id: c_ulong) void;
+// Shared GLib signal externs live in gtk.zig now.
+const g_signal_connect_data = gtk.g_signal_connect_data;
+const g_signal_handler_disconnect = gtk.g_signal_handler_disconnect;
 
 /// Caller-supplied dispatch hook. Invoked on the GLib main thread when
 /// VTE emits `child-exited` — i.e. when the shell process the terminal

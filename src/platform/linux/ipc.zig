@@ -46,7 +46,7 @@ const G_IO_NVAL: GIOCondition = 32;
 const GUnixFDSourceFunc = *const fn (fd: c_int, condition: GIOCondition, user_data: gpointer) callconv(.c) c_int;
 
 extern "c" fn g_unix_fd_add(fd: c_int, condition: GIOCondition, function: GUnixFDSourceFunc, user_data: gpointer) c_uint;
-extern "c" fn g_source_remove(tag: c_uint) c_int;
+const g_source_remove = gtk.g_source_remove;
 
 /// Commands the IPC accepts. Anything else is ignored with a log line.
 pub const Command = enum {
@@ -85,12 +85,16 @@ pub const Ipc = struct {
         const path = try resolveSocketPath(allocator);
         errdefer allocator.free(path);
 
-        // Best-effort unlink of any stale socket. ENOENT is fine
-        // (clean start); any other error will surface on bind below
-        // with a clearer message.
+        // Best-effort unlink of any stale socket. ENOENT is the
+        // clean-start case and stays silent. Other errors — EACCES
+        // (someone else owns it), EISDIR (the path is a dir, user
+        // misconfigured XDG_RUNTIME_DIR), permission-denied parent
+        // — get a one-liner so the user knows why `bind` is about
+        // to fail with a less-informative `AddressInUse` /
+        // `AccessDenied`.
         std.posix.unlink(path) catch |err| switch (err) {
             error.FileNotFound => {},
-            else => {},
+            else => std.debug.print("ipc: unlink {s} failed: {} — bind may fail\n", .{ path, err }),
         };
 
         const fd = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0);
@@ -180,7 +184,18 @@ fn onListenReady(fd: c_int, condition: GIOCondition, user_data: gpointer) callco
 
     // Accept loop. The watch fires once per pending connection but
     // SOCK_NONBLOCK means we can drain backlogged connects in one go.
-    while (true) {
+    //
+    // Bounded by `max_iters` per dispatch — a same-UID client
+    // `connect()`-ing in a tight loop on the abstract socket would
+    // otherwise starve the GLib main loop (no panel updates, no
+    // hotkey, no tray polls). 32 lets a legitimate burst (a script
+    // firing 5–10 toggles in quick succession) drain in one tick;
+    // a malicious peer hitting the cap just gets serviced over
+    // multiple ticks at ~32 commands per ~ms — same throughput but
+    // GLib keeps breathing.
+    const max_iters: usize = 32;
+    var iters: usize = 0;
+    while (iters < max_iters) : (iters += 1) {
         const client_fd = std.posix.accept(fd, null, null, std.posix.SOCK.CLOEXEC) catch |err| switch (err) {
             error.WouldBlock => return 1,
             else => return 1,
@@ -188,12 +203,26 @@ fn onListenReady(fd: c_int, condition: GIOCondition, user_data: gpointer) callco
         defer std.posix.close(client_fd);
 
         var buf: [64]u8 = undefined;
-        const n = std.posix.read(client_fd, &buf) catch continue;
+        // EINTR is expected (signal during the syscall); other
+        // errors (EBADF after close, EFAULT on a bad buf, EIO)
+        // shouldn't recur but are worth logging — silent
+        // `catch continue` made all of them indistinguishable
+        // from a benign restart.
+        const n = std.posix.read(client_fd, &buf) catch |err| switch (err) {
+            error.Unexpected, error.WouldBlock => continue,
+            else => {
+                std.debug.print("ipc: read from client failed: {}\n", .{err});
+                continue;
+            },
+        };
         if (n == 0) continue;
 
         const cmd = parseCommand(buf[0..n]) orelse continue;
         ctx.handler.on_command(ctx.handler.ctx, cmd);
     }
+    // Hit the per-dispatch cap. The watch stays subscribed (return 1)
+    // so the next GLib tick services the remaining backlog.
+    return 1;
 }
 
 /// Pick the first whitespace-trimmed token off the message and map it

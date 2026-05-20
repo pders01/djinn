@@ -79,10 +79,19 @@
         # works the same whether invoked from the dev shell or from
         # `nix run`. Builds happen on the HOST (cwd = the user's
         # checkout), not in the nix store — Metal Toolchain access
-        # demands it.
+        # demands it. On linux the runner also exports
+        # LD_LIBRARY_PATH against linuxDeps so the freshly-built
+        # binary dlopens libgtk-4.so.1 + libgtk4-layer-shell.so.0 from
+        # the nix store (the dev shell sets the same export; without
+        # it `nix run .#` would link fine then fail at first dlopen
+        # because NixOS doesn't seed system libs into the default
+        # loader path).
         runner = name: step: pkgs.writeShellScriptBin name ''
           set -euo pipefail
           ${envFixups}
+          ${if isLinux then ''
+            export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath linuxDeps}''${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+          '' else ""}
           # Pre-fetch ghostty + apply the darwin install patch (idempotent).
           ${zig}/bin/zig build --fetch >/dev/null 2>&1 || true
           ./scripts/apply-ghostty-patch.sh
@@ -183,17 +192,23 @@
               zig_0_15
               pkg-config
               wrapGAppsHook4
-              glib
             ];
+            # glib is a runtime library (GLib main loop, GIO, GObject)
+            # that djinn dlopens via gtk4 + gdbus paths — it belongs in
+            # buildInputs alongside the rest of linuxDeps, not in
+            # nativeBuildInputs (which is for tools that run during the
+            # build itself).
             buildInputs = linuxDeps;
 
             __noChroot = true;
             dontPatchShebangs = true;
-            # wrapGAppsHook4 expects GApplication-style binaries and
-            # tries to inject `--gapplication-service` arg handling.
-            # djinn isn't a GApplication, so disable that wrap behavior
-            # while keeping the GTK env wrapping.
-            dontWrapGApps = false;
+            # wrapGAppsHook4 default behavior wraps $out/bin/djinn to
+            # seed XDG_DATA_DIRS, GSETTINGS_SCHEMA_DIR, and
+            # GDK_PIXBUF_MODULE_FILE from the nix store before the
+            # binary runs. djinn isn't a GApplication subclass but
+            # GTK itself still consults those envs at init for icon
+            # themes + gsettings backends, so the wrap stays on (no
+            # `dontWrapGApps = true;` here).
 
             buildPhase = ''
               runHook preBuild
@@ -202,7 +217,12 @@
               mkdir -p "$ZIG_GLOBAL_CACHE_DIR"
               zig build --fetch >/dev/null 2>&1 || true
               ./scripts/apply-ghostty-patch.sh
-              zig build -Doptimize=ReleaseSafe --prefix "$out"
+              # -Dsystem-install lands .desktop + systemd user unit +
+              # LICENSE + README under $out/share/. wrapGAppsHook4
+              # rewrites $out/bin/djinn at fixup so the wrapped binary
+              # picks up the GTK runtime env from the nix store.
+              zig build -Doptimize=ReleaseSafe -Dsystem-install=true \
+                --prefix "$out"
               runHook postBuild
             '';
 

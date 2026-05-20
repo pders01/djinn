@@ -77,14 +77,9 @@ const GtkBox = opaque {};
 const GtkButton = opaque {};
 const GtkSearchEntry = opaque {};
 const GtkEditable = opaque {};
-const GtkCssProvider = opaque {};
-const GdkDisplay = opaque {};
-const GObject = opaque {};
-
-// GClosureNotify + GConnectFlags signature for g_signal_connect_data;
-// see panel.zig:88 for the macro-free entry point rationale.
-const GClosureNotify = ?*const fn (data: gpointer, closure: ?*anyopaque) callconv(.c) void;
-const GConnectFlags = c_int;
+const GtkCssProvider = gtk.GtkCssProvider;
+const GdkDisplay = gtk.GdkDisplay;
+const GObject = gtk.GObject;
 
 // GtkPolicyType: GTK_POLICY_ALWAYS=0, AUTOMATIC=1, NEVER=2, EXTERNAL=3.
 const GTK_POLICY_AUTOMATIC: c_int = 1;
@@ -118,10 +113,10 @@ extern "c" fn gtk_label_set_wrap(label: *GtkLabel, wrap: gboolean) void;
 extern "c" fn gtk_label_set_selectable(label: *GtkLabel, selectable: gboolean) void;
 
 extern "c" fn gtk_widget_add_css_class(widget: *GtkWidget, css_class: [*:0]const u8) void;
-extern "c" fn gtk_widget_set_visible(widget: *GtkWidget, visible: gboolean) void;
-extern "c" fn gtk_widget_get_visible(widget: *GtkWidget) gboolean;
 extern "c" fn gtk_widget_set_size_request(widget: *GtkWidget, w: c_int, h: c_int) void;
 extern "c" fn gtk_widget_set_vexpand(widget: *GtkWidget, expand: gboolean) void;
+const gtk_widget_set_visible = gtk.gtk_widget_set_visible;
+const gtk_widget_get_visible = gtk.gtk_widget_get_visible;
 
 extern "c" fn gtk_paned_new(orientation: c_int) *GtkWidget;
 extern "c" fn gtk_paned_set_start_child(paned: *GtkPaned, child: *GtkWidget) void;
@@ -138,36 +133,17 @@ extern "c" fn gtk_search_entry_new() *GtkWidget;
 extern "c" fn gtk_editable_get_text(editable: *GtkEditable) [*:0]const u8;
 extern "c" fn gtk_editable_set_text(editable: *GtkEditable, text: [*:0]const u8) void;
 
-extern "c" fn g_signal_connect_data(
-    instance: *GObject,
-    detailed_signal: [*:0]const u8,
-    c_handler: *const anyopaque,
-    data: gpointer,
-    destroy_data: GClosureNotify,
-    connect_flags: GConnectFlags,
-) c_ulong;
-extern "c" fn g_signal_handler_disconnect(instance: *GObject, handler_id: c_ulong) void;
-
-extern "c" fn gtk_css_provider_new() *GtkCssProvider;
-extern "c" fn gtk_css_provider_load_from_string(provider: *GtkCssProvider, css: [*:0]const u8) void;
-extern "c" fn gtk_style_context_add_provider_for_display(
-    display: *GdkDisplay,
-    provider: *anyopaque,
-    priority: c_uint,
-) void;
-extern "c" fn gdk_display_get_default() ?*GdkDisplay;
-
-extern "c" fn g_timeout_add(
-    interval_ms: c_uint,
-    function: *const fn (user_data: gpointer) callconv(.c) c_int,
-    user_data: gpointer,
-) c_uint;
-extern "c" fn g_source_remove(tag: c_uint) gboolean;
-extern "c" fn g_object_unref(object: *GObject) void;
-extern "c" fn g_idle_add(
-    function: *const fn (user_data: gpointer) callconv(.c) c_int,
-    user_data: gpointer,
-) c_uint;
+// Shared GLib / GTK helpers — see gtk.zig for the canonical declarations.
+const g_signal_connect_data = gtk.g_signal_connect_data;
+const g_signal_handler_disconnect = gtk.g_signal_handler_disconnect;
+const g_timeout_add = gtk.g_timeout_add;
+const g_source_remove = gtk.g_source_remove;
+const g_idle_add = gtk.g_idle_add;
+const g_object_unref = gtk.g_object_unref;
+const gtk_css_provider_new = gtk.gtk_css_provider_new;
+const gtk_css_provider_load_from_string = gtk.gtk_css_provider_load_from_string;
+const gtk_style_context_add_provider_for_display = gtk.gtk_style_context_add_provider_for_display;
+const gdk_display_get_default = gtk.gdk_display_get_default;
 
 // ─── Public surface ──────────────────────────────────────────────────
 
@@ -878,41 +854,44 @@ fn pollTick(user_data: gpointer) callconv(.c) c_int {
     // a log append either).
     refreshAttentionChip(self, state);
 
-    // Phase 1: under the state mutex, decide what to do and copy out
-    // the bytes we need. We never hold the lock across GTK calls —
-    // every observed state mutator (MCP tools, agent transitions)
-    // takes the same mutex.
+    // Hold state.mutex across the snapshot AND the row builds — the
+    // entry slices we read (entry.message / entry.client) are owned
+    // by AgentState and only stable while the lock is held. The prior
+    // shape released the lock between snapshot and appendRange's
+    // re-lock; a concurrent `appendLog` eviction in that gap shifted
+    // the `[from..from+count]` window onto different entries than
+    // the snapshot intended (corrupt row text, dangling slices on
+    // the freed string). GTK calls happen under the lock, but the
+    // tick is bounded: pollTick fires every 250ms and the typical
+    // append is 0-few rows; MCP worker threads only block when both
+    // hit the mutex inside the same ~ms window.
+    state.mutex.lock();
+    defer state.mutex.unlock();
+
     var action: TickAction = .no_op;
     var append_from: usize = 0;
     var append_count: usize = 0;
-    var snapshot_count: usize = 0;
-    var snapshot_first_ts: i64 = 0;
+    const snapshot_count: usize = state.log.items.len;
+    const snapshot_first_ts: i64 = if (snapshot_count > 0)
+        state.log.items[0].timestamp_ms
+    else
+        0;
 
+    if (!self.initialized) {
+        action = if (snapshot_count == 0) .no_op else .rebuild;
+    } else if (snapshot_count == self.last_seen_count and
+        snapshot_first_ts == self.last_seen_first_ts)
     {
-        state.mutex.lock();
-        defer state.mutex.unlock();
-
-        snapshot_count = state.log.items.len;
-        if (snapshot_count > 0) {
-            snapshot_first_ts = state.log.items[0].timestamp_ms;
-        }
-
-        if (!self.initialized) {
-            action = if (snapshot_count == 0) .no_op else .rebuild;
-        } else if (snapshot_count == self.last_seen_count and
-            snapshot_first_ts == self.last_seen_first_ts)
-        {
-            action = .no_op;
-        } else if (snapshot_count > self.last_seen_count and
-            snapshot_first_ts == self.last_seen_first_ts)
-        {
-            action = .append;
-            append_from = self.last_seen_count;
-            append_count = snapshot_count - self.last_seen_count;
-        } else {
-            // Ring evicted (first_ts changed) or shrank somehow.
-            action = .rebuild;
-        }
+        action = .no_op;
+    } else if (snapshot_count > self.last_seen_count and
+        snapshot_first_ts == self.last_seen_first_ts)
+    {
+        action = .append;
+        append_from = self.last_seen_count;
+        append_count = snapshot_count - self.last_seen_count;
+    } else {
+        // Ring evicted (first_ts changed) or shrank somehow.
+        action = .rebuild;
     }
 
     if (action == .no_op) {
@@ -922,11 +901,7 @@ fn pollTick(user_data: gpointer) callconv(.c) c_int {
 
     if (action == .rebuild) {
         // Drop everything (real rows + placeholder) and walk the ring
-        // through the active filter. Re-locking inside appendRange is
-        // safe — appendLog is single-threaded against this poll on
-        // the main loop, and even a concurrent agent thread can only
-        // grow the ring between unlock and re-lock, which the next
-        // tick picks up as an append.
+        // through the active filter.
         gtk_list_box_remove_all(@ptrCast(self.list_box));
         self.placeholder = .none;
         self.rendered_count = 0;
@@ -936,14 +911,15 @@ fn pollTick(user_data: gpointer) callconv(.c) c_int {
         // client as before the evict would silently lose the header.
         self.last_client_known = false;
         self.last_client_len = 0;
-        appendRange(self, state, 0, snapshot_count) catch |err| {
+        appendRangeLocked(self, state, 0, snapshot_count) catch |err| {
             std.debug.print("log_pane: rebuild failed: {}\n", .{err});
         };
     } else {
-        // Append branch — appendRange lazy-clears the placeholder on
-        // first matching entry, so an all-filter-rejected tick leaves
-        // the "no matches" placeholder visible without churn.
-        appendRange(self, state, append_from, append_count) catch |err| {
+        // Append branch — appendRangeLocked lazy-clears the
+        // placeholder on the first matching entry, so an
+        // all-filter-rejected tick leaves the "no matches"
+        // placeholder visible without churn.
+        appendRangeLocked(self, state, append_from, append_count) catch |err| {
             std.debug.print("log_pane: append failed: {}\n", .{err});
         };
     }
@@ -972,18 +948,14 @@ const TickAction = enum { no_op, append, rebuild };
 
 /// Build a row for each of `state.log.items[from..from+count]` and
 /// append it to the list box, skipping entries the active filter
-/// rejects. Caller has already validated the range against a fresh
-/// snapshot; we re-lock here only because LogEntry fields are owned
-/// by AgentState and we need stable reads while we format the row
-/// text.
-fn appendRange(self: *LogPane, state: *AgentState, from: usize, count: usize) !void {
-    state.mutex.lock();
-    defer state.mutex.unlock();
-
-    // Range may have shifted under us if a concurrent appendLog
-    // landed between unlock and re-lock. Clamp so we don't read
-    // past the live length (we'll pick up missed entries next tick
-    // via the append branch).
+/// rejects. **Caller must hold `state.mutex`** — the entry slices
+/// we read (entry.message / entry.client) are owned by AgentState
+/// and only stable while the lock is held.
+fn appendRangeLocked(self: *LogPane, state: *AgentState, from: usize, count: usize) !void {
+    // Defensive clamp: callers compute count from a snapshot taken
+    // under the same mutex acquisition, so this should never trim,
+    // but a stale `from` arg (e.g. from a future refactor) would
+    // otherwise read past the slice's end.
     const end = @min(from + count, state.log.items.len);
     if (from >= end) return;
 
@@ -1090,13 +1062,18 @@ fn rebuildAll(self: *LogPane) void {
     self.placeholder = .none;
     self.rendered_count = 0;
 
+    // Hold state.mutex across the snapshot + the row builds. Same
+    // reason as pollTick: appendRangeLocked reads entry slices owned
+    // by AgentState and only stable under the lock. A concurrent
+    // appendLog eviction between snapshot and row-build would
+    // otherwise shift the window onto different entries.
     state.mutex.lock();
+    defer state.mutex.unlock();
     const len = state.log.items.len;
     const first_ts: i64 = if (len > 0) state.log.items[0].timestamp_ms else 0;
-    state.mutex.unlock();
 
     if (len > 0) {
-        appendRange(self, state, 0, len) catch |err| {
+        appendRangeLocked(self, state, 0, len) catch |err| {
             std.debug.print("log_pane: rebuild failed: {}\n", .{err});
         };
     }
@@ -1197,13 +1174,41 @@ fn buildHeaderRow(allocator: std.mem.Allocator, entry: LogEntry) !*GtkWidget {
 
 /// `HH:MM` in UTC. Buffer must be at least 5 bytes; the slice
 /// returned is the formatted prefix. `bufPrint` is infallible
-/// against a 16-byte caller buffer (max output is 5 bytes), so the
-/// `catch unreachable` is genuinely unreachable.
+/// against a 16-byte caller buffer (max output is 5 bytes), but a
+/// future caller could shrink the buffer below 5 bytes and trip
+/// `error.NoSpace`. Return an empty slice on overflow instead of
+/// `unreachable` so the header row degrades gracefully (the row
+/// loses its `HH:MM` suffix but the layout doesn't abort).
 fn formatHeaderTime(buf: []u8, timestamp_ms: i64) []const u8 {
     const seconds: i64 = @divFloor(timestamp_ms, 1000);
     const hr: u32 = @intCast(@mod(@divFloor(seconds, 3600), 24));
     const min: u32 = @intCast(@mod(@divFloor(seconds, 60), 60));
-    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ hr, min }) catch unreachable;
+    return std.fmt.bufPrint(buf, "{d:0>2}:{d:0>2}", .{ hr, min }) catch "";
+}
+
+/// Walk backward from `cap` to the start of the UTF-8 code point
+/// that `bytes[cap..]` would otherwise begin in the middle of. A
+/// continuation byte is `10xxxxxx`; ASCII and the first byte of a
+/// multi-byte sequence both clear that pattern, so the loop stops
+/// at the codepoint boundary nearest to (but not past) `cap`.
+/// Returns `cap` unchanged when it's at or past the end of `bytes`
+/// (caller is asking for "no truncation").
+fn utf8FloorBoundary(bytes: []const u8, cap: usize) usize {
+    if (cap >= bytes.len) return cap;
+    var i: usize = cap;
+    while (i > 0 and (bytes[i] & 0xC0) == 0x80) : (i -= 1) {}
+    return i;
+}
+
+test "utf8FloorBoundary: snaps back from mid-codepoint" {
+    // "é" = 0xC3 0xA9. Cap=1 lands on continuation byte; floor → 0.
+    try std.testing.expectEqual(@as(usize, 0), utf8FloorBoundary("é", 1));
+    // cap == bytes.len means caller doesn't want truncation; pass through.
+    try std.testing.expectEqual(@as(usize, 2), utf8FloorBoundary("é", 2));
+    // ASCII byte stays put.
+    try std.testing.expectEqual(@as(usize, 3), utf8FloorBoundary("abc", 3));
+    // Mid-sequence cap in a longer string: "éé" cap=3 → 2 (after first 'é').
+    try std.testing.expectEqual(@as(usize, 2), utf8FloorBoundary("éé", 3));
 }
 
 /// Read the pinned attention message and sync the chip's label +
@@ -1229,9 +1234,14 @@ fn refreshAttentionChip(self: *LogPane, state: *AgentState) void {
 
         // Prefix with ⚠ to match darwin's chip semantic. 256-byte
         // local buf + 4-byte prefix fits in 260; we cap text at
-        // 252 so the null sentinel slot is preserved.
+        // 252 so the null sentinel slot is preserved. Truncation
+        // snaps back to a UTF-8 code-point boundary so a split
+        // multi-byte sequence doesn't surface as a tofu glyph on
+        // the chip label (GTK renders invalid UTF-8 as `?` or U+FFFD
+        // depending on Pango's run).
         const max_text: usize = 252;
-        const clipped = @min(len, max_text);
+        var clipped: usize = @min(len, max_text);
+        if (clipped < len) clipped = utf8FloorBoundary(local_buf[0..len], clipped);
         var labeled: [260]u8 = undefined;
         const prefix = "\xE2\x9A\xA0  "; // U+26A0 WARNING SIGN + 2 spaces
         @memcpy(labeled[0..prefix.len], prefix);

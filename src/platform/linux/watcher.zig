@@ -17,12 +17,26 @@
 //! Watcher's lifetime. Each entry owns its GFile, GFileMonitor,
 //! basename slice, and a heap-allocated EntryContext that the GLib
 //! callback recovers from `user_data`. All entries share a single
-//! heap-allocated CoalesceState that owns the debounce timer and
-//! the user's Handler. `deinit` cancels each monitor, removes a
-//! pending timeout if any, then frees the boxes — no callbacks can
-//! fire after deinit because the GLib main loop will have already
-//! drained any pending sources (the panel exits its main loop
-//! before deinit chains run).
+//! heap-allocated CoalesceState that owns the debounce timer, the
+//! recurring inode-health timer, and the user's Handler. `deinit`
+//! cancels each monitor, removes pending timeouts if any, then frees
+//! the boxes — no callbacks can fire after deinit because the GLib
+//! main loop will have already drained any pending sources (the
+//! panel exits its main loop before deinit chains run).
+//!
+//! Inode-health recheck: same-filesystem `mv` keeps inodes intact,
+//! so a `mv ~/.config/djinn ~/.config/djinn.bak` round-trip leaves
+//! our inotify watch valid on the surviving inode. The breakage
+//! case is destroy-and-recreate — `rm -rf ~/.config/djinn; mkdir
+//! ~/.config/djinn` (or an editor that wipes the dir mid-write).
+//! A 5-second GLib timeout compares each entry's parent
+//! `st_ino` against the value cached at init / last rebuild; on
+//! mismatch the entry's GFile + GFileMonitor + signal subscription
+//! get rebuilt in place against the current path, the cached inode
+//! updates, and a coalesce fire triggers so the caller's
+//! `on_changed` re-reads through the new inode. Stat failure (path
+//! gone) is a no-op — the next tick retries once the parent is
+//! re-created.
 //!
 //! Handler design: caller-supplied `on_changed` is called once per
 //! debounce window across ALL watched files. GFileMonitor fires
@@ -87,32 +101,28 @@ extern "c" fn g_file_monitor_directory(
 extern "c" fn g_file_monitor_cancel(monitor: *GFileMonitor) c_int;
 extern "c" fn g_file_get_basename(file: *GFile) ?[*:0]u8;
 
-extern "c" fn g_free(mem: ?*anyopaque) void;
-extern "c" fn g_object_unref(object: *anyopaque) void;
 extern "c" fn g_error_free(err: *GError) void;
 
-// g_signal_connect is a macro; we call its underlying function
-// directly the same way panel.zig does.
-const GClosureNotify = ?*const fn (data: gpointer, closure: ?*anyopaque) callconv(.c) void;
-extern "c" fn g_signal_connect_data(
-    instance: *anyopaque,
-    detailed_signal: [*:0]const u8,
-    c_handler: *const anyopaque,
-    data: gpointer,
-    destroy_data: GClosureNotify,
-    connect_flags: c_int,
-) c_ulong;
-
-// Debounce-timer externs. `g_timeout_add` returns the source id;
-// the callback returns G_SOURCE_REMOVE (0) to make it one-shot.
+// Shared GLib helpers (g_signal_connect_data, g_source_remove,
+// g_timeout_add, g_object_unref, g_free) live in gtk.zig.
+//
+// Debounce semantics: `g_timeout_add` returns the source id; the
+// callback returns G_SOURCE_REMOVE (0) to make it one-shot.
 // `g_source_remove` is a no-op when the source has already fired
 // (returns FALSE in that case), which is the post-fire state we
 // rely on so deinit doesn't have to track "is the timer alive?"
 // beyond the timeout_id == 0 sentinel.
 const G_SOURCE_REMOVE: c_int = 0;
-const GSourceFunc = *const fn (user_data: gpointer) callconv(.c) c_int;
-extern "c" fn g_timeout_add(interval_ms: c_uint, function: GSourceFunc, user_data: gpointer) c_uint;
-extern "c" fn g_source_remove(tag: c_uint) c_int;
+/// Returned from a `GSourceFunc` to keep the source firing on its
+/// interval. Inverse of `G_SOURCE_REMOVE`. Used by `healthTick`,
+/// which is recurring rather than one-shot.
+const G_SOURCE_CONTINUE: c_int = 1;
+const GSourceFunc = gtk.GSourceFunc;
+const g_signal_connect_data = gtk.g_signal_connect_data;
+const g_timeout_add = gtk.g_timeout_add;
+const g_source_remove = gtk.g_source_remove;
+const g_object_unref = gtk.g_object_unref;
+const g_free = gtk.g_free;
 
 // ─── Public surface ──────────────────────────────────────────────────
 
@@ -131,6 +141,12 @@ pub const Handler = struct {
 /// ~10–30ms burst that atomic-rename editors produce on save while
 /// still feeling instant to a user editing config interactively.
 const debounce_ms: c_uint = 100;
+
+/// Recheck cadence for the parent-inode health probe. 5s is the
+/// upper bound on how long a `rm -rf ~/.config/djinn; mkdir
+/// ~/.config/djinn` flow can leave the watcher pointed at a freed
+/// inode. Cheap: one `fstatat` per entry per tick.
+const health_check_ms: c_uint = 5_000;
 
 pub const Watcher = struct {
     allocator: std.mem.Allocator,
@@ -155,7 +171,12 @@ pub const Watcher = struct {
     ) !Watcher {
         const coalesce = try allocator.create(CoalesceState);
         errdefer allocator.destroy(coalesce);
-        coalesce.* = .{ .handler = handler, .timeout_id = 0 };
+        coalesce.* = .{
+            .handler = handler,
+            .timeout_id = 0,
+            .entries = &.{},
+            .health_timer_id = 0,
+        };
 
         const entries = try allocator.alloc(Entry, files.len);
         errdefer allocator.free(entries);
@@ -172,15 +193,37 @@ pub const Watcher = struct {
             built += 1;
         }
 
+        // Wire the periodic inode-health probe last so the slice it
+        // sees is fully populated. g_timeout_add returns >0 on
+        // success and is effectively infallible (no IO); if it ever
+        // returns 0 we log and degrade gracefully — the watcher
+        // still works for the inode-stable case.
+        coalesce.entries = entries;
+        coalesce.health_timer_id = g_timeout_add(
+            health_check_ms,
+            CoalesceState.healthTick,
+            @ptrCast(coalesce),
+        );
+        if (coalesce.health_timer_id == 0) {
+            std.debug.print(
+                "watcher: g_timeout_add for health probe returned 0 — config-dir-vanish recovery disabled\n",
+                .{},
+            );
+        }
+
         return .{ .allocator = allocator, .entries = entries, .coalesce = coalesce };
     }
 
     pub fn deinit(self: *Watcher) void {
-        // Drop a pending debounce timer before tearing down the
-        // entries so its fire callback can't dispatch into a
-        // half-freed CoalesceState. `g_source_remove` is a no-op
-        // (returns FALSE) if the source already fired, so it's safe
-        // either way.
+        // Drop pending timers before tearing down the entries so
+        // their fire callbacks can't dispatch into a half-freed
+        // state. `g_source_remove` is a no-op (returns FALSE) if the
+        // source already fired or was never created (id == 0
+        // sentinel guards against that).
+        if (self.coalesce.health_timer_id != 0) {
+            _ = g_source_remove(self.coalesce.health_timer_id);
+            self.coalesce.health_timer_id = 0;
+        }
         if (self.coalesce.timeout_id != 0) {
             _ = g_source_remove(self.coalesce.timeout_id);
             self.coalesce.timeout_id = 0;
@@ -192,10 +235,12 @@ pub const Watcher = struct {
 };
 
 /// Shared state across all entries of a single Watcher. Owns the
-/// Handler the user supplied + the active `g_timeout_add` source
-/// id. Entries share one CoalesceState so saves that ripple across
-/// `djinn/config` and `ghostty/config` simultaneously coalesce into
-/// a single fire instead of two.
+/// Handler the user supplied, the debounce timer, the recurring
+/// inode-health timer, and a back-reference to the entries slice
+/// so the health tick can walk + rebuild without a separate
+/// Watcher pointer. Entries share one CoalesceState so saves that
+/// ripple across `djinn/config` and `ghostty/config` simultaneously
+/// coalesce into a single fire instead of two.
 const CoalesceState = struct {
     handler: Handler,
     /// Active debounce timer id, or 0 if none is scheduled. Set by
@@ -203,6 +248,13 @@ const CoalesceState = struct {
     /// and is removed via the G_SOURCE_REMOVE return) and by
     /// `Watcher.deinit` (after an explicit `g_source_remove`).
     timeout_id: c_uint,
+    /// Entries slice header; the underlying buffer is owned by
+    /// `Watcher`. `Watcher.deinit` cancels `health_timer_id` before
+    /// freeing entries, so this slice can never outlive its backing.
+    entries: []Watcher.Entry,
+    /// Recurring `health_check_ms` timer id, or 0 if scheduling
+    /// failed at init. Cleared by `Watcher.deinit`.
+    health_timer_id: c_uint,
 
     fn schedule(self: *CoalesceState) void {
         // Leading-edge debounce: the first event in a quiet window
@@ -219,6 +271,20 @@ const CoalesceState = struct {
         self.handler.on_changed(self.handler.ctx);
         return G_SOURCE_REMOVE;
     }
+
+    /// Recurring `health_check_ms` callback. Walks each entry,
+    /// checks whether the cached parent inode still matches the
+    /// path's current inode, and rebuilds the GFile +
+    /// GFileMonitor + signal subscription in place when it
+    /// doesn't. On successful rebuild also schedules a coalesce
+    /// fire so the caller's `on_changed` sees the post-recreate
+    /// state. Returning `G_SOURCE_CONTINUE` keeps the source
+    /// firing every `health_check_ms`.
+    fn healthTick(user_data: gpointer) callconv(.c) c_int {
+        const self: *CoalesceState = @ptrCast(@alignCast(user_data));
+        for (self.entries) |*e| recheckEntry(e);
+        return G_SOURCE_CONTINUE;
+    }
 };
 
 const EntryContext = struct {
@@ -228,10 +294,19 @@ const EntryContext = struct {
     /// `g_file_get_basename` (we span it to a slice, no terminator
     /// reliance).
     basename: [:0]u8,
-    /// Owned parent-dir path, kept for diagnostic logging only.
-    /// Convenient when a user runs `RUST_LOG=djinn=trace` -equivalent
-    /// debug printing and needs to know which dir fired.
+    /// Owned parent-dir path, kept for diagnostic logging AND for
+    /// the periodic inode-health probe to stat against. NUL-
+    /// terminated so we can hand it straight to `g_file_new_for_path`
+    /// on rebuild without re-duping.
     parent: [:0]u8,
+    /// Cached `st_ino` of `parent` as observed at the last
+    /// successful build / rebuild. Compared against fresh stat
+    /// results by `recheckEntry`; on mismatch the entry's monitor
+    /// gets torn down and rebuilt. 0 means "unknown" — when the
+    /// init-time stat failed, recheck never fires (since the
+    /// comparison would always say "differs" and lead to a futile
+    /// rebuild loop).
+    parent_ino: u64,
 };
 
 // ─── Entry build / teardown ──────────────────────────────────────────
@@ -280,6 +355,7 @@ fn buildEntry(
         .coalesce = coalesce,
         .basename = basename,
         .parent = parent,
+        .parent_ino = readParentInode(parent),
     };
 
     const signal_id = g_signal_connect_data(
@@ -304,6 +380,15 @@ fn buildEntry(
     };
 }
 
+/// `stat` the parent path and return its inode, or 0 if the call
+/// fails. 0 doubles as a "disable the recheck for this entry"
+/// sentinel — recheckEntry skips entries whose cached inode is 0
+/// because there's no stable baseline to compare against.
+fn readParentInode(parent: [:0]const u8) u64 {
+    const st = std.fs.cwd().statFile(parent) catch return 0;
+    return st.inode;
+}
+
 fn destroyEntry(allocator: std.mem.Allocator, entry: *Watcher.Entry) void {
     // Cancel before unref so an in-flight event can't dispatch into a
     // half-freed EntryContext. GLib serializes source dispatches on
@@ -316,6 +401,87 @@ fn destroyEntry(allocator: std.mem.Allocator, entry: *Watcher.Entry) void {
     allocator.free(entry.ctx.basename);
     allocator.free(entry.ctx.parent);
     allocator.destroy(entry.ctx);
+}
+
+// ─── Inode-health recheck (config-dir-vanish recovery) ───────────────
+
+/// Called on each `health_check_ms` tick for every entry. Stats the
+/// cached parent path; if the inode differs from the value we cached
+/// at init / last rebuild, the user has destroy-and-recreated the
+/// parent (`rm -rf ~/.config/djinn; mkdir ~/.config/djinn`, an editor
+/// that did the same, or a config-rotation script). Our existing
+/// inotify watch is pinned to the freed inode, so future writes to
+/// the new dir would never fire. Rebuild the GFile + GFileMonitor +
+/// signal subscription in place, then schedule a coalesce fire so
+/// the caller's `on_changed` re-reads through the new inode.
+fn recheckEntry(entry: *Watcher.Entry) void {
+    if (entry.ctx.parent_ino == 0) return; // init-time stat failed; no baseline
+    const st = std.fs.cwd().statFile(entry.ctx.parent) catch return;
+    if (st.inode == entry.ctx.parent_ino) return;
+
+    rebuildMonitor(entry) catch |err| {
+        std.debug.print(
+            "watcher: rebuild monitor for \"{s}\" failed: {s} — retry on next tick\n",
+            .{ entry.ctx.parent, @errorName(err) },
+        );
+        return;
+    };
+    entry.ctx.parent_ino = st.inode;
+    entry.ctx.coalesce.schedule();
+}
+
+/// Build a fresh GFile + GFileMonitor + signal subscription against
+/// the cached parent path and swap them onto `entry`, then tear down
+/// the predecessors. Built-then-swap (rather than swap-then-build)
+/// keeps the entry pointing at a live monitor for the entire path so
+/// a partial failure leaves the prior monitor running.
+fn rebuildMonitor(entry: *Watcher.Entry) !void {
+    const new_gfile = g_file_new_for_path(entry.ctx.parent.ptr);
+    errdefer g_object_unref(new_gfile);
+
+    var err: ?*GError = null;
+    const new_monitor = g_file_monitor_directory(
+        new_gfile,
+        G_FILE_MONITOR_WATCH_MOVES,
+        null,
+        &err,
+    ) orelse {
+        if (err) |e| {
+            const msg = if (e.message) |m| std.mem.span(m) else "(no message)";
+            std.debug.print(
+                "watcher: monitor directory \"{s}\" failed during rebuild: {s}\n",
+                .{ entry.ctx.parent, msg },
+            );
+            g_error_free(e);
+        }
+        return error.MonitorFailed;
+    };
+    errdefer {
+        _ = g_file_monitor_cancel(new_monitor);
+        g_object_unref(new_monitor);
+    }
+
+    const new_signal_id = g_signal_connect_data(
+        @ptrCast(new_monitor),
+        "changed",
+        @ptrCast(&onChanged),
+        @ptrCast(entry.ctx),
+        null,
+        0,
+    );
+    if (new_signal_id == 0) return error.SignalConnectFailed;
+
+    // Success — install the new triple, then tear down the old.
+    const old_monitor = entry.monitor;
+    const old_gfile = entry.gfile;
+
+    entry.gfile = new_gfile;
+    entry.monitor = new_monitor;
+    entry.signal_id = new_signal_id;
+
+    _ = g_file_monitor_cancel(old_monitor);
+    g_object_unref(old_monitor);
+    g_object_unref(old_gfile);
 }
 
 // ─── Signal callback ─────────────────────────────────────────────────
@@ -367,4 +533,48 @@ test "Watcher rejects malformed paths" {
     try std.testing.expectError(error.InvalidPath, Watcher.init(a, &.{"/config"}, handler));
     // Trailing slash — no basename.
     try std.testing.expectError(error.InvalidPath, Watcher.init(a, &.{"/etc/"}, handler));
+}
+
+test "readParentInode detects destroy-recreate inode swap" {
+    if (builtin.os.tag != .linux) return;
+    const a = std.testing.allocator;
+
+    // Stage a unique tmpdir for this test so concurrent runs don't
+    // collide on /tmp/djinn-watcher-test.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const sub_name = "djinn-watcher-recheck";
+    try tmp.dir.makeDir(sub_name);
+
+    const sub_path = try tmp.dir.realpathAlloc(a, sub_name);
+    defer a.free(sub_path);
+
+    const sub_path_z = try a.dupeZ(u8, sub_path);
+    defer a.free(sub_path_z);
+
+    const ino_before = readParentInode(sub_path_z);
+    try std.testing.expect(ino_before != 0);
+
+    // Same-FS rename keeps the inode invariant — this case must NOT
+    // trip the recheck (the existing monitor is still valid).
+    const renamed_name = "djinn-watcher-recheck.bak";
+    try tmp.dir.rename(sub_name, renamed_name);
+    try tmp.dir.rename(renamed_name, sub_name);
+    const ino_after_rename = readParentInode(sub_path_z);
+    try std.testing.expectEqual(ino_before, ino_after_rename);
+
+    // Destroy + recreate IS the scenario the recheck guards against
+    // — new inode under the same path.
+    try tmp.dir.deleteDir(sub_name);
+    try tmp.dir.makeDir(sub_name);
+    const ino_after_recreate = readParentInode(sub_path_z);
+    try std.testing.expect(ino_after_recreate != 0);
+    try std.testing.expect(ino_after_recreate != ino_before);
+
+    // Missing path returns 0 — the recheck treats this as "wait
+    // for parent to reappear" and skips this tick.
+    try tmp.dir.deleteDir(sub_name);
+    const ino_missing = readParentInode(sub_path_z);
+    try std.testing.expectEqual(@as(u64, 0), ino_missing);
 }

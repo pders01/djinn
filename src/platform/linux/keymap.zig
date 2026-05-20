@@ -46,18 +46,18 @@ const gpointer = gtk.gpointer;
 // GtkShortcutController API — public since GTK 4.0. Externs are
 // listed here rather than in gtk.zig so the dependency graph stays
 // localized: the rest of the linux platform doesn't reference these.
-const GtkEventController = opaque {};
+const GtkEventController = gtk.GtkEventController;
 const GtkShortcutController = opaque {};
 const GtkShortcut = opaque {};
 const GtkShortcutTrigger = opaque {};
 const GtkShortcutAction = opaque {};
 const GVariant = opaque {};
-const GdkDisplay = opaque {};
+const GdkDisplay = gtk.GdkDisplay;
 const GdkClipboard = opaque {};
 
 // Clipboard surface. `gdk_clipboard_set_text` copies the text
 // internally; the caller's buffer can be freed on return.
-extern "c" fn gdk_display_get_default() ?*GdkDisplay;
+const gdk_display_get_default = gtk.gdk_display_get_default;
 extern "c" fn gdk_display_get_clipboard(display: *GdkDisplay) ?*GdkClipboard;
 extern "c" fn gdk_clipboard_set_text(clipboard: *GdkClipboard, text: [*:0]const u8) void;
 
@@ -70,7 +70,7 @@ extern "c" fn gtk_shortcut_controller_new() *GtkEventController;
 extern "c" fn gtk_shortcut_controller_set_scope(controller: *GtkEventController, scope: c_int) void;
 extern "c" fn gtk_shortcut_controller_add_shortcut(controller: *GtkEventController, shortcut: *GtkShortcut) void;
 extern "c" fn gtk_event_controller_set_propagation_phase(controller: *GtkEventController, phase: c_int) void;
-extern "c" fn gtk_widget_add_controller(widget: *GtkWidget, controller: *GtkEventController) void;
+const gtk_widget_add_controller = gtk.gtk_widget_add_controller;
 
 extern "c" fn gtk_shortcut_trigger_parse_string(s: [*:0]const u8) ?*GtkShortcutTrigger;
 extern "c" fn gtk_callback_action_new(
@@ -309,12 +309,20 @@ fn onOpenSettings(ctx: *Context) void {
     // makePath is idempotent (EEXIST → success). createFile with
     // .exclusive omitted overwrites; we want create-if-missing-else-
     // leave-alone, so access first and only create on ENOENT.
-    std.fs.cwd().makePath(dir) catch {};
+    std.fs.cwd().makePath(dir) catch |err| {
+        // ENOSPC / EACCES used to vanish here, surfacing later as
+        // a confusing "could not create" with no hint that the
+        // parent directory was the actual problem.
+        std.debug.print(
+            "open_settings: makePath {s} failed: {} — config dir may be missing\n",
+            .{ dir, err },
+        );
+    };
     std.fs.accessAbsolute(path, .{}) catch {
-        if (std.fs.createFileAbsolute(path, .{})) |f| f.close() else |_| {
+        if (std.fs.createFileAbsolute(path, .{})) |f| f.close() else |err| {
             std.debug.print(
-                "open_settings: could not create {s} — aborting\n",
-                .{path},
+                "open_settings: could not create {s}: {} — aborting\n",
+                .{ path, err },
             );
             return;
         }
@@ -344,10 +352,27 @@ fn onOpenSettings(ctx: *Context) void {
     );
 }
 
+/// GLib's child-reaping watcher. Internally installs a SIGCHLD
+/// handler that calls `waitpid(pid, …, WNOHANG)` and dispatches the
+/// callback when the child exits — so we don't have to. Without
+/// this, every `trySpawnDetached` call (xdg-open, $EDITOR fallback)
+/// leaves a zombie attached to djinn until process exit. The
+/// callback is a no-op; the reap happens inside GLib regardless of
+/// what we do here.
+extern "c" fn g_child_watch_add(
+    pid: c_int,
+    function: *const fn (pid: c_int, status: c_int, user_data: ?*anyopaque) callconv(.c) void,
+    user_data: ?*anyopaque,
+) c_uint;
+
+fn onChildExited(_: c_int, _: c_int, _: ?*anyopaque) callconv(.c) void {}
+
 /// Spawn `argv` with stdio detached, don't wait. Returns true on
 /// successful exec, false on any error (typically NotFound when the
 /// requested binary isn't on $PATH). Logs the underlying error so
-/// debugging from a journal is straightforward.
+/// debugging from a journal is straightforward. The spawned child
+/// is registered with `g_child_watch_add` so its exit is reaped
+/// automatically — no zombie accumulation.
 fn trySpawnDetached(allocator: std.mem.Allocator, argv: []const []const u8) bool {
     var child = std.process.Child.init(argv, allocator);
     child.stdin_behavior = .Ignore;
@@ -360,6 +385,7 @@ fn trySpawnDetached(allocator: std.mem.Allocator, argv: []const []const u8) bool
         );
         return false;
     };
+    _ = g_child_watch_add(child.id, onChildExited, null);
     return true;
 }
 

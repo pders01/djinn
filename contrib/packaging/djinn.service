@@ -6,10 +6,24 @@ Documentation=https://github.com/derscheid/djinn
 # needs WAYLAND_DISPLAY / DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR
 # and the portal backends to exist before it can register the
 # GlobalShortcuts hotkey and StatusNotifierItem. `graphical-session`
-# is the cross-compositor target (KDE, GNOME, Hyprland, sway all
-# populate it via their respective session services).
+# is the cross-compositor target (KDE / GNOME / sway via plasma-
+# workspace.service / gnome-session-x11.target / sway-session.target
+# all populate it). Hyprland and bare sway/wlroots compositors that
+# don't run through `uwsm`, `niri-session`, or a similar session
+# manager need to `systemctl --user start graphical-session.target`
+# manually (or use `wantedBy=default.target` instead — see the
+# README "Linux (Wayland) → systemd user unit" section).
 After=graphical-session.target
 PartOf=graphical-session.target
+
+# Cap respawn at 5 restarts per 30s. The default Restart=on-failure
+# alone has no start-rate limit, so a panic loop (e.g. portal
+# permanently denying GlobalShortcuts, missing libgtk4-layer-shell)
+# would respawn every 2s indefinitely and flood the journal.
+# StartLimitBurst trips a transient failure state after the cap;
+# `systemctl --user reset-failed djinn` clears it.
+StartLimitBurst=5
+StartLimitIntervalSec=30s
 
 [Service]
 Type=simple
@@ -34,6 +48,33 @@ RestartSec=2s
 # closing the window, without escalating to SIGKILL.
 KillSignal=SIGTERM
 TimeoutStopSec=5s
+
+# Light sandboxing. Conservative settings only — djinn legitimately
+# needs $HOME (config + state), /tmp (dragdrop-staged image files),
+# /proc/self/exe (autostart Exec= resolve), $XDG_RUNTIME_DIR (IPC
+# socket), and the user D-Bus session, so the heavier directives
+# (ProtectHome, PrivateTmp, ProtectSystem=strict, ProtectProc) would
+# break it.
+#   - NoNewPrivileges: disables setuid / file-cap elevation paths.
+#   - ProtectKernelTunables / ProtectKernelModules / ProtectKernelLogs:
+#     no kernel write surface; djinn never touches sysfs / kallsyms.
+#   - ProtectControlGroups: no cgroupfs write.
+#   - LockPersonality: pins the personality bit; rules out non-x86_64
+#     ABI emulation tricks (cheap, no functional cost).
+#   - RestrictSUIDSGID: belt-and-braces with NoNewPrivileges.
+#   - RestrictRealtime: djinn doesn't need SCHED_FIFO / SCHED_RR.
+#   - MemoryDenyWriteExecute: no W^X mappings (Zig binaries don't
+#     JIT). Note: this would break embedded interpreters; revisit if
+#     a future plugin host loads them.
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+MemoryDenyWriteExecute=yes
 
 [Install]
 WantedBy=graphical-session.target

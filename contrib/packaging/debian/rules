@@ -30,15 +30,20 @@ override_dh_auto_configure:
 	./scripts/apply-ghostty-patch.sh
 
 override_dh_auto_build:
-	$(ZIG) build -Doptimize=ReleaseSafe
+	$(ZIG) build -Doptimize=ReleaseSafe -Dsystem-install=true
 
 override_dh_auto_install:
-	# Stage the install tree under debian/djinn/usr — dh_install picks
-	# it up from there. zig's install step handles both binary and
-	# .desktop placement via build.zig's b.installFile call, so we
-	# don't need a separate debian/install file.
-	$(ZIG) build install -Doptimize=ReleaseSafe \
-	    --prefix debian/djinn/usr
+	# Stage the install tree under debian/tmp/usr — dh_install then
+	# picks it up via debian/djinn.install. Routing through debian/tmp
+	# instead of hardcoding debian/djinn keeps the rules file
+	# agnostic about the binary package name, so a future split out
+	# of -doc / -dbgsym sub-packages doesn't need a rules edit.
+	# `-Dsystem-install=true` is what tells build.zig to drop
+	# .desktop / .service / LICENSE / README alongside the binary;
+	# without it dh_install would find only usr/bin/djinn and miss
+	# the rest.
+	$(ZIG) build install -Doptimize=ReleaseSafe -Dsystem-install=true \
+	    --prefix debian/tmp/usr
 
 override_dh_auto_test:
 	# zig build test runs the platform-agnostic suite. Skipped in the

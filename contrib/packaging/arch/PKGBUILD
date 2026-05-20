@@ -102,10 +102,10 @@ build() {
   # No --prefix here: `zig build` (default `install` step) would
   # otherwise try to write into /usr as the build user, which fails
   # AccessDenied under makepkg's fakeroot-less build phase. Default
-  # prefix `zig-out/` keeps the binary + .desktop in the source dir;
+  # prefix `zig-out/` keeps the binary + share tree in the source dir;
   # package() then re-runs install with --prefix=$pkgdir/usr, which
   # re-uses the build cache and just copies files.
-  zig-0.15 build -Doptimize=ReleaseSafe
+  zig-0.15 build -Doptimize=ReleaseSafe -Dsystem-install=true
 }
 
 package() {
@@ -113,9 +113,10 @@ package() {
   # zig's install step honors --prefix; DESTDIR-style relocation
   # happens via --prefix-exe-dir / --prefix-lib-dir / etc., but the
   # simpler path for makepkg is install the tree into pkgdir directly.
-  zig-0.15 build install -Doptimize=ReleaseSafe --prefix "$pkgdir/usr"
-
-  # License + readme (zig install doesn't pick these up).
-  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$_pkgname/LICENSE"
-  install -Dm644 README.md "$pkgdir/usr/share/doc/$_pkgname/README.md"
+  # `-Dsystem-install=true` is what makes the linux branch of
+  # build.zig drop .desktop / .service / LICENSE / README under
+  # share/ — without it pacman would track only the binary and the
+  # other artifacts would orphan on uninstall.
+  zig-0.15 build install -Doptimize=ReleaseSafe -Dsystem-install=true \
+    --prefix "$pkgdir/usr"
 }

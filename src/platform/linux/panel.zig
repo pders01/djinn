@@ -64,8 +64,8 @@ extern "c" fn gtk_window_set_child(window: *GtkWindow, child: ?*GtkWidget) void;
 extern "c" fn gtk_window_present(window: *GtkWindow) void;
 extern "c" fn gtk_window_destroy(window: *GtkWindow) void;
 extern "c" fn gtk_window_is_active(window: *GtkWindow) gboolean;
-extern "c" fn gtk_widget_get_visible(widget: *GtkWidget) gboolean;
-extern "c" fn gtk_widget_set_visible(widget: *GtkWidget, visible: gboolean) void;
+const gtk_widget_get_visible = gtk.gtk_widget_get_visible;
+const gtk_widget_set_visible = gtk.gtk_widget_set_visible;
 extern "c" fn gtk_widget_grab_focus(widget: *GtkWidget) gboolean;
 
 // GdkSurface opaque-region control. GTK4 computes an opaque region
@@ -85,32 +85,17 @@ extern "c" fn g_main_loop_run(loop: *GMainLoop) void;
 extern "c" fn g_main_loop_quit(loop: *GMainLoop) void;
 extern "c" fn g_main_loop_unref(loop: *GMainLoop) void;
 
-// GLib main-loop timer for the resize-poll. Mirrors the shape used by
-// log_pane.zig + tray.zig. Returning G_SOURCE_CONTINUE (1) keeps the
-// source alive across ticks; G_SOURCE_REMOVE (0) drops it.
+// GLib main-loop source return values. G_SOURCE_CONTINUE (1) keeps
+// the source alive across ticks; G_SOURCE_REMOVE (0) drops it.
+// `g_timeout_add`, `g_source_remove`, `g_signal_connect_data`,
+// `g_signal_handler_disconnect` all live in `gtk.zig` now — shared
+// across panel / terminal / log_pane / tray / watcher.
 const G_SOURCE_CONTINUE: c_int = 1;
 const G_SOURCE_REMOVE: c_int = 0;
-extern "c" fn g_timeout_add(
-    interval_ms: c_uint,
-    function: *const fn (user_data: gpointer) callconv(.c) c_int,
-    user_data: gpointer,
-) c_uint;
-extern "c" fn g_source_remove(tag: c_uint) gboolean;
-
-// g_signal_connect is a macro wrapping g_signal_connect_data. We call
-// the underlying function directly. last two args: destroy_data
-// (cleanup callback for `data`, nullable) + connect_flags (0 = after).
-const GClosureNotify = ?*const fn (data: gpointer, closure: ?*anyopaque) callconv(.c) void;
-const GConnectFlags = c_int;
-extern "c" fn g_signal_connect_data(
-    instance: *GObject,
-    detailed_signal: [*:0]const u8,
-    c_handler: *const anyopaque,
-    data: gpointer,
-    destroy_data: GClosureNotify,
-    connect_flags: GConnectFlags,
-) c_ulong;
-extern "c" fn g_signal_handler_disconnect(instance: *GObject, handler_id: c_ulong) void;
+const g_timeout_add = gtk.g_timeout_add;
+const g_source_remove = gtk.g_source_remove;
+const g_signal_connect_data = gtk.g_signal_connect_data;
+const g_signal_handler_disconnect = gtk.g_signal_handler_disconnect;
 
 // ─── gtk4-layer-shell extern surface ─────────────────────────────────
 //
@@ -217,14 +202,21 @@ pub const Panel = struct {
     last_polled_width: c_int = 0,
     last_polled_height: c_int = 0,
 
-    pub fn detect(allocator: std.mem.Allocator) Capabilities {
+    pub fn detect(allocator: std.mem.Allocator) !Capabilities {
         const gtk4 = canDlopen("libgtk-4.so.1");
         const layer_shell = canDlopen("libgtk4-layer-shell.so.0");
 
         const wayland = std.posix.getenv("WAYLAND_DISPLAY") != null;
 
         const desktop_src = std.posix.getenv("XDG_CURRENT_DESKTOP") orelse "";
-        const desktop = allocator.dupe(u8, desktop_src) catch "";
+        // OOM here used to swallow the failure and substitute "" —
+        // a downstream caller reading `caps.desktop` couldn't tell
+        // "real unknown desktop" from "allocator was out of memory
+        // and we lied". Surface the error instead so the caller
+        // logs it; the probe is on the hot startup path and the
+        // user would otherwise see a mysterious GNOME-fallback code
+        // path engage on a Plasma session.
+        const desktop = try allocator.dupe(u8, desktop_src);
 
         return .{
             .gtk4 = gtk4,
@@ -579,6 +571,6 @@ fn canDlopen(name: [*:0]const u8) bool {
 test "Panel.detect doesn't crash without env vars" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const caps = Panel.detect(arena.allocator());
+    const caps = try Panel.detect(arena.allocator());
     _ = caps;
 }

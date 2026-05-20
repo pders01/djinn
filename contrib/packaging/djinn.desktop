@@ -2,9 +2,31 @@
 Type=Application
 Name=djinn
 Comment=Drop-down terminal panel + MCP agent surface
+# Exec is intentionally bare, not absolute. The same .desktop ships
+# from `zig build install --prefix /usr -Dsystem-install=true` (Arch /
+# Debian land it at /usr/share/applications/djinn.desktop with
+# /usr/bin/djinn on PATH) and from the nix derivation (writes
+# $out/share/applications/djinn.desktop with $out/bin/djinn picked
+# up after `nix profile install`). Hardcoding /usr/bin/djinn would
+# break the nix install; the systemd unit uses an absolute path
+# because systemd user-unit env doesn't inherit user PATH the way
+# the desktop-services launcher does.
 Exec=djinn
 Icon=utilities-terminal
 Terminal=false
+# TerminalEmulator surfaces djinn in "Open in Terminal" menus on
+# file managers that key off this category. djinn isn't a general-
+# purpose terminal MIME handler (no `MimeType=` line) — the
+# drop-down + agent-surface use case is launcher-driven, not
+# file-manager-driven, so we deliberately omit it.
 Categories=Utility;TerminalEmulator;
-StartupNotify=false
+# StartupNotify=true: GTK4 emits the startup notification ID
+# automatically when the panel maps, so launchers can dismiss the
+# spinner. StartupWMClass=djinn gives the launcher / taskbar a
+# way to map the running window back to this .desktop entry for
+# icon grouping (GNOME shell, KDE plasma, waybar / sway-bar all
+# read it). Both directives serve compatible purposes; the prior
+# StartupNotify=false caused the launcher spinner to time out on
+# KDE rather than getting dismissed on map.
+StartupNotify=true
 StartupWMClass=djinn

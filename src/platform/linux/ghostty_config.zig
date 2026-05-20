@@ -78,7 +78,16 @@ pub fn loadFromUserConfig(allocator: std.mem.Allocator) !?Colors {
 
     // 1 MiB cap. Real-world ghostty configs sit under 10 KB; the
     // ceiling is just to keep a runaway file from OOMing startup.
-    const text = try file.readToEndAlloc(allocator, 1 << 20);
+    // Hard-fatal `readToEndAlloc` made a too-big config block the
+    // whole inheritance path with no recovery — degrade to "use VTE
+    // defaults" instead so the panel still opens.
+    const text = file.readToEndAlloc(allocator, 1 << 20) catch |err| switch (err) {
+        error.FileTooBig => {
+            std.debug.print("ghostty config: {s} exceeds 1 MiB cap; skipping inheritance\n", .{cfg_path});
+            return null;
+        },
+        else => return err,
+    };
     defer allocator.free(text);
 
     var colors = Colors{};
@@ -110,10 +119,60 @@ pub fn loadFromUserConfig(allocator: std.mem.Allocator) !?Colors {
 /// `text`. Unknown keys are silently ignored — ghostty has hundreds
 /// of keys we don't model, and warning on each would drown out the
 /// useful diagnostics.
+/// Trim an inline `# comment` tail off a config line. `#` is also a
+/// hex-color sigil (`background = #1a1a1a`), so we only strip when
+/// the `#` is followed by something that isn't a hex digit — i.e.
+/// the `#` opens a comment rather than a color value. Matches
+/// ghostty's own parser behavior. Returns the line without the
+/// comment + any trailing whitespace.
+fn stripInlineComment(line: []const u8) []const u8 {
+    var i: usize = 0;
+    while (i < line.len) : (i += 1) {
+        if (line[i] != '#') continue;
+        if (i + 1 < line.len) {
+            const next = line[i + 1];
+            const is_hex = (next >= '0' and next <= '9') or
+                (next >= 'a' and next <= 'f') or
+                (next >= 'A' and next <= 'F');
+            if (is_hex) continue;
+        }
+        if (i == 0) return line[0..0];
+        return std.mem.trimRight(u8, line[0..i], " \t");
+    }
+    return line;
+}
+
+test "stripInlineComment: trailing comment removed" {
+    try std.testing.expectEqualStrings("foo = bar", stripInlineComment("foo = bar # ignore me"));
+}
+
+test "stripInlineComment: hex color preserved" {
+    try std.testing.expectEqualStrings("background = #1a2b3c", stripInlineComment("background = #1a2b3c"));
+}
+
+test "stripInlineComment: hex color + trailing comment" {
+    try std.testing.expectEqualStrings(
+        "background = #1a2b3c",
+        stripInlineComment("background = #1a2b3c # warm tone"),
+    );
+}
+
+test "stripInlineComment: no comment passes through" {
+    try std.testing.expectEqualStrings("foo = bar", stripInlineComment("foo = bar"));
+}
+
+test "stripInlineComment: leading # stays leading" {
+    // Leading # is a comment line (caller handles separately); we
+    // return an empty slice so the trim-then-empty-check at the
+    // caller skips the row.
+    try std.testing.expectEqualStrings("", stripInlineComment("# whole line is a comment"));
+}
+
 pub fn parseInto(text: []const u8, colors: *Colors, allocator: std.mem.Allocator) !void {
     var line_it = std.mem.splitScalar(u8, text, '\n');
     while (line_it.next()) |raw| {
-        const trimmed = std.mem.trim(u8, raw, " \t\r");
+        const stripped = stripInlineComment(std.mem.trim(u8, raw, " \t\r"));
+        const trimmed = std.mem.trim(u8, stripped, " \t");
         if (trimmed.len == 0) continue;
         if (trimmed[0] == '#') continue;
 
@@ -258,7 +317,13 @@ fn tryLoadThemeAt(allocator: std.mem.Allocator, path: []const u8) !?Colors {
     const stat = file.stat() catch return null;
     if (stat.kind != .file) return null;
 
-    const text = try file.readToEndAlloc(allocator, 1 << 20);
+    // Same 1 MiB cap as the user config; degrade to "skip this
+    // theme" instead of aborting startup when a runaway theme file
+    // hits the ceiling.
+    const text = file.readToEndAlloc(allocator, 1 << 20) catch |err| switch (err) {
+        error.FileTooBig => return null,
+        else => return err,
+    };
     defer allocator.free(text);
 
     var colors = Colors{};

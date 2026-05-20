@@ -8,35 +8,44 @@ points you at the source.
 
 ## Priority order
 
-Top three from the `## Code review backlog` section, ranked by
-production risk. Prior top-three (Config live-reload arena,
-signal-handler lifecycle sweep, GDBus extraction, persist worker
-thread lifetime, Dispatch undefined-then-stamped, watcher event
-coalescing, SNI watcher recovery, hotkey Request-path desync, IPC
-`/tmp` socket permissions) all landed — `git log --grep=linux`
-carries the trail.
+The original Important / Minor tiers have largely drained — see the
+History block under `## Code review backlog` for the chain. What's
+left is the Structural refactors batch:
 
-1. **`mcp/server.zig` accept-thread panic recovery.** `run()`
-   returns void; a panic in `handleConnection` kills the accept
-   thread with no log signal. On linux's live-apply path the server
-   may run for hours; a single hot bug silently disables MCP until
-   the next config reload re-spawns it. Wrap each connection in a
-   panic recovery + log.
-2. **`main_linux.zig` has no unit tests of its own.** The
-   `test {}` block re-exports submodules; the watcher reload,
-   Dispatch stamping, persist worker lifetime, and MCP start/stop
-   on live-flip — the highest-risk surfaces in the branch — are
-   unverified by `zig build test`. Now that CI covers linux,
-   regressions on these paths land green. Add at least a smoke
-   test for `onConfigChanged` + Config round-trip.
-3. **`hotkey.zig` silent fall-through hierarchy.** When portal
-   init fails (invalid trigger, CreateSession error, status != 0,
-   no portal backend), each failure mode logs to stderr but there
-   is no positive log signal beyond `portal registration confirmed`.
-   The README points users at `Gtk-WARNING` grep for CSS issues
-   but the hotkey path has no equivalent diagnostic. Aggregate the
-   failure paths into a single logged outcome ("portal hotkey
-   active" / "portal hotkey unavailable: <reason>").
+1. **Structural refactors** — `log_pane.zig` extraction
+   (1373 lines; pull `writeThemedCss` into `log_pane_css.zig`,
+   move filter+header bookkeeping into a `LogModel`),
+   `keymap.zig` `Context` god-object split before
+   find_overlay / command_palette land.
+
+Two batches landed since the last refresh:
+
+- **Packaging cleanup** — `-Dsystem-install` gate in `build.zig`,
+  PKGBUILD + `debian/rules` drop the manual LICENSE/README installs,
+  `debian/djinn.install` declares the binary package's payload,
+  flake.nix `nix run` exports LD_LIBRARY_PATH on linux + glib moves
+  to buildInputs, `djinn.service` gains the conservative sandbox
+  set + `StartLimitBurst`, `djinn.desktop` flips `StartupNotify=true`
+  and documents the bare-Exec intent. Pbuilder debchroot + Nix
+  `nix build` revalidation still wanted before declaring
+  distro-ready.
+- **Resilience polish** — `watcher.zig` survives
+  destroy-and-recreate of the config dir via a 5s inode-health
+  probe that rebuilds the GFileMonitor in place when the cached
+  `st_ino` no longer matches; `dragdrop.zig` /tmp reaper now runs
+  on a 30-minute `g_timeout_add` cadence in addition to the
+  startup sweep, so long-running sessions don't accumulate temps;
+  `notifier.zig::playSound` logs once per process when invoked so
+  the `bell-sound` override gap is visible (the per-kind
+  notification sound-name hint still plays — only the override is
+  dropped today).
+
+`mcp/tools.zig:43` `session_manager` type-purity audit and the
+remaining Minor code-shape items (terminal.zig argv const, hotkey
+errdefer gap, unique_name re-fetch, watcher partial-init cleanup,
+ghostty_config detectAppearance GVariant ownership style) are
+small one-line edits and a good warm-up before the structural
+refactors above.
 
 The "Cross-cutting themes" subsection at the end of the backlog
 names patterns rather than files.
@@ -101,7 +110,12 @@ prevailing shape.
   reading outside the themes/ tree. `tryLoadThemeAt` requires a
   regular file (post-open `stat`) so a symlink to `/dev/zero` or
   a device file resolves to null rather than blocking startup on
-  a 1 MiB read. Light/dark variants picked from
+  a 1 MiB read. `parseInto` strips trailing `# comment` sections
+  via `stripInlineComment` (preserves `#rrggbb` sigils by only
+  treating `#` as a comment when not followed by a hex digit).
+  `loadFromUserConfig` / `loadThemeFile` degrade to "skip
+  inheritance" on `FileTooBig` instead of propagating the error
+  and blocking the panel open. Light/dark variants picked from
   xdg-desktop-portal.Settings color-scheme (defaults to dark; KDE's
   portal double-wraps the value in a variant, the unwrap loop in
   `detectAppearance` handles both shapes). `main_linux.zig` merges
@@ -112,7 +126,12 @@ prevailing shape.
   accepts `toggle` / `show` / `hide` / `quit`. `Ipc.init` narrows the
   process umask to 0077 around `bind()` so the socket inode lands
   with mode 0600 atomically — same-machine users can't drive the
-  verb stream regardless of which path is chosen.
+  verb stream regardless of which path is chosen. Stale-unlink
+  errors (non-ENOENT) log a clear "bind may fail" pre-warning.
+  `onListenReady` caps the per-dispatch accept loop at 32 iters
+  so a same-UID client `connect()`-ing in a tight loop can't
+  starve the GLib main thread; non-EINTR `read` errors log
+  distinctly from benign restarts.
 - `hotkey.zig` — `xdg-desktop-portal.GlobalShortcuts` over GDBus.
   Auto-registers from `config.hotkey.toggle`; first launch on KDE pops
   a confirmation dialog, subsequent launches are silent. The method
@@ -120,9 +139,16 @@ prevailing shape.
   locally-predicted path in both the CreateSession and BindShortcuts
   callbacks via `reconcileRequestPath` — if the portal renames the
   request segment (KDE has done this), the Response subscription
-  swaps onto the canonical path before the body executes. Falls
-  through to the IPC bridge when no portal backend implements
-  GlobalShortcuts.
+  swaps onto the canonical path before the body executes. Each
+  portal call uses `PORTAL_CALL_TIMEOUT_MS = 30s` so a stuck
+  xdg-desktop-portal daemon can't peg the subscription until
+  process exit. `reportSuccess` / `reportFailure` /
+  `reportSyncFailure` emit one definitive
+  `hotkey: portal active — trigger "<X>"` /
+  `hotkey: portal unavailable — <reason>` line per init attempt;
+  `ctx.outcome_reported` latches the first call so duplicate
+  handler paths don't double-log. Falls through to the IPC bridge
+  when no portal backend implements GlobalShortcuts.
 - `log_pane.zig` — right-hand column inside a horizontal `GtkPaned`
   next to the VTE. Widget tree: outer vertical `GtkBox` →
   (attention `GtkButton`, `GtkScrolledWindow → GtkListBox`,
@@ -131,7 +157,12 @@ prevailing shape.
   (`.djinn-log-info` / `-warn` / `-err`) on a module-local
   reload-in-place provider. 250ms `g_timeout_add` poll same shape
   as tray's — diffs `(count, first_ts)` and either appends new
-  rows or rebuilds when the ring evicts. Auto-scroll to newest via
+  rows or rebuilds when the ring evicts. `pollTick` and
+  `rebuildAll` hold `state.mutex` across the snapshot AND the
+  GTK row builds via `appendRangeLocked` so a concurrent
+  `appendLog` eviction can't shift the `[from..from+count]`
+  window onto different entries than the snapshot intended.
+  Auto-scroll to newest via
   an idle callback (deferred so GTK's measured upper-bound
   reflects the freshly-appended row). `applyTheme(opts)` mirrors
   `Terminal.applyTheme`: resolved background + opacity paint at
@@ -202,7 +233,10 @@ prevailing shape.
   struct (lazy-acquired on first `deliver` under `conn_mutex`,
   unref'd by `deinit`) so the hot path past first delivery is
   mutex-free. Failed acquire keeps `connection = null` so transient
-  bus loss retries automatically on the next send.
+  bus loss retries automatically on the next send. `ztrunc` snaps
+  back to a UTF-8 code-point boundary before writing the NUL — the
+  banner body field requires valid UTF-8 and a half-byte tail
+  silently disappears on KDE/GNOME notification daemons.
 - `gdbus.zig` — shared GDBus surface. Opaque types (`GDBusConnection`,
   `GVariant`, `GVariantBuilder`, `GVariantType`, `GCancellable`,
   `GAsyncResult`), `GError` layout, bus + call-flag constants, the
@@ -238,8 +272,12 @@ prevailing shape.
   stays as the home for the next cold-path field.
 - `autostart.zig` — XDG `.desktop` entry at
   `$XDG_CONFIG_HOME/autostart/djinn.desktop`, gated on
-  `config.system.open_at_login`. `Exec=` from `/proc/self/exe`.
-  Replaces SMAppService.
+  `config.system.open_at_login`. `Exec=` from `/proc/self/exe`
+  with `stripDeletedAnnotation` to drop the kernel's ` (deleted)`
+  suffix when the inode has been unlinked mid-session (routine on
+  a pacman/apt upgrade). Stages content to `<path>.tmp` and
+  atomic-renames over the final path so a mid-write crash can't
+  leave a torn file. Replaces SMAppService.
 - `keymap.zig` — `GtkShortcutController` on the panel window with
   `GTK_SHORTCUT_SCOPE_MANAGED` + PROPAGATION_CAPTURE so bindings
   beat VTE's internal shortcut set. Eleven entries (`installed 11/11`
@@ -280,12 +318,22 @@ prevailing shape.
   `/tmp/djinn-drop-<128-bit hex>.png`, and pastes the path. The
   string target is attached first so file-manager drags (which
   typically offer both URI list and thumbnail) resolve to paths
-  rather than rasterized previews. `main_linux.zig::reapDragDropTemps`
-  runs once at startup to clear entries older than 1h.
+  rather than rasterized previews. `formatPayload` skips bare
+  `file://` URIs (no path) so the shell doesn't get an empty `''`
+  positional arg, and logs the truncation count when
+  `writeShellQuoted` runs out of room mid-payload.
+  `main_linux.zig::reapDragDropTemps` runs once at startup to
+  clear entries older than 1h, continuing past per-entry
+  `dir.iterate` errors so other users' /tmp files can't abandon
+  the sweep.
 - MCP HTTP server in `main_linux.zig` — same wiring shape as darwin's:
   `AgentState → Notifier → ToolTable → Dispatcher → McpServer` on a
   detached thread, gated on `mcp-enabled`. Endpoint info in
-  `~/.config/djinn/mcp.json`.
+  `~/.config/djinn/mcp.json`. `handleConnection` returns `!void`
+  and `run()` logs failed handler returns so transient I/O errors
+  stay visible instead of silently disabling MCP requests for the
+  server's lifetime. Body-read failures fall through to the
+  existing 400 "incomplete body" response instead of bare TCP RST.
 
 Tested on CachyOS + KDE Plasma Wayland 6.x.
 
@@ -592,114 +640,26 @@ Lifetime hazards:
   `Config.deinit`. Documented at the assignment site — any
   reordering of the defers inverts the safety story.
 
-GLib main-thread blocking surfaces (each independently fixable; the
-pattern is the issue):
-
-- **`tray.zig::pollAgentTick`** — grabs `state.mutex` from a GLib
-  callback. No documented lock-ordering invariant against other
-  threads that may hold it while calling GLib. Document the
-  invariant or move to try-lock.
-- **`main_linux.zig::onConfigChanged` reload on main thread** —
-  with watcher debouncing landed, the per-save cost is now
-  `Config.load` + ghostty parse + theme apply on the GLib main
-  thread (≤60ms typical, 3× 20ms only on the atomic-rename ENOENT
-  retry path). No longer a real blocker — track here in case the
-  config parse grows. Off-thread reload would need `g_idle_add`
-  marshalling because the apply path (panel.setSize, applyTheme,
-  setVisible) is GTK-bound.
-
-Concurrency + threading correctness:
-
-- **`log_pane.zig appendRange`** — releases `state.mutex` between
-  pollTick's snapshot and appendRange's re-lock. Concurrent
-  `appendLogFrom` eviction in that window mis-indexes rows.
-  Recovers on next tick's `.rebuild` (since `first_ts` differs) but
-  produces one tick of wrong display. Hold the lock across the whole
-  tick or copy entry bytes inside the snapshot lock.
-
-System integration recovery + auth:
-
-- **`hotkey.zig:202-223`** — silent fall-through hierarchy. The
-  TODO claim "fall through to IPC bridge" isn't an active fallback;
-  the IPC bridge is always running and `init` just logs each
-  failure mode to stderr (invalid trigger, CreateSession error,
-  status != 0, no portal). No positive log signal for "hotkey is
-  working" beyond `portal registration confirmed`; if that signal
-  is missed for any reason, the user gets neither error nor
-  confirmation. Aggregate the failure paths into a single logged
-  outcome. This is **priority #3**.
-- **`tray.zig:516-532, 757, 785`** — `message_buf` is mutated in
-  `pollAgentTick` (GLib main thread) and read from property-getter
-  paths (`sniGetProperty` / `buildToolTip`) without explicit
-  synchronization. Safe today because GDBus dispatches on the
-  default main context, but the invariant is unstated. Assert
-  main-thread ownership (`g_main_context_is_owner`) or move under
-  a mutex.
-
-Code-shape duplication ripe for extraction:
-
-- **GTK externs × 4+ files** — `g_signal_connect_data`,
-  `g_timeout_add`, `g_source_remove`, `g_object_unref`,
-  `gdk_display_get_default`, `gtk_widget_set/get_visible`,
-  `gtk_widget_add_controller`, `gtk_css_provider_*`,
-  `gtk_style_context_add_provider_for_display` duplicated across
-  panel/terminal/log_pane/tray/watcher. `g_source_remove` already
-  has divergent return types (`c_int` in ipc/tray, `gboolean` in
-  panel/log_pane). Same shape of consolidation as the landed
-  `gdbus.zig` — carry the surface in `gtk.zig` (which is types-only
-  today) or a sibling `glib.zig` if the GTK/GLib split matters.
-
-Cross-OS abstraction:
-
-- **`platform.zig:41-61` + `platform/darwin.zig`** — abstraction is
-  ornamental for darwin. `main.zig` still imports `hotkey/darwin.zig`,
-  `notify/menubar.zig`, `system/loginitem.zig` directly. 12 of 14
-  darwin re-exports are dead stubs (only `Notifier` flows through).
-  `ThemeOptions` fields diverge (linux has `background`/`foreground`/
-  `cursor`/`opacity`/`palette`; darwin stub has `_hex`-suffixed
-  triplet, no opacity, no palette). Either commit to the migration
-  or revert the dead surface.
-
 Build + packaging:
 
-- **`flake.nix nix run .#`** — no LD_LIBRARY_PATH wrapper for
-  linux. Dev shell exports it; the runner does not. NixOS users
-  link fine then fail at first GTK dlopen. Wrap the runner with
-  `makeWrapper` or document.
-- **`flake.nix:182`** — `glib` in `nativeBuildInputs` but it's a
-  runtime library. Move to `buildInputs`.
 - **`debian/control` + `debian/rules:19-25`** — no
   `Build-Depends: zig (>= 0.15)` because zig isn't in the Debian
   archive; `dh_auto_configure` runs `zig build --fetch` which
   needs network. Unbuildable on fresh pbuilder chroot
   (architectural dead-end until zig is archived or vendored).
-- **`debian/rules:35-36`** — `--prefix debian/djinn/usr` hardcodes
-  the binary package name. Breaks if a second binary package
-  appears (`djinn-doc`, `djinn-dbgsym`). Use `debian/tmp/usr` +
-  `dh_install` reading `debian/djinn.install`, or
-  `debian/$(DEB_SOURCE)/usr`.
-- **`djinn.service`** — no sandboxing directives
-  (`NoNewPrivileges=`, `ProtectSystem=`, `LockPersonality=` cost
-  nothing). No `StartLimitBurst=` — tight panic loop respawns every
-  2s indefinitely.
 - **`djinn.service:11-12`** — `After=graphical-session.target` +
-  `PartOf=graphical-session.target` is correct on KDE/GNOME but
-  the user must explicitly `systemctl --user start
-  graphical-session.target` on Hyprland/sway unless they use a
-  session manager (`uwsm`, `niri-session`). Without it the unit
-  sits `inactive` forever. Add fallback `After=` or document the
-  prereq via `Documentation=`.
+  `PartOf=graphical-session.target` is documented now (the
+  `[Unit]` comment block names the Hyprland / bare-sway uwsm
+  caveat) but no fallback `After=` line. If a user reports the
+  unit sitting `inactive` after a Hyprland install, the
+  next step is either a `default.target` fallback or a README
+  pointer to `systemctl --user start graphical-session.target`.
 - **`djinn.service:38-39`** — `WantedBy=graphical-session.target`
   with transient targets is fragile across compositor restarts:
   `PartOf=` stops djinn but `WantedBy=` of a transient target
   doesn't necessarily re-pull it. Test path: log out → log back
   in → verify djinn restarts. Consider `WantedBy=default.target`
   + `Requisite=graphical-session.target`.
-- **`djinn.desktop:8`** — `Categories=Utility;TerminalEmulator;`
-  + `Terminal=false` + no `MimeType=` line means djinn won't
-  appear as an "Open in Terminal" handler for file managers. If
-  that's deliberate, document. Otherwise add appropriate MIME
-  handlers.
 - **`flake.nix:190-197`** — `__noChroot = true` on
   `packages.default` (not just `checks`) makes
   `nix build .#default` non-reproducible and non-substitutable.
@@ -707,14 +667,6 @@ Build + packaging:
   The cleaner architectural fix is `zon2nix` vendoring so the
   package builds in the sandbox while `checks` retains
   `__noChroot`.
-- **`build.zig:80-97`** — `.desktop` + `.service` installed even on
-  `zig build run` from a dev tree. Gate on a `system-install` build
-  option.
-- **`PKGBUILD` `package()` lines 90-91** — `install -Dm644 LICENSE
-  ...` and `README.md` placed manually after `zig build install`.
-  Files aren't registered with zig's install step, so a future
-  `zig build uninstall` would orphan them. Either move into
-  `b.installFile` paths or document the gap.
 
 MCP cross-OS refactor:
 
@@ -722,141 +674,26 @@ MCP cross-OS refactor:
   imports `../session/manager.zig` from linux. Verify the type
   alone is platform-agnostic; if `session/manager.zig` transitively
   pulls darwin-specific code, linux build breaks.
-- **`mcp/server.zig:81-95`** — `run()` returns void; panic in
-  `handleConnection` kills the accept thread with no log signal.
-  On linux's live-apply path the server may run for hours; a single
-  hot bug silently disables MCP. Wrap each connection in a panic
-  recovery + log. This is **priority #1**.
-
-Untested critical paths:
-
-- **`main_linux.zig` has no unit tests of its own.** The test {}
-  block re-exports submodules; the Dispatch stamping order,
-  `onConfigChanged` lifecycle, MCP start/stop on live-flip,
-  watcher reload, persist worker thread lifetime — the highest-
-  risk surfaces in the branch — are unverified by `zig build test`.
-  Add at least a smoke test that exercises the watcher's reload
-  branch + a Config-with-deinit round-trip. This is **priority #2**.
 
 ### Minor — track, not blocking
 
-- **`cli.zig:48`** — `djinn --hotkey` with no following arg silently
-  consumes the next flag (`--provider claude` becomes the hotkey
-  value).
-- **`mcp/server.zig:130-152`** — content-length body read silently
-  RSTs the client on partial read. Match the `n == 0` path's
-  "incomplete body" 400 response.
-- **`theme.zig:362`** — sentinel cast on potentially-empty buffer:
-  empty CSS string loads on a reload where neither padding nor
-  opacity is set. Guard `css_len > 0`.
+Code-shape:
+
 - **`terminal.zig:243`** — `argv[0..2]` magic number duplicated
   against the `alloc(?[*:0]u8, 2)` site. Field or const.
 - **`keymap.zig` `Context`** — five fields (`terminal`, `allocator`,
   `log_pane`, `panel`, `config`) trending toward god-object as
   find_overlay + command_palette land. Consider per-action
   `*anyopaque` user_data or a `Services` registry.
-- **`keymap.zig:312`** — `std.fs.cwd().makePath(dir)` swallowed;
-  ENOSPC / EACCES hidden, subsequent createFile reports confusing error.
-- **`keymap.zig trySpawnDetached`** — doesn't reap the spawned
-  child. One zombie per invocation until djinn exits. Documented on
-  `onOpenSettings` only; future callers will hit it without warning.
-- **`dragdrop.zig` /tmp cleanup** — `reapDragDropTemps` runs at
-  startup only. Crash mid-session persists temps until next
-  successful launch. Track per-session paths + unlink on `deinit`,
-  or run the reaper periodically.
-- **`dragdrop.zig:166`** — `formatPayload` returns partial write on
-  `error.NoSpace`; user dragging 50 long paths gets silent truncation.
-- **`dragdrop.zig` URI parsing** — `file://` (just scheme, no path)
-  produces empty shell-quoted paste `''`. Defensive ignore would be
-  cleaner.
-- **`notifier.zig:267-273`** — `ztrunc` slices on byte boundary; can
-  split UTF-8 mid-codepoint. Truncate on code-point boundary.
-- **`log_pane.zig:1212`** — same UTF-8 boundary issue in
-  `refreshAttentionChip` 252-byte clip.
-- **`log_pane.zig:1184` `formatHeaderTime`** — `catch unreachable`
-  on `bufPrint`. Safe today; replace with `catch return ""`.
 - **`log_pane.zig` size** — 1373 lines, multiple concerns. Extract
   `writeThemedCss` (~280 lines) to `log_pane_css.zig`; pull
   filter+header bookkeeping into a `LogModel` struct.
-- **`autostart.zig:65-99`** — non-atomic write
-  (`createFile(.truncate=true)` + `writeAll`). Mid-write crash
-  leaves truncated file. Write to `.tmp` + rename.
-- **`autostart.zig:151-156`** — `/proc/self/exe` can include
-  ` (deleted)` annotation after package update mid-session.
-- **`reapDragDropTemps`** — `dir.iterate()` errors return from the
-  function, abandoning the rest. Continue instead.
-- **`hotkey.zig:417`** — errdefer cleanup gap on init failure.
-  Latent today (no allocs after subscribes) but trap for the next
-  edit.
-- **`hotkey.zig:316`** — `timeout_msec=-1` lets stuck portal peg the
-  subscription until process exit. 10-30s cap with logged timeout.
-- **`ipc.zig:158-183`** — unbounded inner accept loop; same-UID
-  client `connect()`-ing in a tight loop starves GLib main loop.
-  Cap iterations per dispatch.
-- **`ipc.zig:91-94`** — `unlink` swallows EACCES / EISDIR; `bind`
-  then fails with less-informative error.
-- **`watcher.zig:255-283`** — no recovery if config dir itself
-  disappears (`mv ~/.config/djinn ~/.config/djinn.bak`).
-  `MOVED_OUT`/`UNMOUNTED` should re-establish the monitor.
-- **`ghostty_config.zig:81-82,225`** — `readToEndAlloc(1<<20)` is
-  hard-fatal on >1 MiB config; should degrade to "skip, use
-  defaults".
-- **`ghostty_config.zig:113-153`** — inline `# comment` on a value
-  line is not stripped, silently rejects the entry.
-- **`notifier.zig`** — `playSound` is a no-op stub. If any
-  cross-platform caller exercises `bell-sound`, linux users get
-  silent failure. Log on first call or wire VTE's `bell` signal.
-- **`djinn.desktop:5`** — `Exec=djinn` (bare) vs systemd unit's
-  absolute `/usr/bin/djinn`. Inconsistent; .desktop should be
-  absolute per freedesktop recommendation.
-- **`djinn.desktop:9`** — `StartupNotify=false` + `StartupWMClass=djinn`
-  inconsistent (WMClass only useful when StartupNotify=true).
-- **`flake.nix:196`** — `dontWrapGApps = false;` is the default; the
-  comment claims it disables wrapping (it doesn't). Delete or fix.
-- **`flake.nix:220`** — `homepage` URL duplicated in `PKGBUILD:7`,
-  `debian/control:13`, `debian/copyright:4`. Single source of truth
-  (or a comptime cross-check) avoids drift.
-- **`platform/darwin.zig:100-120`** — `KeymapContext` declares
-  three fields; linux's `keymap.zig:97-101` has five. Stub doesn't
-  enforce shape parity with the real surface. Either `@compileError
-  ("not implemented on darwin")` or sync the field list.
-- **`main_linux.zig::loadConfigWithRetry`** swallows every error
-  from `Config.load` (`else |_| {}`). EACCES, malformed UTF-8,
-  parse error all look the same as transient ENOENT and burn
-  three retry attempts. Log the first error before retrying.
-- **`main_linux.zig` Terminal bring-up** — `Terminal.open` takes
-  the `on_child_exited` handler with `@ptrCast(&g_dispatch)` while
-  `g_dispatch.terminal` is still `undefined` at that point. The
-  handler doesn't read `terminal` today, but the fragility is
-  load-bearing on knowing which fields each handler touches
-  (subsumed by the priority-#3 Dispatch refactor).
-- **`mcp/server.zig:83-95`** — only `error.SocketNotListening` is
-  treated as "shutting down"; other listener errors during
-  `deinit` (`ConnectionAborted`, `WouldBlock` if the listener went
-  non-blocking) log a spurious "mcp accept failed" before the next
-  loop iteration notices the stop flag. Check `stop_flag` BEFORE
-  logging the error.
-- **`panel.zig:218` `detect`** — `allocator.dupe` failure returns
-  `""` for the desktop name. Masks an OOM as "unknown desktop"
-  downstream. Return the error.
-- **`theme.zig:319` `applyCss`** — 512-byte stack buffer; if the
-  padding rule succeeds but the opacity rule overflows the
-  remaining bytes, `bufPrint`'s `NoSpace` is caught and the partial
-  write loads — silent partial styling. Bubble the NoSpace.
-- **`log_pane.zig:393`** — `showPlaceholder` `unreachable` on
-  `.none`. Brittle as the state grows; return early instead.
-- **`log_pane.zig:373` `applyTheme`** — CSS-build errors swallowed
-  via a debug-print + `return`. Previous provider stays active by
-  accident; at minimum increment a counter callers can observe.
-- **`dragdrop.zig:139`** — two `GtkDropTarget`s attached, neither
-  detached. Widget lifetime cleans up via parent destroy, but a
-  double `dragdrop.attach` (refactor mishap) silently stacks the
-  controllers.
+- **`hotkey.zig` errdefer cleanup gap** on init failure between
+  the last subscribe and the trailing alloc/dup steps. Latent
+  today (no allocs after subscribes) but trap for the next edit.
 - **`hotkey.zig:466, 553`** — `unique_name` re-fetched per call.
   Stash once in `Context`; the unique name is fixed for the
   connection's lifetime.
-- **`ipc.zig:177`** — `read` errors swallowed via `catch continue`.
-  EINTR vs real I/O error are indistinguishable in logs.
 - **`watcher.zig:140-145`** — partial init failure cleanup
   increments `built` after a fallible alloc. Latent today;
   refactor-prone.
@@ -864,6 +701,33 @@ Untested critical paths:
   `params` without explicit floating-ref handling, while
   `hotkey.zig` / `tray.zig` use builder-based construction. Mixed
   GVariant ownership styles make audits harder.
+- **`dragdrop.zig:139`** — two `GtkDropTarget`s attached, neither
+  detached. Widget lifetime cleans up via parent destroy, but a
+  double `dragdrop.attach` (refactor mishap) silently stacks the
+  controllers.
+- **`main_linux.zig` Terminal bring-up** — `Terminal.open` takes
+  the `on_child_exited` handler with `@ptrCast(&g_dispatch)` while
+  `g_dispatch.terminal` is still `undefined` at that point. The
+  handler doesn't read `terminal` today, but the fragility is
+  load-bearing on knowing which fields each handler touches
+  (subsumed by the priority-#3 Dispatch refactor).
+
+Resilience:
+
+- **`notifier.zig` bell-sound proper wiring** — `playSound` logs
+  the gap on first call today, but the user's `bell-sound`
+  override still falls through to the per-kind hint
+  (`dialog-warning` etc.). Real fix is either (a) wire VTE's
+  `bell` signal in `terminal.zig` and route into a sound-only
+  delivery, or (b) call `ca_context_play_full` from libcanberra
+  (adds a runtime dep). Track until the bell subsystem itself
+  lands.
+
+Packaging:
+
+- **`flake.nix:220`** — `homepage` URL duplicated in `PKGBUILD:7`,
+  `debian/control:13`, `debian/copyright:4`. Single source of truth
+  (or a comptime cross-check) avoids drift.
 - **`build.zig:43-54`** — `ghostty_dep` branch duplicates the
   dependency call to drop two darwin-only options. A future
   ghostty rev that renames a required option breaks only one
@@ -879,53 +743,56 @@ Untested critical paths:
 - **`debian/rules:38-43`** — empty `override_dh_auto_test:`
   silently skips the step. Comment-only; an `autopkgtest` config
   would be the proper way to enforce skip.
-- **`debian/changelog`** — timestamp `Sat, 16 May 2026 20:30:00`
-  is future-dated relative to clock-conservative builders;
-  `lintian` flags it. Use `date -R` at commit time.
 
 ### Cross-cutting themes (synthesis)
 
-1. **GLib main-thread blocking.** Tray's `pollAgentTick` still
-   grabs `state.mutex` from a GLib callback without a documented
-   lock-ordering invariant. The watcher path now coalesces
-   GFileMonitor bursts via a 100ms debounce so the per-save cost
-   is one reload (≤60ms typical) instead of 5+ × 60ms. The
-   notifier path is mutex-free past first delivery thanks to the
-   cached connection landing. Audit any new GLib callback for
-   blocking I/O or contended locks.
-2. **GTK extern duplication.** Same shape as the landed
-   `gdbus.zig` extraction. `g_signal_connect_data`, `g_timeout_add`,
-   `g_source_remove`, `g_object_unref`, GTK CSS / widget helpers
-   are duplicated across 4+ modules with at least one divergent
-   signature (`g_source_remove` returns `c_int` in ipc/tray,
-   `gboolean` in panel/log_pane). Consolidate in `gtk.zig` (or a
-   sibling `glib.zig` if the split is worth it).
-3. **Platform abstraction half-built.** Either commit darwin to
-   `platform.zig` (mechanical) or shrink the surface to what's
-   actually used cross-OS (just `Notifier` today).
-4. **Threading model under-documented.** Mutex ordering between
-   `state.mutex` and GLib main, MCP server thread join semantics —
-   need explicit invariants. The persist worker's lifetime is now
-   pinned (single in-flight, joined on shutdown via
-   `joinPendingSave`); other subsystems still under-document their
-   shared-state contract.
+1. **GLib main-thread blocking.** Tray's `pollAgentTick` now has
+   the lock-ordering invariant documented (file-doc + Context
+   field comments). Watcher coalesces GFileMonitor bursts via a
+   100ms debounce so the per-save cost is one reload (≤60ms
+   typical) instead of 5+ × 60ms. Notifier is mutex-free past
+   first delivery via cached connection. Log pane holds
+   `state.mutex` across each pollTick now — bounded, but a new
+   point that future GLib callback authors should be aware of.
+   Audit any new GLib callback for blocking I/O or contended
+   locks against the same rule.
+2. **GTK extern surface — consolidated.** `gtk.zig` now hosts
+   the GLib/GTK helpers used by 3+ modules. Per-feature externs
+   (gtk_window_*, vte_terminal_*, gtk_paned_*, pango_*,
+   gtk_layer_*) stay scoped to their consumer.
+3. **Platform abstraction — reverted to minimal surface.**
+   `platform.zig` re-exports only `Notifier` + `NotifyKind` (the
+   cross-OS consumers). Linux + darwin entries use direct
+   imports for everything else. `platform/darwin.zig` shrunk
+   from 14 stubs to 2.
+4. **Threading model.** `state.mutex` ↔ GLib main lock-ordering
+   documented in tray.zig file-doc; persist worker lifetime
+   pinned (single in-flight, joined on shutdown); MCP accept
+   thread joined via `McpServer.thread` on linux. Remaining
+   under-documented surface: agent state's per-method contract
+   (which methods take the mutex, who can call them concurrently)
+   — could land as a section in `agent/state.zig`'s file-doc.
 5. **Packaging not yet upstream-ready.** Debian source format
    workable but `dh_auto_configure` runs `zig build --fetch`
    (needs network in pbuilder); flake.nix `nix build .#default`
-   relies on `__noChroot = true` (non-reproducible, non-substitutable);
-   `zig build install` orphans manually-placed LICENSE/README on
-   uninstall. Three independent blockers for true distro inclusion;
-   the GH-release tarball + AUR `djinn-git` PKGBUILD are the two
-   working install paths today (see History).
+   relies on `__noChroot = true` (non-reproducible, non-substitutable).
+   `-Dsystem-install=true` now owns the .desktop / .service /
+   LICENSE / README drops under share/, so the orphan-on-uninstall
+   hole is closed and the rules / PKGBUILD / nix derivation all
+   share the same install transaction. Two independent blockers
+   left for true distro inclusion; the GH-release tarball + AUR
+   `djinn-git` PKGBUILD are the two working install paths today
+   (see History).
 6. **Untested high-risk paths.** CI now covers linux — Ubuntu 24.04
    runs `zig build test` + debug build + ReleaseSafe + `--version`
-   smoke on every push (`.github/workflows/ci.yml::linux`). What's
-   still untested by `zig build test`: the bring-up sequence in
-   `main_linux.zig` (Dispatch stamping order, `onConfigChanged`
-   lifecycle, MCP live-flip, watcher reload, persist worker
-   lifetime). Submodule unit tests stayed unchanged across the
-   alpha; the main bring-up's regression surface needs its own
-   smoke tests. This is **priority #2** in the live backlog.
+   smoke on every push (`.github/workflows/ci.yml::linux`).
+   main_linux now has its own smoke suite for the pure-data merge
+   plumbing (`Config` round-trip, `mergeColor`, `buildThemeOptions`);
+   what stays untested by `zig build test` is anything that drives
+   GTK on the main thread — the actual `onConfigChanged` apply
+   sequence, MCP live-flip, watcher reload re-entry, persist
+   worker join. Those need a Wayland session and are covered by
+   manual smoke runs.
 7. **Install/uninstall asymmetry + path conflicts.** Arch/Debian/Nix
    all invoke `zig build install --prefix …`; no `zig build
    uninstall` exists. The `.desktop` identity at
@@ -937,6 +804,151 @@ Untested critical paths:
 History (landed themes — kept for context, `git log --grep=linux`
 has the chain):
 
+- **Resilience polish pass** — `watcher.zig` now survives
+  destroy-and-recreate of the config dir (`rm -rf ~/.config/djinn;
+  mkdir ~/.config/djinn`, an editor that does the same, a config
+  rotation script). A new 5-second GLib timeout walks every entry,
+  compares each parent path's `st_ino` against the value cached at
+  init / last rebuild, and on mismatch rebuilds the GFile +
+  GFileMonitor + signal subscription in place — then schedules a
+  coalesce fire so the caller's `on_changed` re-reads through the
+  new inode. Same-FS `mv` round-trips were already safe (inotify
+  watches by inode; rename preserves it). `EntryContext.parent_ino`
+  caches the inode; 0 doubles as a "disable recheck" sentinel for
+  entries whose init-time stat failed. `dragdrop.zig` /tmp reaper
+  now fires on a 30-minute `g_timeout_add` cadence in addition to
+  the startup sweep — a 9-hour workday with 100 image drops no
+  longer accumulates temps until djinn restarts. `notifier.zig`'s
+  `playSound` stub gained a one-shot stderr warning on first call
+  so the `bell-sound` override gap is visible (`tools.zig` invokes
+  it after every successful `sendKind`, once per 30s per (kind,
+  client) bucket by rate-limit default); the per-kind notification
+  sound-name hint set by `deliver` still plays through the
+  notification daemon — only the user override falls through. New
+  `readParentInode detects destroy-recreate inode swap` test
+  exercises the kernel + std.fs.statFile path the recheck relies
+  on: same-FS rename keeps the inode invariant, destroy-recreate
+  rotates it, missing path returns the 0 sentinel.
+- **Packaging cleanup pass** — `build.zig` grows a
+  `-Dsystem-install` option; the linux install branch is gated so
+  `zig build install` from a dev tree drops only `zig-out/bin/djinn`,
+  while distro recipes (PKGBUILD, debian/rules, flake.nix) pass
+  `-Dsystem-install=true` to also land .desktop + systemd user
+  unit + LICENSE + README under `share/`. PKGBUILD + debian/rules
+  drop their out-of-band `install -Dm644` calls, closing the
+  orphan-on-uninstall gap. `debian/rules` stages into
+  `debian/tmp/usr` and the new `debian/djinn.install` declares the
+  binary package's payload — no more hardcoded `debian/djinn/usr`.
+  `flake.nix nix run .#` on linux exports `LD_LIBRARY_PATH`
+  against `linuxDeps` so a fresh `nix run` doesn't fail at first
+  GTK dlopen on NixOS; `glib` moves from `nativeBuildInputs` into
+  the shared `linuxDeps` (runtime library, not a build tool);
+  `dontWrapGApps = false` line drops in favor of the
+  wrapGAppsHook4 default with a corrected rationale comment.
+  `djinn.service` gains the conservative sandbox set
+  (`NoNewPrivileges`, `ProtectKernel{Tunables,Modules,Logs}`,
+  `ProtectControlGroups`, `LockPersonality`, `RestrictSUIDSGID`,
+  `RestrictRealtime`, `MemoryDenyWriteExecute`) plus
+  `StartLimitBurst=5` / `StartLimitIntervalSec=30s` so a panic
+  loop trips a transient failure state instead of flooding the
+  journal indefinitely; the Hyprland / bare-sway `uwsm` caveat
+  for `graphical-session.target` is documented in `[Unit]`.
+  `djinn.desktop` flips `StartupNotify=true` (GTK4 emits the
+  notification ID automatically at panel map; the prior `false`
+  paired with `StartupWMClass=djinn` left KDE's launcher spinner
+  ticking until protocol timeout), and the comments now explain
+  why `Exec=djinn` stays bare (same .desktop ships from both
+  `/usr` system installs and the nix derivation) and why
+  `MimeType=` is deliberately omitted.
+- **Minor-tier pass — robustness across the platform layer** —
+  UTF-8 boundary truncation for notifier banners + log_pane
+  attention chip (`utf8FloorBoundary` helper); error-visibility
+  pass on `loadConfigWithRetry`, panel `detect` allocator,
+  `ipc` unlink, `keymap` makePath, reapDragDropTemps iterate;
+  defensive bounds in `theme::applyCss` (NoSpace bubble + empty
+  CSS guard), `dragdrop::formatPayload` (bare-file:// skip,
+  truncation log), `ghostty_config` (FileTooBig graceful, inline
+  `# comment` strip that preserves hex sigils);
+  long-running resilience via `PORTAL_CALL_TIMEOUT_MS=30s`,
+  `autostart::register` atomic .tmp + rename,
+  `autostart::resolveExePath` strips ` (deleted)`, `ipc` accept
+  loop capped at 32 iters/dispatch with read-error logging,
+  `keymap::trySpawnDetached` registers each child with
+  `g_child_watch_add` for GLib-side reaping;
+  `cli::consumeValue` rejects flag-like values for --hotkey /
+  --provider; `mcp::handleConnection` returns 400 instead of
+  RST on body-read failure.
+- **log_pane appendRange lock window** — `appendRange` (now
+  `appendRangeLocked`) requires the caller to hold `state.mutex`.
+  `pollTick` and `rebuildAll` both acquire the lock once across
+  snapshot + row builds instead of dropping it between phases.
+  GTK calls happen under the lock, but the tick is bounded
+  (every 250ms, typical 0-few rows) so MCP worker contention is
+  negligible. The prior shape let a concurrent `appendLog`
+  eviction shift the `[from..from+count]` window onto different
+  entries than the snapshot intended — corrupt row text and
+  dangling slice reads on the freed string.
+- **tray.zig threading-model docs** — file-doc spells out the
+  GLib main-thread invariant for `ctx.state`, `ctx.message_buf`,
+  `ctx.message_len`, plus the lock-ordering rule w.r.t.
+  `state.mutex` (GLib main may wait on it; mutex holders never
+  wait on GLib). `pollAgentTick`'s brief lock acquisition is now
+  documented as the established direction; future GLib callbacks
+  that introduce blocking I/O or contended locks need an audit
+  pass against this rule.
+- **GTK extern consolidation** — `gtk.zig` now hosts the shared
+  GLib/GTK surface: `g_signal_connect_data`,
+  `g_signal_handler_disconnect`, `g_timeout_add`, `g_idle_add`,
+  `g_source_remove`, `g_object_unref`, `g_free`,
+  `gdk_display_get_default`, `gtk_widget_set/get_visible`,
+  `gtk_widget_add_controller`, `gtk_css_provider_*`,
+  `gtk_style_context_add_provider_for_display`. Reconciles
+  `g_source_remove`'s previously-divergent `c_int` / `gboolean`
+  return types onto the canonical `gboolean` spelling. Each
+  consumer module aliases the shared declaration (`const
+  g_signal_connect_data = gtk.g_signal_connect_data;`) instead
+  of redeclaring its own extern. Same shape as the landed
+  `gdbus.zig` extraction. Per-feature externs (gtk_window_new,
+  vte_terminal_*, gtk_paned_*, pango_*, gtk_layer_*) stay
+  scoped to their consumer.
+- **platform.zig dead-stub revert** — abstraction surface shrunk
+  from 14 re-exports to just `Notifier` + `NotifyKind` (the only
+  cross-OS consumers — `mcp/tools.zig`). `main_linux.zig` now
+  imports `platform/linux.zig` directly under the same `platform`
+  alias; the linux call sites don't change. `platform/darwin.zig`
+  drops 12 unused stubs that had been accumulating drift against
+  the real linux types (ThemeOptions `_hex` suffixes,
+  KeymapContext field-count mismatch). Net: ~170 lines removed,
+  no behavior change on either OS.
+- **MCP accept-thread error logging** — `handleConnection` now
+  returns `!void`; `run()` logs the error before continuing so a
+  recurring bug (parser regression, OOM, partial-read I/O) becomes
+  visible instead of silently disabling every MCP request. The
+  accept-fail backoff path also checks `stop_flag` before logging,
+  so `deinit` no longer prints a spurious "accept failed" warning
+  when it closes the listener.
+- **Hotkey aggregate outcome reporter** — `hotkey.zig` emits one
+  definitive log line per `init()` attempt: `"hotkey: portal
+  active — trigger "<X>""` on success, `"hotkey: portal unavailable
+  — <reason>"` on failure. The sync paths (session bus, unique
+  name, trigger parse) and async terminal points (CreateSession
+  reply / Response status, BindShortcuts reply / Response status)
+  all flow through `reportSuccess` / `reportFailure` / `reportSync
+  Failure`. `ctx.outcome_reported` latches the first reporter call
+  so duplicate handlers don't double-log. `main_linux.zig` no
+  longer prints its own "init failed" line on the cold path; the
+  reload path replaces its "rebind failed: <err>" line with a
+  concise "previous binding still active" since hotkey.zig now
+  carries the failure detail.
+- **main_linux smoke tests** — `Config.parse` + `deinit` round-
+  trip (covers the live-reload arena drop), `mergeColor` priority
+  (djinn hex wins, ghostty fallback, malformed-hex fall-through,
+  null when both unset), `buildThemeOptions` merge order (djinn
+  wins on every field, ghostty fills gaps including palette, no-
+  inheritance path), `strOptEql` identity. The full GTK-bound
+  `onConfigChanged` flow stays covered by manual smoke runs on a
+  Wayland session — the testable building blocks are now wired so
+  a regression in the merge rules surfaces under `zig build test`.
 - **Signal-handler lifecycle** — panel/terminal/log_pane all stash
   handler ids and disconnect in `deinit` before any free that
   invalidates user_data. New GTK modules should follow this shape.

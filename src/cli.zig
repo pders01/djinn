@@ -45,8 +45,7 @@ const common_flags = [_]Flag{
         .help = "Toggle keybinding (default: ctrl+space)",
         .handler = struct {
             fn h(ctx: *Ctx) ParseResult {
-                ctx.parsed.keybinding_override = ctx.args.next();
-                return .run;
+                return consumeValue(ctx, "--hotkey", &ctx.parsed.keybinding_override);
             }
         }.h,
     },
@@ -56,8 +55,7 @@ const common_flags = [_]Flag{
         .help = "Provider: claude/codex/aider/gemini/opencode/crush/pi/generic",
         .handler = struct {
             fn h(ctx: *Ctx) ParseResult {
-                ctx.parsed.provider_override = ctx.args.next();
-                return .run;
+                return consumeValue(ctx, "--provider", &ctx.parsed.provider_override);
             }
         }.h,
     },
@@ -137,6 +135,28 @@ const darwin_flags = [_]Flag{
 
 const flags: [if (is_darwin) common_flags.len + darwin_flags.len else common_flags.len]Flag =
     if (is_darwin) common_flags ++ darwin_flags else common_flags;
+
+/// Consume the next argv token as the value for `flag_name`, with
+/// guards against the common typo "djinn --hotkey --provider claude"
+/// — under the prior shape `ctx.args.next()` blindly returned
+/// "--provider" and the user's `--provider claude` was silently
+/// dropped on the floor. Reject flag-like values (start with `--`)
+/// and missing values with a clear error.
+fn consumeValue(ctx: *Ctx, flag_name: []const u8, slot: *?[]const u8) ParseResult {
+    const val = ctx.args.next() orelse {
+        std.debug.print("error: {s} requires a value\n", .{flag_name});
+        return .exit_err;
+    };
+    if (std.mem.startsWith(u8, val, "--")) {
+        std.debug.print(
+            "error: {s} requires a value (got flag-like \"{s}\")\n",
+            .{ flag_name, val },
+        );
+        return .exit_err;
+    }
+    slot.* = val;
+    return .run;
+}
 
 pub fn parse(args_iter: *std.process.ArgIterator, parsed: *Args) ParseResult {
     var ctx = Ctx{ .args = args_iter, .parsed = parsed };

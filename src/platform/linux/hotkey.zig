@@ -74,6 +74,14 @@ inline fn vt(comptime spec: [:0]const u8) *const GVariantType {
     return @ptrCast(spec.ptr);
 }
 
+/// Per-call timeout for portal method invocations, in milliseconds.
+/// 30 seconds is generous for a confirmation dialog the user has to
+/// click (KDE prompts on first launch) but short enough that a stuck
+/// xdg-desktop-portal daemon stops pegging the subscription until
+/// process exit. -1 (infinite) was the prior shape and gave no
+/// recovery path short of restart.
+const PORTAL_CALL_TIMEOUT_MS: c_int = 30_000;
+
 // ─── Public surface ──────────────────────────────────────────────────
 
 /// Caller-supplied dispatch hook. Invoked on the GLib main thread when
@@ -98,23 +106,21 @@ pub const Hotkey = struct {
     ) !Hotkey {
         var err: ?*GError = null;
         const connection = gdbus.g_bus_get_sync(G_BUS_TYPE_SESSION, null, &err) orelse {
-            if (err) |e| {
-                logErr("g_bus_get_sync", e);
-                gdbus.g_error_free(e);
-            }
+            const detail = if (err) |e| gerrorMessage(e) else "(no message)";
+            reportSyncFailure("session bus unavailable: {s}", .{detail});
+            if (err) |e| gdbus.g_error_free(e);
             return error.SessionBusUnavailable;
         };
         errdefer gdbus.g_object_unref(connection);
 
-        const unique_name_z = gdbus.g_dbus_connection_get_unique_name(connection) orelse
+        const unique_name_z = gdbus.g_dbus_connection_get_unique_name(connection) orelse {
+            reportSyncFailure("no D-Bus unique name on session bus", .{});
             return error.NoUniqueName;
+        };
         const unique_name = std.mem.span(unique_name_z);
 
         const trigger = translateTrigger(allocator, djinn_trigger) catch |e| {
-            std.debug.print(
-                "hotkey: invalid trigger \"{s}\" ({}); skipping portal registration\n",
-                .{ djinn_trigger, e },
-            );
+            reportSyncFailure("invalid trigger \"{s}\" ({})", .{ djinn_trigger, e });
             return error.InvalidTrigger;
         };
         errdefer allocator.free(trigger);
@@ -168,6 +174,7 @@ pub const Hotkey = struct {
             .activated_sub_id = 0,
             .create_response_sub_id = 0,
             .bind_response_sub_id = 0,
+            .outcome_reported = false,
         };
 
         // Activated catches every shortcut firing for the lifetime of
@@ -218,7 +225,7 @@ pub const Hotkey = struct {
             create_params,
             vt("(o)"),
             0,
-            -1,
+            PORTAL_CALL_TIMEOUT_MS,
             null,
             &onCreateSessionReply,
             ctx,
@@ -281,7 +288,46 @@ const Context = struct {
     activated_sub_id: c_uint,
     create_response_sub_id: c_uint,
     bind_response_sub_id: c_uint,
+    /// Single-shot latch for the aggregate "portal active / portal
+    /// unavailable" outcome log. The portal flow has several places it
+    /// can succeed or fail (sync init, CreateSession reply, CreateSession
+    /// Response status, BindShortcuts reply, BindShortcuts Response
+    /// status). Without a latch, transient handlers fire multiple log
+    /// lines for the same logical attempt; with it, the user sees one
+    /// definitive outcome per `Hotkey.init` call.
+    outcome_reported: bool,
 };
+
+// ─── Outcome reporters ───────────────────────────────────────────────
+//
+// Every terminal point in the portal handshake flows through one of
+// these. The pre-Context sync failures (session-bus / unique-name /
+// trigger parse) use `reportSyncFailure`; once Context exists, async
+// callbacks use `reportSuccess` / `reportFailure` which dedupe against
+// `ctx.outcome_reported`.
+
+fn reportSuccess(ctx: *Context) void {
+    if (ctx.outcome_reported) return;
+    ctx.outcome_reported = true;
+    std.debug.print(
+        "hotkey: portal active — trigger \"{s}\"\n",
+        .{ctx.trigger},
+    );
+}
+
+fn reportFailure(ctx: *Context, comptime fmt: []const u8, args: anytype) void {
+    if (ctx.outcome_reported) return;
+    ctx.outcome_reported = true;
+    std.debug.print("hotkey: portal unavailable — " ++ fmt ++ "\n", args);
+}
+
+fn reportSyncFailure(comptime fmt: []const u8, args: anytype) void {
+    std.debug.print("hotkey: portal unavailable — " ++ fmt ++ "\n", args);
+}
+
+fn gerrorMessage(e: *GError) []const u8 {
+    return if (e.message) |m| std.mem.span(m) else "(no message)";
+}
 
 // ─── Signal / reply callbacks ────────────────────────────────────────
 
@@ -310,7 +356,7 @@ fn onCreateSessionReply(
         return;
     }
     if (err) |e| {
-        logErr("CreateSession", e);
+        reportFailure(ctx, "CreateSession method failed: {s}", .{gerrorMessage(e)});
         gdbus.g_error_free(e);
         // No portal backend present (or GlobalShortcuts not implemented
         // in this compositor's portal). Drop the create-Response watch
@@ -351,10 +397,7 @@ fn onCreateSessionResponse(
     }
 
     if (status != 0) {
-        std.debug.print(
-            "hotkey: portal CreateSession refused (status {d}); falling back to IPC bridge\n",
-            .{status},
-        );
+        reportFailure(ctx, "CreateSession refused by portal (status {d})", .{status});
         return;
     }
 
@@ -362,19 +405,19 @@ fn onCreateSessionResponse(
     defer gdbus.g_variant_unref(results_v);
 
     const session_handle_v = gdbus.g_variant_lookup_value(results_v, "session_handle", vt("s")) orelse {
-        std.debug.print("hotkey: CreateSession response missing session_handle\n", .{});
+        reportFailure(ctx, "CreateSession response missing session_handle", .{});
         return;
     };
     defer gdbus.g_variant_unref(session_handle_v);
 
     const session_str = std.mem.span(gdbus.g_variant_get_string(session_handle_v, null));
     ctx.session_handle = ctx.allocator.dupeZ(u8, session_str) catch |e| {
-        std.debug.print("hotkey: dup session_handle failed: {}\n", .{e});
+        reportFailure(ctx, "dup session_handle failed: {}", .{e});
         return;
     };
 
     bindShortcut(ctx) catch |e| {
-        std.debug.print("hotkey: BindShortcuts dispatch failed: {}\n", .{e});
+        reportFailure(ctx, "BindShortcuts dispatch failed: {}", .{e});
     };
 }
 
@@ -404,7 +447,7 @@ fn onBindShortcutsReply(
         return;
     }
     if (err) |e| {
-        logErr("BindShortcuts", e);
+        reportFailure(ctx, "BindShortcuts method failed: {s}", .{gerrorMessage(e)});
         gdbus.g_error_free(e);
     }
 }
@@ -486,13 +529,11 @@ fn onBindShortcutsResponse(
     const status = gdbus.g_variant_get_uint32(status_v);
 
     if (status == 0) {
-        std.debug.print(
-            "hotkey: portal registration confirmed — \"{s}\" is now bound to djinn.toggle\n",
-            .{ctx.trigger},
-        );
+        reportSuccess(ctx);
     } else {
-        std.debug.print(
-            "hotkey: BindShortcuts refused (status {d}); user may have declined or the trigger is unavailable\n",
+        reportFailure(
+            ctx,
+            "BindShortcuts refused (status {d}) — user may have declined or trigger unavailable",
             .{status},
         );
     }
@@ -555,7 +596,7 @@ fn bindShortcut(ctx: *Context) !void {
         params,
         vt("(o)"),
         0,
-        -1,
+        PORTAL_CALL_TIMEOUT_MS,
         null,
         &onBindShortcutsReply,
         ctx,
@@ -751,11 +792,6 @@ fn mapModifier(name: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, lower, "alt") or std.mem.eql(u8, lower, "opt") or std.mem.eql(u8, lower, "option")) return "ALT";
     if (std.mem.eql(u8, lower, "cmd") or std.mem.eql(u8, lower, "command") or std.mem.eql(u8, lower, "super") or std.mem.eql(u8, lower, "meta") or std.mem.eql(u8, lower, "logo") or std.mem.eql(u8, lower, "win")) return "LOGO";
     return null;
-}
-
-fn logErr(label: []const u8, e: *GError) void {
-    const msg = if (e.message) |m| std.mem.span(m) else "(no message)";
-    std.debug.print("hotkey: {s} failed: {s}\n", .{ label, msg });
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────

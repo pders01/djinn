@@ -78,12 +78,25 @@ pub const McpServer = struct {
     /// any successful accept. Without this, a persistent failure (fd
     /// exhaustion, kernel hiccup) busy-loops the thread at ~100% CPU
     /// and floods stderr if we logged each one.
+    ///
+    /// Each `handleConnection` runs to completion on this thread. Its
+    /// error return is logged before the next iteration: without this
+    /// signal, a recurring bug (parser regression, dispatch panic
+    /// translated to error.OutOfMemory, partial-read I/O failure)
+    /// silently disables every MCP request for the lifetime of the
+    /// server. On linux's live-apply path the server may run for
+    /// hours — visible logs matter.
     pub fn run(self: *McpServer) void {
         var backoff_ms: u64 = 1;
         while (!self.stop_flag.load(.acquire)) {
             const conn = self.listener.accept() catch |err| switch (err) {
                 error.SocketNotListening => return,
                 else => {
+                    // Stop-during-accept races: `deinit` closes the
+                    // listener while we were blocked here. Check the
+                    // flag before logging so the spurious "accept
+                    // failed" line doesn't show up on every shutdown.
+                    if (self.stop_flag.load(.acquire)) return;
                     std.debug.print("warning: mcp accept failed: {} (backoff {d}ms)\n", .{ err, backoff_ms });
                     std.Thread.sleep(backoff_ms * std.time.ns_per_ms);
                     backoff_ms = @min(backoff_ms * 2, 200);
@@ -91,11 +104,13 @@ pub const McpServer = struct {
                 },
             };
             backoff_ms = 1;
-            self.handleConnection(conn);
+            self.handleConnection(conn) catch |err| {
+                std.debug.print("warning: mcp connection handler failed: {}\n", .{err});
+            };
         }
     }
 
-    fn handleConnection(self: *McpServer, conn: net.Server.Connection) void {
+    fn handleConnection(self: *McpServer, conn: net.Server.Connection) !void {
         defer conn.stream.close();
 
         var arena = std.heap.ArenaAllocator.init(self.allocator);
@@ -103,7 +118,7 @@ pub const McpServer = struct {
         const alloc = arena.allocator();
 
         var buf: [16 * 1024]u8 = undefined;
-        const head_end = readHead(conn.stream, &buf) catch return;
+        const head_end = try readHead(conn.stream, &buf);
         const head = buf[0..head_end];
 
         const req = parseRequest(head) orelse {
@@ -132,9 +147,9 @@ pub const McpServer = struct {
             return;
         }
 
-        const body = alloc.alloc(u8, cl) catch {
+        const body = alloc.alloc(u8, cl) catch |err| {
             writeStatus(conn.stream, 500, "Internal Server Error", "");
-            return;
+            return err;
         };
 
         const already = buf.len - head_end;
@@ -142,7 +157,14 @@ pub const McpServer = struct {
         @memcpy(body[0..initial], buf[head_end .. head_end + initial]);
         var read_total: usize = initial;
         while (read_total < cl) {
-            const n = conn.stream.read(body[read_total..]) catch return;
+            // Read errors here are typically a peer disconnect or
+            // a half-closed write; either way the body is
+            // incomplete. Falling through to the 400-response path
+            // gives the client a structured error instead of the
+            // bare TCP RST `try` produced on the prior shape (a
+            // half-written request that propagates to run() and
+            // logs an enigmatic `EndOfStream` line).
+            const n = conn.stream.read(body[read_total..]) catch break;
             if (n == 0) break;
             read_total += n;
         }
@@ -160,12 +182,12 @@ pub const McpServer = struct {
         else
             null;
 
-        const response = self.dispatchJsonRpc(alloc, body, client) catch {
+        const response = self.dispatchJsonRpc(alloc, body, client) catch |err| {
             writeStatus(conn.stream, 500, "Internal Server Error", "");
-            return;
+            return err;
         };
 
-        writeJsonResponse(conn.stream, response) catch return;
+        try writeJsonResponse(conn.stream, response);
     }
 
     fn dispatchJsonRpc(self: *McpServer, allocator: std.mem.Allocator, body: []const u8, client: ?[]const u8) ![]const u8 {

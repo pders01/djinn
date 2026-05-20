@@ -29,8 +29,9 @@
 //! `tryDropImage` in `terminal/view.zig` mirrors this. A random
 //! suffix keeps a cooperating local process from pre-positioning a
 //! symlink at the path between create and write. `main_linux.zig`
-//! runs a one-shot reaper at startup so /tmp doesn't grow across
-//! launches.
+//! runs the reaper at startup AND on a 30-minute `g_timeout_add`
+//! cadence so /tmp doesn't accumulate temps either across launches
+//! (startup pass) or within a long-running session (periodic pass).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -72,7 +73,7 @@ const GDK_ACTION_COPY: GdkDragAction = 1;
 // ─── GTK / Gdk extern surface ────────────────────────────────────────
 
 extern "c" fn gtk_drop_target_new(type: c_ulong, actions: GdkDragAction) *GtkDropTarget;
-extern "c" fn gtk_widget_add_controller(widget: *GtkWidget, controller: *GtkEventController) void;
+const gtk_widget_add_controller = gtk.gtk_widget_add_controller;
 extern "c" fn g_value_get_string(value: *const GValue) ?[*:0]const u8;
 extern "c" fn g_value_get_object(value: *const GValue) ?*GObject;
 /// GdkTexture isn't a fundamental GType (those are baked into GLib);
@@ -84,17 +85,8 @@ extern "c" fn gdk_texture_get_type() c_ulong;
 /// Synchronous PNG encode + write. Returns nonzero on success.
 extern "c" fn gdk_texture_save_to_png(texture: *GdkTexture, filename: [*:0]const u8) c_int;
 
-// g_signal_connect_data is the macro-free entry point, same pattern
-// the rest of the linux platform modules use.
-const GClosureNotify = ?*const fn (data: gpointer, closure: ?*anyopaque) callconv(.c) void;
-extern "c" fn g_signal_connect_data(
-    instance: *anyopaque,
-    detailed_signal: [*:0]const u8,
-    c_handler: *const anyopaque,
-    data: gpointer,
-    destroy_data: GClosureNotify,
-    connect_flags: c_int,
-) c_ulong;
+// Shared GLib signal connect lives in gtk.zig.
+const g_signal_connect_data = gtk.g_signal_connect_data;
 
 // ─── VTE paste ───────────────────────────────────────────────────────
 
@@ -272,13 +264,23 @@ fn formatPayload(out: []u8, text: []const u8) ![]const u8 {
                 if (path_encoded[0] == '/') 0 else i
             else
                 0;
-            const written = writeShellQuoted(out[len..], path_encoded[path_start..], true) catch
+            const bare_path = path_encoded[path_start..];
+            // A bare `file://` with no path (or `file://host` with no
+            // trailing `/`) produces an empty path; emitting `''` to
+            // the shell is worse than a no-op — it noises the prompt
+            // with an empty positional arg. Skip the entry.
+            if (bare_path.len == 0) continue;
+            const written = writeShellQuoted(out[len..], bare_path, true) catch |err| {
+                std.debug.print("dragdrop: payload truncated at {d} entries: {}\n", .{ emitted, err });
                 return out[0..len];
+            };
             len += written;
         } else {
             // Non-file URI on the same drop: paste as-is.
-            const written = writeShellQuoted(out[len..], line, false) catch
+            const written = writeShellQuoted(out[len..], line, false) catch |err| {
+                std.debug.print("dragdrop: payload truncated at {d} entries: {}\n", .{ emitted, err });
                 return out[0..len];
+            };
             len += written;
         }
         emitted += 1;

@@ -28,8 +28,15 @@
 //! Kind, and the notification daemon plays the sound. No separate
 //! subprocess for the common path. `playSound` (the
 //! terminal-bell-driven path that darwin uses for `bell-sound`) is a
-//! stub today — VTE has its own bell signal that we'll wire up once
-//! that subsystem lands.
+//! stub-with-warning: the implicit per-kind sound-name hint already
+//! fires through `deliver`, so attention events DO play a sound on
+//! linux — but a user's `bell-sound` config override is ignored.
+//! `playSound` logs the override name on first call so the gap is
+//! visible (`tools.zig` invokes it whenever `sendKind` succeeds,
+//! once per 30s per (kind, client) bucket by rate-limit default).
+//! The proper wiring lands when VTE's `bell` signal is connected:
+//! either send a second notification with the user-supplied
+//! sound-name, or call libcanberra's `ca_context_play_full`.
 //!
 //! Rate-limit logic is duplicated from `notify/darwin.zig` rather
 //! than DRY'd into a shared file: `src/notify/` is on the don't-touch
@@ -40,6 +47,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const gdbus = @import("gdbus.zig");
+
+/// Single-shot latch for `playSound`'s first-call warning. Module
+/// scope (not per-Notifier) because the message describes a
+/// platform-wide capability gap, not a per-instance state — and the
+/// `playSound` signature takes `*const Notifier`, matching darwin,
+/// so per-instance mutation isn't available without a wider API
+/// change.
+var play_sound_stub_logged: std.atomic.Value(bool) = .init(false);
 
 const GVariant = gdbus.GVariant;
 const GVariantBuilder = gdbus.GVariantBuilder;
@@ -140,11 +155,25 @@ pub const Notifier = struct {
     }
 
     /// Standalone sound playback. Used by darwin for terminal-bell
-    /// (`bell-sound` config). On linux the bell path goes through
-    /// VTE's `bell` signal — until that's wired up this is a no-op.
-    /// Kept on the struct so the surface matches darwin and callers
-    /// compile across platforms.
-    pub fn playSound(_: *const Notifier, _: ?[]const u8) void {}
+    /// (`bell-sound` config). On linux the implicit per-kind hint
+    /// already plays through the notification daemon's `sound-name`
+    /// path; a user's `bell-sound` override is currently ignored.
+    /// Log once per process so the gap is visible — `tools.zig`
+    /// invokes this after every successful `sendKind`, so the call
+    /// rate is bounded by the Notifier's rate-limit ring (30s
+    /// default per (kind, client) bucket). Returns silently
+    /// thereafter to keep stderr quiet for the rest of the session.
+    /// Surface matches darwin so callers compile across platforms.
+    pub fn playSound(_: *const Notifier, name: ?[]const u8) void {
+        if (play_sound_stub_logged.swap(true, .seq_cst)) return;
+        const requested = name orelse "(none)";
+        std.debug.print(
+            "notifier: playSound(\"{s}\") ignored on linux — bell-sound override " ++
+                "needs VTE bell-signal wiring; the per-kind notification " ++
+                "sound-name hint still fires through deliver()\n",
+            .{requested},
+        );
+    }
 
     /// Acquire (or return the cached) session bus connection.
     /// Returns null if the bus is unavailable — caller treats that as
@@ -272,12 +301,56 @@ fn deliver(
 /// Copy `bytes` into `buf`, truncating to len-1 and writing the
 /// trailing NUL. Returns a sentinel-terminated slice pointing into
 /// `buf` — caller is responsible for the buffer's lifetime.
+///
+/// Truncation snaps backward to a UTF-8 code-point boundary so a
+/// multi-byte char isn't split mid-sequence. The freedesktop
+/// `Notify` body field is documented as UTF-8; a half-byte tail
+/// produces an invalid-encoding error on KDE / GNOME notification
+/// daemons and the banner silently disappears.
 fn ztrunc(buf: []u8, bytes: []const u8) [:0]u8 {
     const max = buf.len - 1;
-    const n = @min(bytes.len, max);
+    var n = @min(bytes.len, max);
+    if (n < bytes.len) n = utf8FloorBoundary(bytes, n);
     @memcpy(buf[0..n], bytes[0..n]);
     buf[n] = 0;
     return buf[0..n :0];
+}
+
+/// Walk backward from `cap` to the start of the UTF-8 code point
+/// that `bytes[cap..]` would otherwise begin in the middle of. A
+/// continuation byte has the form `10xxxxxx`; the leading byte of a
+/// multi-byte sequence is `11xxxxxx`. Both ASCII (`0xxxxxxx`) and
+/// "we're at a leader" land cleanly at `cap`. Walks at most three
+/// bytes (longest UTF-8 sequence is 4 bytes — leader + 3 conts).
+/// Returns `cap` unchanged when it's at or past `bytes.len` (caller
+/// is asking for "no truncation"; the byte-index access below would
+/// otherwise read past the slice).
+fn utf8FloorBoundary(bytes: []const u8, cap: usize) usize {
+    if (cap >= bytes.len) return cap;
+    var i: usize = cap;
+    while (i > 0 and (bytes[i] & 0xC0) == 0x80) : (i -= 1) {}
+    return i;
+}
+
+test "ztrunc: ascii truncates byte-exact" {
+    var buf: [8]u8 = undefined;
+    const out = ztrunc(&buf, "hello world");
+    try std.testing.expectEqualStrings("hello w", out);
+}
+
+test "ztrunc: utf-8 snap back from mid-codepoint" {
+    var buf: [4]u8 = undefined; // capacity 3 bytes + NUL
+    // "é" = 0xC3 0xA9 (2 bytes). With cap=3 we'd land on byte 3 of
+    // "éé" (0xC3 0xA9 0xC3 | 0xA9), splitting the second codepoint.
+    // Floor snaps back to byte 2 — the start of the second 'é'.
+    const out = ztrunc(&buf, "éé");
+    try std.testing.expectEqualStrings("é", out);
+}
+
+test "ztrunc: empty input" {
+    var buf: [4]u8 = undefined;
+    const out = ztrunc(&buf, "");
+    try std.testing.expectEqualStrings("", out);
 }
 
 /// Notify signature:

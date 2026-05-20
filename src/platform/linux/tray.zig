@@ -36,6 +36,30 @@
 //! Failure mode: if no SNI watcher is running (bare wlroots compositors
 //! without a panel), the RegisterStatusNotifierItem call errors. We
 //! log and continue — the panel still works via hotkey + IPC.
+//!
+//! Threading model — every entry point in this file runs on the GLib
+//! main thread:
+//!   - `pollAgentTick` fires from `g_timeout_add` (250ms).
+//!   - `Tray.updateState` is called only from `pollAgentTick`.
+//!   - `sniGetProperty` / `sniMethodCall` / `menuGetProperty` /
+//!     `menuMethodCall` are dispatched by GDBus on the default main
+//!     context, which is the GLib main thread.
+//!   - `onWatcherNameOwnerChanged` is a signal subscription on the
+//!     same connection, same thread.
+//!
+//! Consequence: `ctx.state`, `ctx.message_buf`, and `ctx.message_len`
+//! are owned by the GLib main thread. Reads + writes need no explicit
+//! synchronization. If a future caller routes any of these through a
+//! different thread (e.g. emitting a state update from an MCP worker
+//! thread without marshalling via `g_idle_add`), that invariant
+//! breaks and `message_buf` becomes a torn-read hazard.
+//!
+//! Lock ordering w.r.t. AgentState: `pollAgentTick` acquires
+//! `state.mutex` briefly to snapshot, then releases before any DBus
+//! call. MCP worker threads that hold `state.mutex` (via
+//! `appendLogFrom`, `setState`, …) never call back into GLib
+//! synchronously. The waiting direction is one-way: GLib main may
+//! wait on `state.mutex`; state.mutex holders never wait on GLib.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -160,9 +184,14 @@ extern "c" fn g_dbus_connection_emit_signal(
 ) c_int;
 
 // GLib main-loop timer for the poll. Mirrors panel.zig + log_pane.zig.
-const GSourceFunc = *const fn (user_data: gpointer) callconv(.c) c_int;
-extern "c" fn g_timeout_add(interval_ms: c_uint, function: GSourceFunc, user_data: gpointer) c_uint;
-extern "c" fn g_source_remove(tag: c_uint) c_int;
+// Shared GLib timer/source surface — see gtk.zig. Reconciles
+// `g_source_remove`'s prior `c_int` return type with the canonical
+// `gboolean` spelling other modules use. Wire-compatible (gboolean is
+// c_int in GLib), the rename is purely about not having two
+// signatures for the same symbol.
+const GSourceFunc = gtk.GSourceFunc;
+const g_timeout_add = gtk.g_timeout_add;
+const g_source_remove = gtk.g_source_remove;
 
 const G_SOURCE_CONTINUE: c_int = 1;
 
@@ -595,17 +624,19 @@ const Context = struct {
     /// watcher's registration set). 0 means "not subscribed yet" or
     /// "subscription failed" — `deinit` checks before unsubscribing.
     watcher_subscription_id: c_uint = 0,
-    /// Latest agent state. Cached so the SNI property getters can
-    /// return live values without taking the AgentState mutex from a
-    /// DBus callback (could be reached re-entrantly from any host
-    /// thread the GLib worker resolves to). `updateState` writes this
-    /// from the GLib main thread; the property getters read it from
-    /// the same thread, so no synchronization needed.
+    /// Latest agent state. See file-level Threading model: written by
+    /// `updateState` (pollAgentTick), read by `sniGetProperty` (GDBus
+    /// callback). Both run on the GLib main thread — single-writer,
+    /// single-reader, same thread, no synchronization needed. If
+    /// you add a writer that runs off the main thread, marshal via
+    /// `g_idle_add` so this invariant holds.
     state: Agent = .idle,
-    /// Last message accompanying a state transition. Fixed-size buffer
-    /// keeps allocator coupling out of the GDBus callback path. 256
-    /// bytes is more than enough for the kind of "compiling foo.zig"
-    /// status strings these messages carry.
+    /// Last message accompanying a state transition. Same single-thread
+    /// invariant as `state` above — torn reads only become possible
+    /// if a future caller writes this from a non-main thread. The
+    /// 256-byte cap keeps allocator coupling out of the GDBus
+    /// callback path; messages longer than that get truncated by
+    /// `updateState` and the panel host renders the trim.
     message_buf: [256]u8 = undefined,
     message_len: usize = 0,
     /// Observed AgentState, set by `observeAgentState`. Null until

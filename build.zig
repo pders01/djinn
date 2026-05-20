@@ -13,6 +13,19 @@ pub fn build(b: *std.Build) void {
     const is_darwin = tag.isDarwin();
     const is_linux = tag == .linux;
 
+    // System-install gate. `zig build install` from a dev tree should
+    // leave the developer with `zig-out/bin/djinn` and nothing else;
+    // distro packagers and the nix derivation pass
+    // `-Dsystem-install=true` so the linux install step also drops the
+    // `.desktop`, `.service`, LICENSE, and README into their canonical
+    // share/ paths. Darwin ignores the flag — those artifacts are
+    // bundle-shaped on macOS.
+    const system_install = b.option(
+        bool,
+        "system-install",
+        "Install .desktop, systemd user unit, LICENSE, and README to share/ (linux packagers only)",
+    ) orelse false;
+
     // zig-objc: hotkey CGEventTap + menubar. Darwin-only — the
     // dependency itself compiles only on darwin and isn't imported by
     // any non-darwin source file.
@@ -71,13 +84,16 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(exe);
 
     // Linux: ship the canonical .desktop alongside the binary so
-    // packaging recipes that just do `zig build --prefix /usr` install
-    // a system-menu entry too. Pinning to $prefix/share/applications/
-    // (the system path the portal hotkey approval persists against)
-    // is what makes KDE's GlobalShortcuts dialog stop re-prompting on
-    // every upgrade — the autostart entry in ~/.config/autostart/ has
-    // a different scope and identity. Skipped on darwin (no equivalent).
-    if (is_linux) {
+    // packaging recipes that just do `zig build --prefix /usr install
+    // -Dsystem-install=true` populate a system-menu entry too. Pinning
+    // to $prefix/share/applications/ (the system path the portal hotkey
+    // approval persists against) is what makes KDE's GlobalShortcuts
+    // dialog stop re-prompting on every upgrade — the autostart entry
+    // in ~/.config/autostart/ has a different scope and identity.
+    // Gated on -Dsystem-install so a developer's `zig build run` from
+    // a checkout doesn't pollute zig-out/share/ with files only useful
+    // when staging into /usr. Skipped on darwin (no equivalent).
+    if (is_linux and system_install) {
         b.installFile(
             "contrib/packaging/djinn.desktop",
             "share/applications/djinn.desktop",
@@ -94,6 +110,14 @@ pub fn build(b: *std.Build) void {
             "contrib/packaging/djinn.service",
             "lib/systemd/user/djinn.service",
         );
+        // LICENSE + README land under share/ at freedesktop-conventional
+        // paths so `zig build uninstall` (when it lands upstream) can
+        // remove them as part of the same transaction. Distro recipes
+        // (PKGBUILD, debian/rules) no longer need an out-of-band
+        // `install -Dm644` step — the orphan-on-uninstall hole that
+        // hand-placed files leave is closed.
+        b.installFile("LICENSE", "share/licenses/djinn/LICENSE");
+        b.installFile("README.md", "share/doc/djinn/README.md");
     }
 
     const run_cmd = b.addRunArtifact(exe);

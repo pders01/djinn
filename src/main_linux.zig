@@ -24,7 +24,17 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Config = @import("config.zig").Config;
-const platform = @import("platform.zig");
+// Direct import of the linux platform aggregator — `platform.zig` is
+// the cross-OS narrow surface (just `Notifier` + `NotifyKind` for
+// `mcp/tools.zig` today). Linux-only consumers (panel, terminal,
+// hotkey, tray, watcher, autostart, log_pane, ghostty_config, keymap)
+// would have to detour through `platform.zig`'s comptime switch +
+// darwin-stub branches with no caller-visible benefit. Darwin's
+// `src/main.zig` follows the same convention — it goes directly to
+// `hotkey/darwin.zig`, `notify/menubar.zig`, etc. The result is a
+// platform.zig that's truly minimal and not a kitchen sink of
+// abstractions that don't pay rent.
+const platform = @import("platform/linux.zig");
 const AgentState = @import("agent/state.zig").AgentState;
 const ToolTable = @import("mcp/tools.zig").ToolTable;
 const Dispatcher = @import("mcp/dispatch.zig").Dispatcher;
@@ -42,11 +52,36 @@ const persist = @import("state/persist.zig");
 const GSourceFunc = *const fn (user_data: ?*anyopaque) callconv(.c) c_int;
 extern "c" fn g_unix_signal_add(signum: c_int, function: GSourceFunc, user_data: ?*anyopaque) c_uint;
 
+/// `g_timeout_add` callback shape: returns 1 to keep the source
+/// firing on its interval, 0 to remove it after this dispatch.
+/// Used by the recurring drag-drop reaper. Same shape as
+/// `GSourceFunc` above but the body returns a constant 1 instead of
+/// re-arming bookkeeping.
+const G_SOURCE_CONTINUE: c_int = 1;
+extern "c" fn g_timeout_add(interval_ms: c_uint, function: GSourceFunc, user_data: ?*anyopaque) c_uint;
+
+/// Cadence for the periodic reaper, in milliseconds. 30 minutes is
+/// short enough that a long-running session keeps /tmp tidy, long
+/// enough that the cost (one /tmp scan) stays negligible. The age
+/// threshold inside the reaper is still 1h — the periodic schedule
+/// just bounds how long a stale temp lingers past that threshold.
+const dragdrop_reap_interval_ms: c_uint = 1_800_000;
+
+/// `g_timeout_add` body for the periodic reaper. Mirrors the
+/// startup call's behavior — best-effort, never surfaces errors.
+/// Returns `G_SOURCE_CONTINUE` so the source stays armed across
+/// the session.
+fn reapDragDropTempsTick(_: ?*anyopaque) callconv(.c) c_int {
+    reapDragDropTemps();
+    return G_SOURCE_CONTINUE;
+}
+
 /// Scan /tmp for `djinn-drop-*.png` files older than 1h and remove
-/// them. Called once at startup so /tmp doesn't grow unboundedly
-/// across launches — the image-drop path in `dragdrop.zig` writes
-/// here with random-suffix filenames and never cleans up its own
-/// trail (pasting the path means a downstream consumer may still be
+/// them. Called at startup AND every `dragdrop_reap_interval_ms`
+/// thereafter so a long-running session doesn't accumulate temps
+/// indefinitely — the image-drop path in `dragdrop.zig` writes here
+/// with random-suffix filenames and never cleans up its own trail
+/// (pasting the path means a downstream consumer may still be
 /// reading the file). Mirrors `reapDragDropTemps` in main.zig:309.
 /// Failures are silent; a stale temp is annoying, not breaking.
 fn reapDragDropTemps() void {
@@ -55,7 +90,17 @@ fn reapDragDropTemps() void {
     const now = std.time.timestamp();
     const max_age_s: i64 = 3600;
     var it = dir.iterate();
-    while (it.next() catch return) |entry| {
+    // Skip past iteration errors instead of returning — `dir.iterate`'s
+    // `next` can fail per-entry on a transient permission or stat
+    // race in /tmp (other users' files), and the previous shape
+    // abandoned the rest of the directory at the first such hiccup
+    // and left valid djinn-drop temps unreaped. Hard failures
+    // (closed fd, OOM in the iterator) keep recurring on the next
+    // tick — best-effort, log nothing because /tmp noise from other
+    // users isn't actionable.
+    while (true) {
+        const maybe_entry = it.next() catch continue;
+        const entry = maybe_entry orelse break;
         if (entry.kind != .file) continue;
         if (!std.mem.startsWith(u8, entry.name, "djinn-drop-")) continue;
         if (!std.mem.endsWith(u8, entry.name, ".png")) continue;
@@ -255,10 +300,14 @@ const Dispatch = struct {
                     "config: hotkey rebound to \"{s}\"\n",
                     .{new_config.hotkey.toggle},
                 );
-            } else |err| {
+            } else |_| {
+                // hotkey.zig already printed the aggregate
+                // "portal unavailable — <reason>" line. Note that
+                // the previous binding survives because we only
+                // deinit the old slot on the success branch above.
                 std.debug.print(
-                    "config: hotkey rebind to \"{s}\" failed: {} — previous binding still active\n",
-                    .{ new_config.hotkey.toggle, err },
+                    "config: previous hotkey binding still active\n",
+                    .{},
                 );
             }
         }
@@ -353,10 +402,20 @@ fn logDispatchUnready(field: []const u8) void {
 /// three fail the caller keeps the previous config in place.
 fn loadConfigWithRetry(allocator: std.mem.Allocator) ?Config {
     var attempt: u8 = 0;
+    var first_err: ?anyerror = null;
     while (attempt < 3) : (attempt += 1) {
         if (attempt > 0) std.Thread.sleep(20 * std.time.ns_per_ms);
-        if (Config.load(allocator)) |cfg| return cfg else |_| {}
+        if (Config.load(allocator)) |cfg| return cfg else |err| {
+            if (first_err == null) first_err = err;
+        }
     }
+    // EACCES, malformed UTF-8, parse errors all looked identical
+    // to a transient atomic-rename ENOENT under the prior shape, so
+    // the retries burned silently on a permanent failure. Log the
+    // first error before giving up — the user staring at the
+    // generic "reload failed after retries" line then has a clue
+    // whether it's worth investigating.
+    if (first_err) |e| std.debug.print("config: load failed: {}\n", .{e});
     return null;
 }
 
@@ -574,7 +633,10 @@ pub fn main() !void {
     // whether we'll have to fall back to a plain toplevel window.
     var probe_arena = std.heap.ArenaAllocator.init(allocator);
     defer probe_arena.deinit();
-    const caps = platform.Panel.detect(probe_arena.allocator());
+    const caps = platform.Panel.detect(probe_arena.allocator()) catch |err| {
+        std.debug.print("host probe failed: {}\n", .{err});
+        return err;
+    };
 
     std.debug.print(
         "host probe — wayland={} gtk4={} layer_shell={} desktop=\"{s}\"\n",
@@ -601,8 +663,12 @@ pub fn main() !void {
     // Sweep stale image-drop temp files from a previous session
     // before the user can produce new ones. Best-effort; permission
     // errors on /tmp just leave the entries lying around. See the
-    // reaper function for the naming + age cutoff.
+    // reaper function for the naming + age cutoff. The recurring
+    // `g_timeout_add` below keeps /tmp tidy across long-running
+    // sessions — a 9-hour workday with 100 image drops would
+    // otherwise let those temps accumulate until djinn restarts.
     reapDragDropTemps();
+    _ = g_timeout_add(dragdrop_reap_interval_ms, reapDragDropTempsTick, null);
 
     // Open the borderless panel. Layer-shell anchors it to the top of
     // the screen when available; otherwise it's a plain undecorated
@@ -801,17 +867,16 @@ pub fn main() !void {
     // compositor's native hotkey to the same socket if the portal isn't
     // available (no portal backend installed, GlobalShortcuts not
     // implemented by this compositor's portal, etc.).
+    // Sync failure paths inside `Hotkey.init` print their own
+    // "hotkey: portal unavailable — <reason>" log via the aggregate
+    // reporter; the IPC bridge above keeps scripted toggles working
+    // either way. Don't re-log here — duplicate lines obscure which
+    // outcome was the definitive one.
     var maybe_hotkey: ?platform.Hotkey = platform.Hotkey.init(
         allocator,
         .{ .ctx = @ptrCast(&g_dispatch), .on_activated = Dispatch.onHotkey },
         config.hotkey.toggle,
-    ) catch |err| blk: {
-        std.debug.print(
-            "hotkey portal init failed: {} — IPC bridge still active\n",
-            .{err},
-        );
-        break :blk null;
-    };
+    ) catch null;
     defer if (maybe_hotkey) |*h| h.deinit();
     g_dispatch.hotkey = &maybe_hotkey;
 
@@ -1000,4 +1065,169 @@ test {
     _ = @import("platform/linux/ghostty_config.zig");
     _ = @import("platform/linux/keymap.zig");
     _ = @import("platform/linux/log_pane.zig");
+}
+
+// ─── main_linux smoke tests ──────────────────────────────────────────
+//
+// The watcher reload path (`Dispatch.onConfigChanged`) drives GTK on
+// the main thread, so the full flow can't run under `zig build test`.
+// What CAN be tested without a GTK display is the pure-data plumbing
+// the reload depends on:
+//
+//   - Config parse + deinit round-trip — proves the live-reload swap
+//     can drop a Config without leaks.
+//   - buildThemeOptions merge order — proves djinn config wins over
+//     ghostty inheritance on every field (regressing this would
+//     silently make ghostty's palette override the user's explicit
+//     `theme.background = …` on every save).
+//   - mergeColor priority — same property at the leaf.
+//
+// These are the smoke tests called out as priority #2 in TODO.md's
+// "Code review backlog". The full GTK-bound `onConfigChanged` flow
+// stays covered by manual smoke runs on a Wayland session.
+
+test "Config: parse + deinit round-trip" {
+    const a = std.testing.allocator;
+    const src =
+        \\hotkey = ctrl+shift+space
+        \\window-width = 1200
+        \\window-height = 600
+        \\background = #112233
+        \\font-size = 16
+        \\
+    ;
+    var cfg = try Config.parse(a, src);
+    defer cfg.deinit();
+    try std.testing.expectEqualStrings("ctrl+shift+space", cfg.hotkey.toggle);
+    try std.testing.expectEqual(@as(?u32, 1200), cfg.window.width);
+    try std.testing.expectEqual(@as(?u32, 600), cfg.window.height);
+    try std.testing.expectEqualStrings("#112233", cfg.theme.background.?);
+    try std.testing.expectEqual(@as(?f64, 16), cfg.terminal.font_size);
+}
+
+test "Config: default-constructed deinit is a no-op" {
+    // The live-reload path swaps in a freshly-loaded Config and
+    // deinit's the prior one. The very first Config in `main_linux.zig`
+    // comes from `loadOrDefault`, which returns `Config{}` when no
+    // file exists. Deinit on that default value must be safe.
+    var cfg: Config = .{};
+    cfg.deinit();
+}
+
+test "mergeColor: djinn hex wins over ghostty" {
+    const ghostty: ?platform.GhosttyColors = .{
+        .background = .{ .r = 0, .g = 0, .b = 0 },
+    };
+    const c = mergeColor("#ff8040", ghostty, .background).?;
+    try std.testing.expectEqual(@as(u8, 0xff), c.r);
+    try std.testing.expectEqual(@as(u8, 0x80), c.g);
+    try std.testing.expectEqual(@as(u8, 0x40), c.b);
+}
+
+test "mergeColor: ghostty fills gaps when djinn is null" {
+    const ghostty: ?platform.GhosttyColors = .{
+        .foreground = .{ .r = 0xab, .g = 0xcd, .b = 0xef },
+    };
+    const c = mergeColor(null, ghostty, .foreground).?;
+    try std.testing.expectEqual(@as(u8, 0xab), c.r);
+    try std.testing.expectEqual(@as(u8, 0xcd), c.g);
+    try std.testing.expectEqual(@as(u8, 0xef), c.b);
+}
+
+test "mergeColor: returns null when neither source has a value" {
+    try std.testing.expect(mergeColor(null, null, .cursor) == null);
+    const ghostty: ?platform.GhosttyColors = .{};
+    try std.testing.expect(mergeColor(null, ghostty, .cursor) == null);
+}
+
+test "mergeColor: malformed djinn hex falls through to ghostty" {
+    // Reload safety: a user typo in `theme.background` shouldn't blank
+    // the panel — fall back to whatever ghostty resolved.
+    const ghostty: ?platform.GhosttyColors = .{
+        .background = .{ .r = 0x10, .g = 0x20, .b = 0x30 },
+    };
+    const c = mergeColor("not-a-hex", ghostty, .background).?;
+    try std.testing.expectEqual(@as(u8, 0x10), c.r);
+}
+
+test "buildThemeOptions: djinn config wins on every field" {
+    const a = std.testing.allocator;
+    const src =
+        \\font-family = "Cascadia Code"
+        \\font-size = 13
+        \\background = #010203
+        \\foreground = #040506
+        \\cursor-color = #070809
+        \\opacity = 0.75
+        \\padding-x = 8
+        \\padding-y = 4
+        \\
+    ;
+    var cfg = try Config.parse(a, src);
+    defer cfg.deinit();
+
+    // Ghostty values present for every field — djinn config should
+    // shadow them.
+    const ghostty: ?platform.GhosttyColors = .{
+        .background = .{ .r = 0xff, .g = 0xff, .b = 0xff },
+        .foreground = .{ .r = 0xff, .g = 0xff, .b = 0xff },
+        .cursor = .{ .r = 0xff, .g = 0xff, .b = 0xff },
+        .font_family = "Ghostty Font",
+        .font_size = 99,
+    };
+
+    const opts = buildThemeOptions(&cfg, ghostty);
+    try std.testing.expectEqualStrings("Cascadia Code", opts.font_family.?);
+    try std.testing.expectEqual(@as(?f64, 13), opts.font_size);
+    try std.testing.expectEqual(@as(u8, 0x01), opts.background.?.r);
+    try std.testing.expectEqual(@as(u8, 0x04), opts.foreground.?.r);
+    try std.testing.expectEqual(@as(u8, 0x07), opts.cursor.?.r);
+    try std.testing.expectEqual(@as(?f64, 8), opts.padding_x);
+    try std.testing.expectEqual(@as(?f64, 4), opts.padding_y);
+    try std.testing.expectEqual(@as(?f64, 0.75), opts.opacity);
+}
+
+test "buildThemeOptions: ghostty fills gaps when djinn unset" {
+    const a = std.testing.allocator;
+    var cfg = try Config.parse(a, "");
+    defer cfg.deinit();
+
+    const ghostty: ?platform.GhosttyColors = .{
+        .background = .{ .r = 0xaa, .g = 0xbb, .b = 0xcc },
+        .font_family = "Inherited",
+        .font_size = 11,
+        .palette = blk: {
+            var p: [16]?platform.ghostty_config.Rgb = .{null} ** 16;
+            p[3] = .{ .r = 1, .g = 2, .b = 3 };
+            break :blk p;
+        },
+    };
+
+    const opts = buildThemeOptions(&cfg, ghostty);
+    try std.testing.expectEqualStrings("Inherited", opts.font_family.?);
+    try std.testing.expectEqual(@as(?f64, 11), opts.font_size);
+    try std.testing.expectEqual(@as(u8, 0xaa), opts.background.?.r);
+    // theme-opacity unset, window.opacity defaults to 0.95.
+    try std.testing.expectEqual(@as(?f64, 0.95), opts.opacity);
+    // Palette is ghostty-only.
+    try std.testing.expectEqual(@as(u8, 2), opts.palette[3].?.g);
+}
+
+test "buildThemeOptions: no ghostty inheritance" {
+    const a = std.testing.allocator;
+    var cfg = try Config.parse(a, "background = #abcdef\n");
+    defer cfg.deinit();
+
+    const opts = buildThemeOptions(&cfg, null);
+    try std.testing.expectEqual(@as(u8, 0xab), opts.background.?.r);
+    try std.testing.expect(opts.foreground == null);
+    try std.testing.expect(opts.font_family == null);
+    // Palette stays all-null when ghostty isn't inherited.
+    for (opts.palette) |slot| try std.testing.expect(slot == null);
+}
+
+test "strOptEql: identity" {
+    try std.testing.expect(strOptEql("ctrl+space", "ctrl+space"));
+    try std.testing.expect(!strOptEql("ctrl+space", "alt+space"));
+    try std.testing.expect(strOptEql("", ""));
 }

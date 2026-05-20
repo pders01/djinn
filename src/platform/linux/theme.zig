@@ -52,8 +52,8 @@ const GdkRGBA = extern struct {
 };
 
 const PangoFontDescription = opaque {};
-const GtkCssProvider = opaque {};
-const GdkDisplay = opaque {};
+const GtkCssProvider = gtk.GtkCssProvider;
+const GdkDisplay = gtk.GdkDisplay;
 
 // ─── External surface ────────────────────────────────────────────────
 
@@ -99,23 +99,17 @@ extern "c" fn pango_font_map_list_families(
     n_families: *c_int,
 ) void;
 extern "c" fn pango_font_family_get_name(family: *PangoFontFamily) [*:0]const u8;
-extern "c" fn g_free(mem: ?*anyopaque) void;
+const g_free = gtk.g_free;
 
 // CSS provider — global so we don't need gtk_widget_get_style_context
 // (deprecated in GTK 4.10). The `vte-terminal` selector matches by
 // widget type name; djinn has a single VTE instance, so the targeting
-// is unambiguous.
-extern "c" fn gtk_css_provider_new() *GtkCssProvider;
-extern "c" fn gtk_css_provider_load_from_string(
-    provider: *GtkCssProvider,
-    css: [*:0]const u8,
-) void;
-extern "c" fn gtk_style_context_add_provider_for_display(
-    display: *GdkDisplay,
-    provider: *anyopaque,
-    priority: c_uint,
-) void;
-extern "c" fn gdk_display_get_default() ?*GdkDisplay;
+// is unambiguous. Provider externs live in gtk.zig now (also used by
+// log_pane.zig).
+const gtk_css_provider_new = gtk.gtk_css_provider_new;
+const gtk_css_provider_load_from_string = gtk.gtk_css_provider_load_from_string;
+const gtk_style_context_add_provider_for_display = gtk.gtk_style_context_add_provider_for_display;
+const gdk_display_get_default = gtk.gdk_display_get_default;
 
 /// Mirrors `GTK_STYLE_PROVIDER_PRIORITY_APPLICATION` from
 /// `gtkstyleprovider.h`. Sits above theme defaults so our padding
@@ -319,6 +313,13 @@ fn applyCursorColor(terminal: *VteTerminal, opts: Options) void {
 /// display. First call creates + adds the provider; subsequent calls
 /// reload its content in place. CSS shorthand puts vertical first,
 /// horizontal second, matching GTK's box model.
+///
+/// Both buf-print failures and an empty-CSS reload now log + return
+/// without touching the provider. The prior shape silently dropped
+/// half-written CSS strings on `bufPrint` `NoSpace` and loaded an
+/// empty string (no rules) when neither padding nor opacity was
+/// set, which silently disabled any previously-applied padding /
+/// transparency without the user knowing why.
 fn applyCss(opts: Options) void {
     var css_buf: [512]u8 = undefined;
     var css_len: usize = 0;
@@ -330,7 +331,10 @@ fn applyCss(opts: Options) void {
             css_buf[css_len..],
             "vte-terminal {{ padding: {d}px {d}px; }}",
             .{ py, px },
-        ) catch return;
+        ) catch |err| {
+            std.debug.print("theme: padding CSS overflowed buf: {}\n", .{err});
+            return;
+        };
         css_len += w.len;
     }
 
@@ -352,11 +356,21 @@ fn applyCss(opts: Options) void {
                     "window > * {{ background-color: transparent; }} " ++
                     "vte-terminal, vte-terminal.terminal {{ background-color: transparent; }}",
                 .{},
-            ) catch return;
+            ) catch |err| {
+                std.debug.print("theme: opacity CSS overflowed buf: {}\n", .{err});
+                return;
+            };
             css_len += w.len;
         }
     }
 
+    // Empty buffer = neither padding nor opacity is set. Loading
+    // the empty sentinel string into the provider would clear any
+    // prior rules — fine if that's what the caller wants, but it's
+    // distinct from "first apply with no theme overrides", which
+    // should leave the GTK theme defaults alone. Skip the load so
+    // we don't perturb the display.
+    if (css_len == 0) return;
     if (css_len >= css_buf.len) return;
     css_buf[css_len] = 0;
     const css: [*:0]const u8 = @ptrCast(css_buf[0..css_len :0].ptr);
