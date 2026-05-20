@@ -8,248 +8,39 @@ points you at the source.
 
 ## Priority order
 
-The original Important / Minor tiers have largely drained — see the
-History block under `## Code review backlog` for the chain. Multi-
-profile Phases 0/1/2 (foundation, tab strip + keyboard switching,
-palette switcher) have all landed. Restart-session + per-profile
-window-size memory also landed this pass; remaining work is
-structural refactors and the opportunistic darwin-parity ports.
+The Linux port is consolidated as four commits on top of the
+shared `main` baseline; the granular prototype history is parked
+on the `archive/linux/pre-squash-after-prototype` branch (local
+and on the personal upstream) for anyone who wants to read the
+chain. The original Important / Minor code-review tiers landed
+during the prototype phase; remaining work is opportunistic
+darwin-parity ports and the deferred per-action user_data
+refactor.
 
-1. **Darwin-parity opportunistic ports** — right-click "Copy entry"
-   in log pane, per-client header color, filter prefix syntax +
-   level pills, tab-strip agent-state dot, palette enrichment +
-   duplicate-active row. Each waits on a separate session because
-   the surrounding code is unfamiliar; see the Tier A darwin parity
-   block further down for the shape of each.
+1. **Darwin-parity opportunistic ports for linux**: right-click
+   "Copy entry" in log pane, per-client header color, filter
+   prefix syntax + level pills, tab-strip agent-state dot, and
+   palette enrichment + duplicate-active row already shipped on
+   darwin (see the consolidated multi-profile commit); each
+   waits on a separate session to land its linux counterpart
+   because the surrounding code is unfamiliar. The Tier A block
+   under `## Pick-up plan` has the per-feature shape.
 2. **Per-action `*anyopaque` user_data for keymap actions** (deferred).
    Today every handler takes `*Context` and reaches for the slots it
-   needs; the Context refactor this pass split popover slots into a
-   `Popovers` sub-struct but kept the single-context shape. A genuine
-   per-action user_data refactor would let each row carry its own
-   dependency type, with comptime-generated wrappers casting back.
-   Not justified at today's 32-row count — the cost of type-erasing
-   every handler outweighs the structural-clarity win. Revisit if
-   the action table doubles.
-
-Most recent batch (older ones are in the History block at the bottom
-of `## Code review backlog`):
-
-- **`log_pane.zig` structural refactor** — pulled `writeThemedCss`
-  (~280 lines) into `log_pane_css.zig`; pulled filter + header
-  bookkeeping (filter_buf / filter_len / last_client_*, plus
-  `matchesFilter` / `shouldEmitHeader` / `updateLastClient` /
-  `setFilter` / `resetGrouping` / `hasActiveFilter`) into a
-  `LogModel` struct in `log_model.zig`. LogPane now holds a
-  `model: LogModel = .{}` and delegates from the hot
-  `appendRangeLocked` path. log_pane.zig dropped from 1495 to 1021
-  lines; the pure-data model has its own 10-test suite that no
-  longer needs a fake LogPane stack-allocation to poke at. Filter
-  state observation (`refreshPlaceholder` checks for "no matches"
-  placeholder) goes through `model.hasActiveFilter()`. The CSS
-  extraction module mirrors `tab_strip.writeThemedCss` and
-  `palette.writeThemedCss` shape — each chrome module owns its
-  themed CSS in a sibling file rather than inline.
-- **`keymap.zig` Popovers sub-group + service-registry framing** —
-  the three late-stamped popover slots (`find_overlay`,
-  `cheatsheet`, `palette`) collapsed into a single
-  `Popovers` struct. Doc-comment now articulates the
-  service-registry pattern + a field-usage map (which actions read
-  which slot) so readers don't grep the whole file to find the
-  dependency graph. Field count dropped from 9 to 7 visible at the
-  top level. Per-action `*anyopaque` user_data refactor stays
-  available but is deferred (see priority #2 above) — at 32 rows
-  the current shape is honest about the dependency graph; a
-  per-action split would mostly type-erase the same information
-  across more pointers.
-- **Hide-on-blur popover-grab suppression** — `Ctrl+Shift+F` and
-  `Ctrl+Shift+P` were dismissing the panel on KWin Wayland: GTK4's
-  `autohide=true` popovers (find overlay, palette) grab keyboard
-  input at popup, which makes the parent toplevel report
-  `is-active=false` even though focus has just landed on the
-  popover's GtkSearchEntry. `setHideOnBlur` then fired and hid
-  djinn the instant the popover appeared. Fix is a popover-grab
-  counter on `Panel`: `pushPopoverGrab` / `popPopoverGrab` bump
-  the counter on `show` / `closed` signals from each tracked
-  popover, and `onActiveChanged` short-circuits while the
-  counter is non-zero. `Panel.trackPopoverGrabs(popover)` wires
-  the signals; `find_overlay.popoverWidget()` and
-  `palette.popoverWidget()` expose the underlying popover so
-  main_linux can register both. `popPopoverGrab` re-runs the
-  hide check when the counter drops to zero so an app-switch
-  with a popover open still lands the panel hide (the
-  active=false event was suppressed at the time it fired). A
-  `gtk_window_get_focus`-based heuristic was tempting but GTK4
-  retains the focus child across legitimate app-switches, so
-  it can't distinguish "popover grabbed focus inside me" from
-  "user clicked another app and I still remember my last focus
-  child."
-- **Multi-session exit refinement** — inactive session's
-  `child-exited` no longer quits the panel. `Terminal.Handler`
-  grew an `extra: usize` payload; SessionHost stamps the
-  session idx into each per-VTE handler (`spawnInto` and
-  `restartActive` both route through a new `handlerFor(idx)`
-  helper that copies the shared template and overwrites
-  `.extra`). `Dispatch.onChildExited(ctx, idx)` branches on
-  `sm.active_idx`: active match → `panel.quit()` (preserves
-  the "typing `exit` closes djinn" gesture); else
-  `host.markExited(idx, true)`, which flips
-  `Entry.exited` and fans the new `on_exit_changed` hook.
-  Tab strip listens via `markExited(idx, exited)` and adds /
-  removes `.djinn-tab-exited`. CSS dims the chip (alpha
-  0.35), italicizes the label, and strikes the label text
-  through (targets `> label` because GTK4 paints chip text via
-  a label child node). `restartActive` clears the bit AFTER
-  the new spawn lands (so a partial failure leaves the chip
-  showing exited), and `markExited` is idempotent so the
-  normal "Ctrl+R on a live session" path is a no-op.
-
-- **`session_host.zig` Entry.name_z stack-pointer bug fix** —
-  the init loop wrote each Entry as a stack-local `e`, set
-  `e.name_z = written.ptr` (pointing into `&e.name[0]`), then
-  copied the value into the array via `appendAssumeCapacity`.
-  `name_z` still aliased the loop frame, so every stored
-  `name_z` resolved to the last iteration's `e.name` buffer
-  (e.g. `"session-N-1"` for an N-profile config). Symptoms:
-  `gtk_stack_add_named` collided on every non-eager spawn
-  (`duplicate child name in GtkStack: session-N-1` in the
-  journal), `gtk_stack_set_visible_child_name` always selected
-  the same slot, and profile switching was visually a no-op.
-  Fix: append the Entry first, then `bufPrintZ` into the
-  stored slot's `name` buffer and point `name_z` at it; the
-  stored slot is heap-stable post-init (`ensureTotalCapacity`
-  reserved up front, no further appends) so the pointer
-  survives.
-- **Restart-session (Ctrl+R) + drop-to-shell (Ctrl+Shift+R)** —
-  `SessionHost.restartActive(override_cmd)` replaces the active
-  VTE widget in place. The first attempt used
-  `vte_terminal_set_pty(t, NULL)` to hangup the child + a deferred
-  `spawn_async` to re-fork into the same widget; that path
-  NULL-derefs at +0x18 inside VTE 0.84's PTY dispose chain
-  (`set_pty -> inner helper -> libvte+0x4a7b4`) and crashed the
-  panel every Ctrl+R. The deployed shape sidesteps the buggy
-  codepath entirely: build a fresh `Terminal` first (so an OOM
-  doesn't strand the slot empty), `Terminal.detachExitHandler`
-  on the old (so widget destroy can't fan child-exited out as
-  `panel.quit`), `gtk_stack_remove` the old widget (which
-  finalizes it, closes the pty, sends SIGHUP to the child),
-  `deinit` the old Terminal's owned strings, then
-  `gtk_stack_add_named` the fresh widget under the same stack
-  name. Tab strip, log pane, and window position all preserved;
-  matches darwin's `restartSurfaceCallback` (free old surface,
-  bind a fresh one to the same NSView). `override_cmd = null`
-  keeps the profile's command (`Ctrl+R`); `override_cmd =
-  "/bin/zsh"` drops to the shell fallback (`Ctrl+Shift+R`).
-  Keymap action table grew to 32 rows.
-- **Per-profile window-size memory** — `SessionHost.on_switch`
-  hook ctx switched from `&tab_strip` to `&g_dispatch` so the
-  callback can fan to both the chip refresh AND a new
-  `Dispatch.applyProfileWindowSize` that reads `state.json` and
-  resizes the panel to the per-profile dims. Mirrors darwin's
-  `applyProfileWindowSize` in `src/ghostty/surface_lifecycle.zig`.
-  Producer side was already wired (`onPanelResize` plumbs the
-  active profile name into `persist.saveDebounced`); this lands
-  the reader half. Config-pinned `window-width` / `window-height`
-  short-circuit so editing the file always wins over state.json.
-
-- **Multi-profile Phase 2 — Ctrl+Shift+P palette switcher** —
-  `src/platform/linux/palette.zig` owns a `GtkPopover` anchored to
-  `host.widget()` (the GtkStack, so the popover survives profile
-  switches) with a vertical box: `GtkSearchEntry` on top,
-  `GtkScrolledWindow → GtkListBox` underneath. One
-  `GtkListBoxRow` per profile, label widget child. Type-to-filter
-  via case-insensitive substring match against pre-lowercased
-  `label + name` haystacks (one buffer per profile, alloc'd at
-  init); `gtk_list_box_set_filter_func` reads the cached needle
-  on each `search-changed`. Up/Down/Return/Escape intercepted by
-  a CAPTURE-phase `GtkEventControllerKey` on the entry so the
-  user types into a focused entry while keyboard-navigating the
-  visible filtered rows; Enter fires the same `OnActivate` hook
-  the tab strip uses (routes through `host.activate(idx)`, fans
-  `on_switch` to the chip strip). Selection mode BROWSE keeps
-  one row selected at all times so Enter always has a target.
-  Module-local `GtkCssProvider` reload-in-place on `applyTheme`,
-  same pattern as `tab_strip.zig` / `log_pane.zig`; selected-row
-  accent fill from `palette[4]` (blue ANSI slot) with
-  `@accent_color` fallback. Drive-by fix: tab_strip + palette
-  both `gtk_css_provider_load_from_string` calls now append a
-  trailing `\0` to the build buffer — without it the parser
-  reads past `buf.items.len` and the second provider (palette)
-  perturbed allocator layout enough to surface as
-  `Theme parser error: <data>:27:398: Expected '{' after
-  selectors` warnings against tab_strip's CSS. `log_pane`
-  already does this. Banner reads `installed 30/30` on startup;
-  `palette_open` row gated by `predHasMultipleProfiles` so
-  single-profile setups propagate Ctrl+Shift+P unchanged.
-- **`log_pane.pairWithSibling` end_child repair** — was passing
-  `self.scrolled` to `gtk_paned_set_end_child` even though
-  `scrolled` is appended to `self.container` in `init`. The
-  `gtk_paned_set_end_child: assertion 'child == NULL || ... ||
-  gtk_widget_get_parent (child) == NULL' failed` Gtk-CRITICAL
-  in the journal was this; GTK either silently no-op'd or
-  reparented scrolled out of container, leaving `self.container`
-  (the widget `setVisible` / `toggleVisible` toggle) orphaned
-  outside the widget tree. Ctrl+/ logged the toggle but the user
-  saw nothing. Fix passes `self.container` to `set_end_child`
-  so the whole composite (attention chip + scrolled list +
-  search entry) lands in the paned and visibility flips work.
-- **Cheatsheet popover renders + stays open** —
-  `cheatsheet.zig` had two bugs surfaced once a multi-profile
-  user actually pressed Ctrl+? in production: (1) `autohide=true`
-  on a popover whose only child is a non-focusable `GtkLabel`
-  flipped the panel window's `notify::is-active` off on popup,
-  and with `hide-on-blur = true` the whole panel hid itself
-  right after the popup, looking like Ctrl+? hides djinn; (2)
-  without an explicit `gtk_popover_set_pointing_to`, GTK used
-  the anchor's full allocation rect as the target and could not
-  fit a ~400px-tall popover at any edge of the full-window-sized
-  GtkStack, so it clipped invisibly. Fix: `autohide=false` (Ctrl+?
-  already toggles dismiss), and `open()` recomputes a 1×1
-  pointing-to rect at the anchor's horizontal center / ~1/8 from
-  the top each popup so panel resizes keep it centered.
-  Find overlay + palette stay autohide=true because their
-  `GtkSearchEntry` anchors focus correctly.
-- **`just install-arch` ExecStart rewrite** — `contrib/packaging/
-  djinn.service` bakes `ExecStart=/usr/bin/djinn` (the AUR
-  install path). Copying it to `/usr/local/lib/systemd/user/`
-  without rewriting left the unit pointing at a missing binary
-  after a same-system AUR uninstall, producing
-  `status=203/EXEC` and `start-limit-hit`. The recipe now
-  appends a `sudo sed -i 's|^ExecStart=/usr/bin/djinn$|
-  ExecStart=/usr/local/bin/djinn|'` after the install copy.
-
-The previous batch — **Multi-profile Phase 1, tab strip +
-keyboard switching** — landed `src/platform/linux/tab_strip.zig`
-plus the 11-row keymap expansion (`next_tab` / `prev_tab` /
-`tab_1..9`) and the `SessionHost.on_switch` fan-out hook the
-palette also rides. Behavioral note from the earlier foundation
-batch is still in force: with no `profile.*` lines, the
-synthesized "default" profile spawns `Config.getProviderCommand()`
-— `/bin/zsh` for generic — instead of `$SHELL`. Matches darwin.
-Debian/Ubuntu users without zsh need `provider-command = /bin/bash`
-or `zsh` installed.
-
-The Minor code-shape pass landed this batch: `Terminal.argv` is a
-slice (drops the magic-2 length on the deinit reconstitution);
-hotkey's two signal subscribes carry matching errdefers so a
-future fallible insert can't leak them; `Context.unique_name`
-caches the value `g_dbus_connection_get_unique_name` was re-
-fetching from `bindShortcut`; `Watcher.init`'s built-count and
-next-write index collapse to a single counter; `detectAppearance`
-builds its params tuple through the builder API matching
-`hotkey.zig` / `tray.zig`; and `dragdrop.attach` is idempotent
-via a GObject-data marker so a refactor double-route can't stack
-four controllers on the VTE widget.
-
-The "Cross-cutting themes" subsection at the end of the backlog
-names patterns rather than files.
+   needs; the Popovers sub-struct cleaned up the late-stamped
+   slots but kept the single-context shape. A genuine per-action
+   user_data refactor would let each row carry its own dependency
+   type, with comptime-generated wrappers casting back. Not
+   justified at today's 32-row count: the cost of type-erasing
+   every handler outweighs the structural-clarity win. Revisit
+   if the action table doubles.
 
 Commit conventions: conventional-commits subject (`fix(linux): …`,
 `feat(...)`, `docs(...)`, `build: …`), `- ` bullet bodies wrapped
-~80 chars, no `Co-Authored-By` trailer. Bodies are declarative —
-they state what the code now does, not the discovery path
-("previously…", "without this would…", "wrong twice over"). Bundled
-changes split into separate commits. `git log --oneline` for the
-prevailing shape.
+~80 chars, no `Co-Authored-By` trailer, no em dashes. Bodies are
+declarative: they state what the code now does, not the discovery
+path ("previously…", "without this would…"). `git log --oneline`
+for the prevailing shape.
 
 ## Status snapshot
 
@@ -977,10 +768,12 @@ prefer to manage shortcuts in your compositor config:
 
 ### Foundations *(all landed)*
 
-The original port's phased rollout — packaging, cold-path
-live-apply, CLI overrides, keymap expansion, log pane MVP —
-all shipped. `git log --grep=linux --oneline` carries the
-chain. Two gotchas the next agent should not re-discover:
+The original port's phased rollout (packaging, cold-path
+live-apply, CLI overrides, keymap expansion, log pane MVP) all
+shipped in the prototype phase; the four consolidated commits
+on `main` are the entry points, and the granular landing chain
+lives on `archive/linux/pre-squash-after-prototype`. Two
+gotchas the next agent should not re-discover:
 
 - **Toolchain pin: `zig0.15` from AUR**, not Arch's stock `zig`.
   Current Arch zig is 0.16 and ghostty's `requireZig` rejects
@@ -1242,14 +1035,16 @@ is one focused session.
 
 ## Code review backlog
 
-A four-slice review of `origin/main..HEAD` (2026-05-17, 48 commits,
-~10k LoC) surfaced these. Items are grouped by severity; within a
+Originally surfaced by a four-slice review of the prototype
+branch (~10k LoC). Items are grouped by severity; within a
 severity, related items are clustered so a fix session can sweep
-one theme at a time. Each entry: `file:line` + 1-line description.
-Landed entries are pruned as work lands — `git log --grep=linux`
-carries the history. The Critical-tier (debian source format, link
-order, ghostty theme-name validation, PKGBUILD git-variant) all
-landed in the original 2026-05-17 pass.
+one theme at a time. Each entry: `file:line` + 1-line
+description. Landed entries get pruned in place; the original
+chain lives on `archive/linux/pre-squash-after-prototype`. The
+Critical-tier (debian source format, link order, ghostty
+theme-name validation, PKGBUILD git-variant) and the bulk of
+the Important + Minor tiers all landed during the prototype
+phase.
 
 ### Important — real debt, will bite production
 
@@ -1311,22 +1106,6 @@ Code-shape:
   handler doesn't read `terminal` today, but the fragility is
   load-bearing on knowing which fields each handler touches
   (subsumed by the priority-#3 Dispatch refactor).
-
-Landed in the most recent minor-pass:
-
-- **`terminal.zig`** — argv stored as a slice (`[]?[*:0]u8`)
-  rather than a many-item pointer + duplicated magic-2 length.
-- **`hotkey.zig`** — `activated_sub_id` and `create_response_sub_id`
-  carry matching errdefers so a future fallible insert between
-  the subscribes and the return can't leak them. `Context.
-  unique_name` caches the value `bindShortcut` used to re-fetch.
-- **`watcher.zig`** — init loop's `built` count is also the
-  next-write index, so a refactor can't drift the two apart.
-- **`ghostty_config.zig`** — `detectAppearance` params use the
-  builder API matching `hotkey.zig` / `tray.zig`.
-- **`dragdrop.zig`** — `attach` is idempotent via a
-  GObject-data marker so a double-route can't stack four
-  controllers on the same widget.
 
 Resilience:
 
@@ -1397,8 +1176,7 @@ Packaging:
    hole is closed and the rules / PKGBUILD / nix derivation all
    share the same install transaction. Two independent blockers
    left for true distro inclusion; the GH-release tarball + AUR
-   `djinn-git` PKGBUILD are the two working install paths today
-   (see History).
+   `djinn-git` PKGBUILD are the two working install paths today.
 6. **Untested high-risk paths.** CI now covers linux — Ubuntu 24.04
    runs `zig build test` + debug build + ReleaseSafe + `--version`
    smoke on every push (`.github/workflows/ci.yml::linux`).
@@ -1417,373 +1195,13 @@ Packaging:
    user-local install (`~/.local/share/applications/…`) silently
    breaks hotkey persistence. Document or block.
 
-History (landed themes — kept for context, `git log --grep=linux`
-has the chain):
-
-- **log_pane visibility toggle repair + cheatsheet popover render**
-  — `log_pane.pairWithSibling` now passes `self.container` (not
-  `self.scrolled`) to `gtk_paned_set_end_child`; scrolled is
-  already a child of container from init, and the prior code
-  tripped the `gtk_paned_set_end_child: assertion ... parent ==
-  NULL` Gtk-CRITICAL, leaving container orphaned so Ctrl+/ did
-  nothing. Cheatsheet popover flipped to `autohide=false` (the
-  label has no focusable child, so autohide's grab flipped the
-  panel window inactive and `hide-on-blur=true` hid the whole
-  panel right after popup), and `open()` now sets an explicit
-  1×1 `gtk_popover_set_pointing_to` rect at the anchor's
-  horizontal center / ~1/8 from the top each popup (without an
-  explicit pointing-to the full anchor allocation was used and
-  GTK clipped the 400px-tall popover off-screen). Recomputed
-  each open so panel resizes keep it centered. Find overlay +
-  palette stay autohide=true because their `GtkSearchEntry`
-  anchors focus.
-- **`just install-arch` rewrites ExecStart for /usr/local** —
-  `contrib/packaging/djinn.service` bakes `ExecStart=/usr/bin/
-  djinn` (the AUR install path). The recipe now `sed`s that to
-  `/usr/local/bin/djinn` after the install copy so a same-
-  system AUR-then-/usr/local install doesn't leave systemd
-  spinning on `status=203/EXEC` until `start-limit-hit`.
-- **Multi-profile Phase 2 — Ctrl+Shift+P palette switcher** —
-  new `src/platform/linux/palette.zig` (~520 LOC) wires a
-  `GtkPopover` anchored on the `SessionHost` GtkStack with a
-  `GtkSearchEntry` + scrolled `GtkListBox` of profile rows.
-  Filter via `set_filter_func` reading a cached lowercased
-  needle; each row carries pre-lowercased `label + name` slices
-  in a per-row buffer so the per-keystroke hot path is two
-  `mem.indexOf` calls per row. CAPTURE-phase
-  `GtkEventControllerKey` on the entry intercepts Up/Down/Return/
-  Escape — selection moves through the filtered rows while the
-  entry keeps focus. Selection mode BROWSE so Enter always has a
-  target. `OnActivate` callback reuses the tab strip's
-  `onTabActivate` route so palette- and click-driven switches
-  both flow through `host.activate(idx)` and the existing
-  `on_switch` hook re-skins the chip strip on both paths.
-  Module-local `GtkCssProvider` reload-in-place on `applyTheme`;
-  selected-row accent picks `palette[4]` with `@accent_color`
-  fallback, mirroring tab_strip. Drive-by: tab_strip + palette
-  both `append(0)` their CSS build buffer before
-  `gtk_css_provider_load_from_string` — palette's second
-  provider shifted allocator layout enough to surface
-  tab_strip's pre-existing missing-sentinel bug as garbage
-  `Theme parser error: <data>:N:M: Expected '{' after selectors`
-  warnings; log_pane already does this. Keymap action table grew
-  to 30 rows (`palette_open` gated by `predHasMultipleProfiles`,
-  banner reads `installed 30/30`).
-- **Multi-profile Phase 1 — tab strip + keyboard switching** —
-  new `src/platform/linux/tab_strip.zig` (430 LOC) wires a
-  horizontal `GtkBox` of `GtkButton` chips, one per session, with
-  `.djinn-tab-active` driving the active-row accent underline.
-  Module-local `GtkCssProvider` reloads in place on `applyTheme`
-  (palette[4] for the accent, `@accent_color` as GTK-named-color
-  fallback; inactive chips reserve a 2px transparent
-  border-bottom so the active accent doesn't shift the row
-  vertically on switch). Strip hidden when `sm.count() < 2`;
-  `pairWithChild(paned)` returns the vertical GtkBox that
-  main_linux hands to `panel.attachChild`. `session_host.zig`
-  gained an `OnSwitch` callback fired once per successful
-  `activate(idx)`; main_linux wires it onto `TabStrip.markActive`
-  so click + keymap paths converge on one chip-update site
-  without session_host importing tab_strip. Keymap action table
-  grew 11 rows: `next_tab`, `prev_tab`, and `tab_1..tab_9`,
-  gated by the new `predHasMultipleProfiles` predicate so
-  single-profile setups propagate Alt+N to readline. `tab_N`
-  handlers are comptime-built via `makeTabHandler(n)`.
-  `Dispatch` carries a `tab_strip` slot so `onConfigChanged`
-  fans `applyTheme` across VTE / log pane / strip in lockstep.
-- **Multi-profile foundation** — `src/platform/linux/session_host.zig`
-  owns a `GtkStack` of one VTE per profile, lazy-spawned on
-  first activate; the active-at-startup session spawns eagerly
-  so the first paint shows its shell. `Terminal.open` grew a
-  `Spawn { command, cwd }` parameter; SessionHost feeds each
-  profile's resolved command + cwd (`script > command >
-  provider > /bin/zsh`, same precedence as darwin). main_linux
-  builds `SessionManager` from config and wires
-  `&session_manager` into `ToolTable` so `djinn_active_profile`
-  returns real `{name, label, cwd, command}` instead of
-  `{"name":null}`. `onPanelResize` plumbs
-  `sm.active().profile.name` into `persist.saveDebounced` so
-  per-profile window-size memory can land later.
-  `keymap.Context.terminal` became
-  `keymap.Context.session_host`; handlers reach through
-  `currentTerminal()` so font / scroll / copy / paste / clear
-  always operate on the visible VTE. `find_overlay` anchors on
-  `host.widget()` (the stack) and gained
-  `setTarget(*GtkWidget)` — `SessionHost.activate` retargets the
-  search needle on switch without reparenting the popover.
-- **Parity easy-pickings pass** — five small parity gaps with
-  darwin filled in one session. Shift+PgUp / Shift+PgDn drive
-  VTE's GtkScrollable vadjustment by one page (universal
-  terminal-emulator scrollback gesture). Ctrl+Shift+T cycles
-  `ghostty_config.appearance_override` (null → light → dark)
-  and triggers a reapply via the new `reapply_config` hook on
-  the keymap Context — same flow a config save would invoke,
-  so the new `theme = light:X,dark:Y` variant gets baked in.
-  `state.divider` persists the log-pane GtkPaned position via
-  a debounce-shared worker (`saveDividerDebounced`) with an
-  independent dirty bit from window dims; the worker's
-  `flushOnce` reads existing disk state and only overlays the
-  dirty fields, so a 60Hz drag burst doesn't flush stale w/h
-  and vice versa. Ctrl+Shift+F opens a VTE-backed find overlay
-  (`find_overlay.zig`) — GtkPopover + GtkSearchEntry +
-  Prev/Next icon buttons; each text change recompiles a PCRE2
-  regex via `vte_regex_new_for_search` (CASELESS + MULTILINE)
-  and feeds it to `vte_terminal_search_set_regex`. Ctrl+G /
-  Ctrl+Shift+G step matches via VTE's
-  `search_find_next`/`_find_previous`. Ctrl+? opens a Pango-
-  markup cheatsheet popover (`cheatsheet.zig`) sourced from
-  the keymap action table, which grew `display` (e.g. "Ctrl+=")
-  and `description` (e.g. "Increase font size") fields. The
-  cheatsheet skips rows with empty description so the
-  layout-cover `font_inc_shift` dup doesn't double-list. New
-  tests cover the readParentInode-free building blocks: the
-  `appearance_override` cycle, the divider serializer's
-  zero-vs-non-zero branch, and the cheatsheet markup's
-  description-filter behavior.
-- **Resilience polish pass** — `watcher.zig` now survives
-  destroy-and-recreate of the config dir (`rm -rf ~/.config/djinn;
-  mkdir ~/.config/djinn`, an editor that does the same, a config
-  rotation script). A new 5-second GLib timeout walks every entry,
-  compares each parent path's `st_ino` against the value cached at
-  init / last rebuild, and on mismatch rebuilds the GFile +
-  GFileMonitor + signal subscription in place — then schedules a
-  coalesce fire so the caller's `on_changed` re-reads through the
-  new inode. Same-FS `mv` round-trips were already safe (inotify
-  watches by inode; rename preserves it). `EntryContext.parent_ino`
-  caches the inode; 0 doubles as a "disable recheck" sentinel for
-  entries whose init-time stat failed. `dragdrop.zig` /tmp reaper
-  now fires on a 30-minute `g_timeout_add` cadence in addition to
-  the startup sweep — a 9-hour workday with 100 image drops no
-  longer accumulates temps until djinn restarts. `notifier.zig`'s
-  `playSound` stub gained a one-shot stderr warning on first call
-  so the `bell-sound` override gap is visible (`tools.zig` invokes
-  it after every successful `sendKind`, once per 30s per (kind,
-  client) bucket by rate-limit default); the per-kind notification
-  sound-name hint set by `deliver` still plays through the
-  notification daemon — only the user override falls through. New
-  `readParentInode detects destroy-recreate inode swap` test
-  exercises the kernel + std.fs.statFile path the recheck relies
-  on: same-FS rename keeps the inode invariant, destroy-recreate
-  rotates it, missing path returns the 0 sentinel.
-- **Packaging cleanup pass** — `build.zig` grows a
-  `-Dsystem-install` option; the linux install branch is gated so
-  `zig build install` from a dev tree drops only `zig-out/bin/djinn`,
-  while distro recipes (PKGBUILD, debian/rules, flake.nix) pass
-  `-Dsystem-install=true` to also land .desktop + systemd user
-  unit + LICENSE + README under `share/`. PKGBUILD + debian/rules
-  drop their out-of-band `install -Dm644` calls, closing the
-  orphan-on-uninstall gap. `debian/rules` stages into
-  `debian/tmp/usr` and the new `debian/djinn.install` declares the
-  binary package's payload — no more hardcoded `debian/djinn/usr`.
-  `flake.nix nix run .#` on linux exports `LD_LIBRARY_PATH`
-  against `linuxDeps` so a fresh `nix run` doesn't fail at first
-  GTK dlopen on NixOS; `glib` moves from `nativeBuildInputs` into
-  the shared `linuxDeps` (runtime library, not a build tool);
-  `dontWrapGApps = false` line drops in favor of the
-  wrapGAppsHook4 default with a corrected rationale comment.
-  `djinn.service` gains the conservative sandbox set
-  (`NoNewPrivileges`, `ProtectKernel{Tunables,Modules,Logs}`,
-  `ProtectControlGroups`, `LockPersonality`, `RestrictSUIDSGID`,
-  `RestrictRealtime`, `MemoryDenyWriteExecute`) plus
-  `StartLimitBurst=5` / `StartLimitIntervalSec=30s` so a panic
-  loop trips a transient failure state instead of flooding the
-  journal indefinitely; the Hyprland / bare-sway `uwsm` caveat
-  for `graphical-session.target` is documented in `[Unit]`.
-  `djinn.desktop` flips `StartupNotify=true` (GTK4 emits the
-  notification ID automatically at panel map; the prior `false`
-  paired with `StartupWMClass=djinn` left KDE's launcher spinner
-  ticking until protocol timeout), and the comments now explain
-  why `Exec=djinn` stays bare (same .desktop ships from both
-  `/usr` system installs and the nix derivation) and why
-  `MimeType=` is deliberately omitted.
-- **Minor-tier pass — robustness across the platform layer** —
-  UTF-8 boundary truncation for notifier banners + log_pane
-  attention chip (`utf8FloorBoundary` helper); error-visibility
-  pass on `loadConfigWithRetry`, panel `detect` allocator,
-  `ipc` unlink, `keymap` makePath, reapDragDropTemps iterate;
-  defensive bounds in `theme::applyCss` (NoSpace bubble + empty
-  CSS guard), `dragdrop::formatPayload` (bare-file:// skip,
-  truncation log), `ghostty_config` (FileTooBig graceful, inline
-  `# comment` strip that preserves hex sigils);
-  long-running resilience via `PORTAL_CALL_TIMEOUT_MS=30s`,
-  `autostart::register` atomic .tmp + rename,
-  `autostart::resolveExePath` strips ` (deleted)`, `ipc` accept
-  loop capped at 32 iters/dispatch with read-error logging,
-  `keymap::trySpawnDetached` registers each child with
-  `g_child_watch_add` for GLib-side reaping;
-  `cli::consumeValue` rejects flag-like values for --hotkey /
-  --provider; `mcp::handleConnection` returns 400 instead of
-  RST on body-read failure.
-- **log_pane appendRange lock window** — `appendRange` (now
-  `appendRangeLocked`) requires the caller to hold `state.mutex`.
-  `pollTick` and `rebuildAll` both acquire the lock once across
-  snapshot + row builds instead of dropping it between phases.
-  GTK calls happen under the lock, but the tick is bounded
-  (every 250ms, typical 0-few rows) so MCP worker contention is
-  negligible. The prior shape let a concurrent `appendLog`
-  eviction shift the `[from..from+count]` window onto different
-  entries than the snapshot intended — corrupt row text and
-  dangling slice reads on the freed string.
-- **tray.zig threading-model docs** — file-doc spells out the
-  GLib main-thread invariant for `ctx.state`, `ctx.message_buf`,
-  `ctx.message_len`, plus the lock-ordering rule w.r.t.
-  `state.mutex` (GLib main may wait on it; mutex holders never
-  wait on GLib). `pollAgentTick`'s brief lock acquisition is now
-  documented as the established direction; future GLib callbacks
-  that introduce blocking I/O or contended locks need an audit
-  pass against this rule.
-- **GTK extern consolidation** — `gtk.zig` now hosts the shared
-  GLib/GTK surface: `g_signal_connect_data`,
-  `g_signal_handler_disconnect`, `g_timeout_add`, `g_idle_add`,
-  `g_source_remove`, `g_object_unref`, `g_free`,
-  `gdk_display_get_default`, `gtk_widget_set/get_visible`,
-  `gtk_widget_add_controller`, `gtk_css_provider_*`,
-  `gtk_style_context_add_provider_for_display`. Reconciles
-  `g_source_remove`'s previously-divergent `c_int` / `gboolean`
-  return types onto the canonical `gboolean` spelling. Each
-  consumer module aliases the shared declaration (`const
-  g_signal_connect_data = gtk.g_signal_connect_data;`) instead
-  of redeclaring its own extern. Same shape as the landed
-  `gdbus.zig` extraction. Per-feature externs (gtk_window_new,
-  vte_terminal_*, gtk_paned_*, pango_*, gtk_layer_*) stay
-  scoped to their consumer.
-- **platform.zig dead-stub revert** — abstraction surface shrunk
-  from 14 re-exports to just `Notifier` + `NotifyKind` (the only
-  cross-OS consumers — `mcp/tools.zig`). `main_linux.zig` now
-  imports `platform/linux.zig` directly under the same `platform`
-  alias; the linux call sites don't change. `platform/darwin.zig`
-  drops 12 unused stubs that had been accumulating drift against
-  the real linux types (ThemeOptions `_hex` suffixes,
-  KeymapContext field-count mismatch). Net: ~170 lines removed,
-  no behavior change on either OS.
-- **MCP accept-thread error logging** — `handleConnection` now
-  returns `!void`; `run()` logs the error before continuing so a
-  recurring bug (parser regression, OOM, partial-read I/O) becomes
-  visible instead of silently disabling every MCP request. The
-  accept-fail backoff path also checks `stop_flag` before logging,
-  so `deinit` no longer prints a spurious "accept failed" warning
-  when it closes the listener.
-- **Hotkey aggregate outcome reporter** — `hotkey.zig` emits one
-  definitive log line per `init()` attempt: `"hotkey: portal
-  active — trigger "<X>""` on success, `"hotkey: portal unavailable
-  — <reason>"` on failure. The sync paths (session bus, unique
-  name, trigger parse) and async terminal points (CreateSession
-  reply / Response status, BindShortcuts reply / Response status)
-  all flow through `reportSuccess` / `reportFailure` / `reportSync
-  Failure`. `ctx.outcome_reported` latches the first reporter call
-  so duplicate handlers don't double-log. `main_linux.zig` no
-  longer prints its own "init failed" line on the cold path; the
-  reload path replaces its "rebind failed: <err>" line with a
-  concise "previous binding still active" since hotkey.zig now
-  carries the failure detail.
-- **main_linux smoke tests** — `Config.parse` + `deinit` round-
-  trip (covers the live-reload arena drop), `mergeColor` priority
-  (djinn hex wins, ghostty fallback, malformed-hex fall-through,
-  null when both unset), `buildThemeOptions` merge order (djinn
-  wins on every field, ghostty fills gaps including palette, no-
-  inheritance path), `strOptEql` identity. The full GTK-bound
-  `onConfigChanged` flow stays covered by manual smoke runs on a
-  Wayland session — the testable building blocks are now wired so
-  a regression in the merge rules surfaces under `zig build test`.
-- **Signal-handler lifecycle** — panel/terminal/log_pane all stash
-  handler ids and disconnect in `deinit` before any free that
-  invalidates user_data. New GTK modules should follow this shape.
-- **Live-reload Config string ownership** — internal
-  `ArenaAllocator` per Config; deinit drops it as a single
-  transaction; linux wires deinit on shutdown + live-reload.
-  Darwin wires shutdown only — its `resolveEntry` would need to
-  copy strings through `owned_strings` before live-reload deinit
-  becomes safe (Sessions store raw arena pointers).
-- **GDBus consolidation** — `platform/linux/gdbus.zig` holds the
-  shared D-Bus surface; the four consumers route through it.
-- **Notifier session bus connection caching** — cached on the
-  Notifier struct under `conn_mutex`, lazy-acquired, unref'd by
-  `deinit`. Three GDBus consumers each acquire-and-unref their
-  own connection now (hotkey + tray + notifier); ghostty config
-  acquires once at startup. A `gdbus.zig` singleton with borrow
-  semantics could consolidate further, but defer until a new
-  consumer needs it.
-- **Persist worker thread lifetime** — `state/persist.zig` tracks
-  the in-flight `std.Thread` handle in `g_thread`, loops a single
-  worker through accumulated dirty values (debouncing at 300ms
-  per write), and `main_linux.zig` defers `joinPendingSave`
-  before `gpa.deinit` so a mid-sleep worker can't outlive the
-  allocator. The detach-per-save shape it replaced let a worker
-  dereference freed gpa state at shutdown.
-- **Dispatch null-safety** — `main_linux.zig::Dispatch` declares
-  its seven late-stamped fields as optional pointers defaulting
-  to null instead of the prior `undefined` placeholders. The
-  initial `g_dispatch = .{ … }` literal carries only the
-  always-present fields (allocator / panel / config /
-  ghostty_colors); each subsystem stamps its slot non-null right
-  after construction. `onConfigChanged` opens with a readiness
-  gate that unwraps every slot via `logDispatchUnready` —
-  callbacks that fire before their dependencies are wired bail
-  with a clear log instead of dereferencing undefined memory.
-- **Watcher event coalescing** — `watcher.zig` allocates a single
-  shared `CoalesceState` per `Watcher` that owns the user's
-  Handler plus a `g_timeout_add` source id. Each entry's
-  GFileMonitor signal handler schedules a 100ms leading-edge
-  debounce via `coalesce.schedule`; subsequent events while the
-  timer is pending no-op. Fires the user's `on_changed` exactly
-  once per save (or per cross-file save in the same window).
-  `deinit` removes a pending timer before freeing entries so the
-  fire callback can't dispatch into half-freed state. The prior
-  shape called the handler directly from every event — 5+ fires
-  per atomic-rename save, multiplied by the 60ms retry budget
-  in `onConfigChanged` for ~900ms of main-thread blocking on
-  rapid `:w`.
-- **SNI watcher recovery** — `tray.zig` subscribes to
-  `org.freedesktop.DBus.NameOwnerChanged` filtered on
-  `arg0=org.kde.StatusNotifierWatcher` before the initial
-  `RegisterStatusNotifierItem` call. `onWatcherNameOwnerChanged`
-  re-issues `sendRegisterRequest` whenever a new owner takes the
-  well-known name — plasmashell / waybar / xfce4-panel restarts
-  mid-session, GNOME AppIndicator extension reload, or the host
-  coming up after djinn (user logs into Plasma post-launch). The
-  exported `/StatusNotifierItem` + `/MenuBar` objects survive
-  across watcher restarts because they live on the bus connection,
-  so re-registering is the only step needed to restore visibility.
-- **Hotkey canonical Request-path** — `hotkey.zig::reconcileRequestPath`
-  parses the `(o)` Request path from CreateSession and
-  BindShortcuts method replies and swaps the Response subscription
-  onto the canonical path when it differs from the locally-
-  predicted one. xdg-desktop-portal documents the request-path
-  scheme but KDE has historically renamed segments; under the
-  prior shape the Response signal could fire on a path we weren't
-  subscribed to and the binding would silently fail. Prediction
-  stays as the pre-subscribe path so the Response can't fire
-  between method call and reply (the Request body runs after the
-  reply, so the canonical re-subscribe is race-safe).
-- **IPC socket mode** — `ipc.zig::Ipc.init` narrows the process
-  umask to 0077 around `bind()` and restores it via defer; the
-  socket inode is created with mode 0600 atomically. Race-free
-  against any local user `nc -U`-ing the verb stream — covers the
-  `/tmp/djinn-<uid>.sock` fallback path where the runtime dir
-  isn't 0700-protected.
-- **CI + release pipeline cover linux** —
-  `.github/workflows/ci.yml::linux` runs on `ubuntu-24.04`,
-  apt-installs `libgtk-4-dev` / `libgtk4-layer-shell-dev` /
-  `libvte-2.91-gtk4-dev` / `libglib2.0-dev` / `pkg-config`, then
-  exercises `zig build test` + debug build + ReleaseSafe + a
-  `djinn --version` smoke. `release.yml::build-linux` and
-  `pre-release.yml::build-linux` produce a
-  `djinn-${tag}-x86_64-linux.tar.gz` containing the ReleaseSafe
-  binary + `.desktop` + `.service` + LICENSE + NOTICES + README.
-  pre-release linux is sequenced AFTER the darwin `publish` job so
-  the delete-and-recreate of the rolling tag can't race the linux
-  upload. aarch64-linux deferred.
-- **README + just install-arch** — README intro names both macOS
-  and Linux; the `## Linux (Wayland)` section covers prereqs per
-  distro, four install paths (AUR PKGBUILD, `just install-arch`,
-  manual zig build, pre-built tarball), the two-step KDE hotkey
-  flow (portal registration + System Settings binding), IPC
-  socket fallback for compositors without
-  `xdg-desktop-portal.GlobalShortcuts`, systemd user unit opt-in,
-  and a troubleshooting list. `justfile` gains `install-arch` /
-  `uninstall-arch` for fast dev iteration outside pacman tracking;
-  `arch_zig` probes for `/usr/bin/zig-0.15` (AUR) before falling
-  back to the nix dev shell so the recipe doesn't accidentally
-  pick Arch's stock 0.16 zig.
+The full chain of landed themes from the prototype phase lives
+on the `archive/linux/pre-squash-after-prototype` branch (local
++ personal upstream). Browse with `git log --oneline
+archive/linux/pre-squash-after-prototype` and pick a SHA when
+"why did we do it that way?" needs the original landing context;
+the recurring decisions are already captured under `## Decisions
+you should not undo`.
 
 ## Don't touch
 
