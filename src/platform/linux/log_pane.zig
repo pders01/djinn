@@ -112,12 +112,32 @@ extern "c" fn gtk_label_new(str: ?[*:0]const u8) *GtkWidget;
 extern "c" fn gtk_label_set_xalign(label: *GtkLabel, xalign: f32) void;
 extern "c" fn gtk_label_set_wrap(label: *GtkLabel, wrap: gboolean) void;
 extern "c" fn gtk_label_set_selectable(label: *GtkLabel, selectable: gboolean) void;
+extern "c" fn gtk_label_get_text(label: *GtkLabel) [*:0]const u8;
+
+// GtkGestureClick: a GtkEventController subclass that fires
+// `pressed(n_press, x, y)` on button-down. We attach one per log
+// row to power right-click "copy entry". `set_button(3)` restricts
+// to the secondary button so left-click + drag selection on the
+// label's text (gtk_label_set_selectable) still works as expected.
+const GtkGesture = gtk.GtkEventController;
+extern "c" fn gtk_gesture_click_new() *gtk.GtkEventController;
+extern "c" fn gtk_gesture_single_set_button(gesture: *GtkGesture, button: c_uint) void;
+extern "c" fn gtk_event_controller_get_widget(controller: *gtk.GtkEventController) ?*GtkWidget;
+extern "c" fn gtk_widget_get_display(widget: *GtkWidget) ?*GdkDisplay;
+
+// Clipboard surface — same pattern as `keymap.zig::mcp_copy_endpoint`.
+const GdkClipboard = opaque {};
+extern "c" fn gdk_display_get_clipboard(display: *GdkDisplay) ?*GdkClipboard;
+extern "c" fn gdk_clipboard_set_text(clipboard: *GdkClipboard, text: [*:0]const u8) void;
+
+const GDK_BUTTON_SECONDARY: c_uint = 3;
 
 extern "c" fn gtk_widget_add_css_class(widget: *GtkWidget, css_class: [*:0]const u8) void;
 extern "c" fn gtk_widget_set_size_request(widget: *GtkWidget, w: c_int, h: c_int) void;
 extern "c" fn gtk_widget_set_vexpand(widget: *GtkWidget, expand: gboolean) void;
 const gtk_widget_set_visible = gtk.gtk_widget_set_visible;
 const gtk_widget_get_visible = gtk.gtk_widget_get_visible;
+const gtk_widget_add_controller = gtk.gtk_widget_add_controller;
 
 extern "c" fn gtk_paned_new(orientation: c_int) *GtkWidget;
 extern "c" fn gtk_paned_set_start_child(paned: *GtkPaned, child: *GtkWidget) void;
@@ -856,7 +876,57 @@ fn buildRow(allocator: std.mem.Allocator, entry: LogEntry) !*GtkWidget {
         .warn => "djinn-log-warn",
         .err => "djinn-log-err",
     });
+
+    // Right-click "Copy entry": GtkGestureClick → pressed handler
+    // reads the label's text (which carries the `[LVL] ` prefix the
+    // row was built with), strips it, writes the body to the
+    // system clipboard. No user_data needed; the handler reaches
+    // back through the gesture → widget chain to find the label.
+    const click = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(click, GDK_BUTTON_SECONDARY);
+    _ = g_signal_connect_data(
+        @ptrCast(click),
+        "pressed",
+        @ptrCast(&onRowRightClick),
+        null,
+        null,
+        0,
+    );
+    gtk_widget_add_controller(label, click);
+
     return label;
+}
+
+/// GtkGestureClick `pressed` handler for log-row right-click.
+/// Signature matches GTK 4: `(gesture, n_press, x, y, user_data)`.
+/// Resolves the originating label via the gesture's widget, reads
+/// its displayed text, strips the leading `[LVL] ` prefix, and
+/// writes the message body to the system clipboard. No-op when
+/// any leg of the lookup fails (no display, no clipboard,
+/// orphaned controller).
+fn onRowRightClick(
+    gesture: *gtk.GtkEventController,
+    _: c_int,
+    _: f64,
+    _: f64,
+    _: gpointer,
+) callconv(.c) void {
+    const widget = gtk_event_controller_get_widget(gesture) orelse return;
+    const display = gtk_widget_get_display(widget) orelse return;
+    const clipboard = gdk_display_get_clipboard(display) orelse return;
+    const text_z = gtk_label_get_text(@ptrCast(widget));
+    const text = std.mem.span(text_z);
+    const PREFIX_LEN: usize = 6;
+    const has_prefix = text.len > PREFIX_LEN and (std.mem.startsWith(u8, text, "[INF] ") or
+        std.mem.startsWith(u8, text, "[WRN] ") or
+        std.mem.startsWith(u8, text, "[ERR] "));
+    if (has_prefix) {
+        // `text_z + PREFIX_LEN` stays NUL-terminated since the
+        // backing buffer's sentinel sits at text.len > PREFIX_LEN.
+        gdk_clipboard_set_text(clipboard, text_z + PREFIX_LEN);
+    } else {
+        gdk_clipboard_set_text(clipboard, text_z);
+    }
 }
 
 /// Build the dim group-header label: `{client} · HH:MM` in UTC.
