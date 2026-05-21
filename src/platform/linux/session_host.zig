@@ -170,6 +170,13 @@ pub const SessionHost = struct {
     /// wiring is silently consumed — none happen in practice
     /// (init's eager spawn doesn't dispatch child-exited).
     on_exit_changed: ?OnExitChanged = null,
+    /// Fallback for `vte_terminal_set_audible_bell` when a profile
+    /// doesn't override `profile.<name>.bell-audible`. Captured at
+    /// init from `config.bell.audible` so spawn-time resolution
+    /// doesn't need a Config reference; a hot-reload that flips
+    /// the global default lands on the next spawn, existing live
+    /// VTEs keep their construction-time value.
+    bell_audible_default: bool,
 
     /// Build the stack, eagerly spawn the active-at-startup session,
     /// leave the rest as lazy slots. Returns a SessionHost the caller
@@ -184,6 +191,7 @@ pub const SessionHost = struct {
         sm: *SessionManager,
         theme_opts: ThemeOptions,
         handler: ?TerminalHandler,
+        bell_audible_default: bool,
     ) !SessionHost {
         const stack = gtk_stack_new();
         gtk_stack_set_transition_duration(@ptrCast(stack), 0);
@@ -223,6 +231,7 @@ pub const SessionHost = struct {
             .entries = entries,
             .theme_opts = theme_opts,
             .handler = handler,
+            .bell_audible_default = bell_audible_default,
         };
 
         // Eagerly spawn just the active session — see `spawnInto` for
@@ -368,10 +377,11 @@ pub const SessionHost = struct {
         // Build the new Terminal first so a spawn-arg error / OOM
         // doesn't strand the entry empty after we've already torn
         // the old widget down.
+        const audible = profile.bell_audible orelse self.bell_audible_default;
         const spawn: TerminalSpawn = if (override_cmd) |c|
-            .{ .command = c, .cwd = profile.cwd }
+            .{ .command = c, .cwd = profile.cwd, .audible_bell = audible }
         else
-            .{ .command = profile.command, .cwd = profile.cwd };
+            .{ .command = profile.command, .cwd = profile.cwd, .audible_bell = audible };
         const new_term = Terminal.open(self.allocator, self.theme_opts, self.handlerFor(idx), spawn) catch |err| {
             std.debug.print(
                 "session_host: restart for profile '{s}' failed: {}\n",
@@ -445,6 +455,7 @@ pub const SessionHost = struct {
             .{
                 .command = profile.command,
                 .cwd = profile.cwd,
+                .audible_bell = profile.bell_audible orelse self.bell_audible_default,
             },
         );
         self.entries.items[idx].terminal = term;
@@ -465,6 +476,7 @@ pub const SessionHost = struct {
             .ctx = tmpl.ctx,
             .extra = idx,
             .on_child_exited = tmpl.on_child_exited,
+            .on_bell = tmpl.on_bell,
         };
     }
 

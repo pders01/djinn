@@ -216,6 +216,24 @@ const Dispatch = struct {
         self.panel.quit();
     }
 
+    /// VTE `bell`: the PTY emitted BEL (0x07). Audible bell is
+    /// already handled inside VTE itself via the per-VTE
+    /// `set_audible_bell` flag we stamped at spawn from
+    /// `profile.bell_audible orelse cfg.bell.audible`, so this
+    /// callback only drives the visual side. `idx` is the firing
+    /// session; the firing profile's `bell_visual` override wins
+    /// over the global default, letting a chatter profile keep
+    /// its visual bell quiet while interactive profiles still
+    /// flash.
+    fn onBell(ctx: *anyopaque, idx: usize) void {
+        const self: *Dispatch = @ptrCast(@alignCast(ctx));
+        const sm = self.session_manager orelse return;
+        if (idx >= sm.sessions.items.len) return;
+        const profile = &sm.sessions.items[idx].profile;
+        const visual = profile.bell_visual orelse self.config.bell.visual;
+        if (visual) self.panel.flashBell();
+    }
+
     /// VTE `child-exited`: the spawned shell terminated (typed
     /// `exit`, was killed, etc.). `idx` carries the session index
     /// (SessionHost stamps it into Terminal.Handler.extra at spawn
@@ -904,7 +922,8 @@ pub fn main() !void {
     var host = platform.SessionHost.init(allocator, &session_manager, theme_opts, .{
         .ctx = @ptrCast(&g_dispatch),
         .on_child_exited = Dispatch.onChildExited,
-    }) catch |err| {
+        .on_bell = Dispatch.onBell,
+    }, config.bell.audible) catch |err| {
         std.debug.print("session host init failed: {}\n", .{err});
         return err;
     };

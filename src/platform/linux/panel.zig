@@ -80,6 +80,13 @@ const GdkSurface = opaque {};
 extern "c" fn gtk_native_get_surface(self: *anyopaque) ?*GdkSurface;
 extern "c" fn gdk_surface_set_opaque_region(surface: *GdkSurface, region: ?*anyopaque) void;
 
+/// Composition-level opacity on the GtkWindow itself. Multiplies
+/// every painted pixel (including the VTE alpha-blended background)
+/// by `opacity`. Used to flash the panel briefly on visual bell;
+/// steady-state is always 1.0 (background transparency is handled
+/// per-widget via CSS, not via window-wide opacity).
+extern "c" fn gtk_widget_set_opacity(widget: *anyopaque, opacity: f64) void;
+
 extern "c" fn g_main_loop_new(context: ?*GMainContext, is_running: gboolean) *GMainLoop;
 extern "c" fn g_main_loop_run(loop: *GMainLoop) void;
 extern "c" fn g_main_loop_quit(loop: *GMainLoop) void;
@@ -194,6 +201,13 @@ pub const Panel = struct {
     /// thread when the polled size differs from the last-seen value.
     on_resize_ctx: ?*anyopaque = null,
     on_resize_cb: ?*const fn (ctx: *anyopaque, w: u32, h: u32) void = null,
+    /// `g_timeout_add` tag for the in-flight visual-bell restore.
+    /// Non-zero while the panel is mid-flash; the tick handler
+    /// restores opacity to 1.0 and clears this slot. A second
+    /// `flashBell` during the dim cancels the pending restore so
+    /// the second flash gets its full 80ms (otherwise stacked
+    /// bells would visually collapse into one).
+    bell_restore_id: c_uint = 0,
     /// `g_timeout_add` tag for the resize-poll, 0 when not running.
     /// GTK4 doesn't surface a reliable "I was resized" signal on the
     /// GtkWindow level (default-width/-height are app-set hints, not
@@ -379,6 +393,23 @@ pub const Panel = struct {
         gtk_window_set_default_size(self.window, width, height);
     }
 
+    /// Brief composition-level dim as a visual bell. Triggered by
+    /// VTE's `bell` signal when the active profile (or global
+    /// fallback) has `bell-visual = true`. Dim factor 0.4 + 80ms
+    /// duration match darwin's `Panel.flashBell` so multi-platform
+    /// users get the same gesture. Re-entrant: a second flash mid-
+    /// dim cancels the in-flight restore and reschedules so each
+    /// bell gets its full duration.
+    pub fn flashBell(self: *Panel) void {
+        const widget: *anyopaque = @ptrCast(self.window);
+        gtk_widget_set_opacity(widget, 0.4);
+        if (self.bell_restore_id != 0) {
+            _ = g_source_remove(self.bell_restore_id);
+            self.bell_restore_id = 0;
+        }
+        self.bell_restore_id = g_timeout_add(80, bellRestoreTick, @ptrCast(self));
+    }
+
     /// Read the panel's current allocated size. Returns `0,0` until
     /// the window has been mapped + measured by GTK. On layer-shell
     /// this is the size the compositor settled on; on plain toplevel
@@ -548,6 +579,10 @@ pub const Panel = struct {
             _ = g_source_remove(self.resize_poll_id);
             self.resize_poll_id = 0;
         }
+        if (self.bell_restore_id != 0) {
+            _ = g_source_remove(self.bell_restore_id);
+            self.bell_restore_id = 0;
+        }
         // Disconnect signal handlers before destroying the window.
         // `close-request` and `map` hold the window itself in user_data
         // (harmless if the destroy happens first), but `notify::is-active`
@@ -668,6 +703,18 @@ fn resizePollTick(user_data: gpointer) callconv(.c) c_int {
         if (self.on_resize_ctx) |ctx| cb(ctx, @intCast(w), @intCast(h));
     }
     return G_SOURCE_CONTINUE;
+}
+
+/// One-shot restore of the panel's composition opacity after a
+/// visual bell flash. Returns G_SOURCE_REMOVE so GLib drops the
+/// source; the corresponding `bell_restore_id` slot is cleared
+/// here too so `flashBell` knows no restore is pending.
+fn bellRestoreTick(user_data: gpointer) callconv(.c) c_int {
+    const self: *Panel = @ptrCast(@alignCast(user_data orelse return G_SOURCE_REMOVE));
+    const widget: *anyopaque = @ptrCast(self.window);
+    gtk_widget_set_opacity(widget, 1.0);
+    self.bell_restore_id = 0;
+    return G_SOURCE_REMOVE;
 }
 
 /// `dlopen(name, RTLD_LAZY)` + immediate `dlclose`. Returns true when

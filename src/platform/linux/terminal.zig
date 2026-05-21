@@ -34,6 +34,13 @@ pub const ThemeOptions = theme.Options;
 pub const Spawn = struct {
     command: []const u8,
     cwd: ?[]const u8 = null,
+    /// Resolved audible-bell state for this VTE: profile override
+    /// (`profile.<name>.bell-audible`) when set, else the global
+    /// `bell.audible` config. Applied via
+    /// `vte_terminal_set_audible_bell` so VTE's built-in BEL beep
+    /// honors per-profile mute. Visual bell is panel-wide and
+    /// handled outside the Terminal in `Panel.flashBell`.
+    audible_bell: bool = true,
 };
 
 const GtkWidget = gtk.GtkWidget;
@@ -64,6 +71,13 @@ pub const Handler = struct {
     ctx: *anyopaque,
     extra: usize = 0,
     on_child_exited: *const fn (ctx: *anyopaque, extra: usize) void,
+    /// Optional `bell` signal hook. VTE fires the GTK `bell` signal
+    /// when the PTY emits BEL (0x07). Used by the host to drive
+    /// panel-wide visual bell flash; per-VTE audible bell is set
+    /// directly via `vte_terminal_set_audible_bell` at spawn time
+    /// and doesn't need a callback. Null when the host doesn't
+    /// want bell dispatch.
+    on_bell: ?*const fn (ctx: *anyopaque, extra: usize) void = null,
 };
 
 // ─── VTE extern surface ──────────────────────────────────────────────
@@ -109,6 +123,11 @@ extern "c" fn vte_terminal_feed_child(terminal: *VteTerminal, data: [*]const u8,
 /// already exited, when `feed_child` would have nowhere to go.
 /// ANSI escapes work (CSI/SGR are interpreted by VTE itself).
 extern "c" fn vte_terminal_feed(terminal: *VteTerminal, data: [*]const u8, length: isize) void;
+/// Toggle VTE's built-in audible bell. true = VTE beeps on BEL;
+/// false = swallow. Per-VTE setting so each profile's mute state
+/// is independent. Visual bell is the host's responsibility
+/// (VTE's `bell` signal still fires regardless of this setting).
+extern "c" fn vte_terminal_set_audible_bell(terminal: *VteTerminal, is_audible: c_int) void;
 
 // VTE inherits GtkScrollable since 0.40 — its vertical GtkAdjustment
 // is the canonical scrollback driver. `vte_terminal_get_vadjustment`
@@ -195,6 +214,10 @@ pub const Terminal = struct {
     /// freeing `handler_box` — a pending dispatch in flight at
     /// teardown would otherwise read freed memory through user_data.
     child_exited_handler_id: c_ulong = 0,
+    /// Signal id for the `bell` handler, 0 when the caller didn't
+    /// supply `Handler.on_bell`. Same disconnect-before-free
+    /// contract as `child_exited_handler_id`.
+    bell_handler_id: c_ulong = 0,
 
     /// Resolve $SHELL falling back to /bin/sh. Returns the dup'd
     /// sentinel-terminated slice. $SHELL is the freedesktop convention;
@@ -221,6 +244,14 @@ pub const Terminal = struct {
         // option is no-op-safe when null, so a caller with empty
         // config gets VTE defaults.
         theme.apply(widget, theme_opts);
+
+        // Audible bell: VTE's built-in beep on PTY BEL (0x07).
+        // Resolved by the caller from profile override + global
+        // config and threaded through `Spawn.audible_bell`. Null
+        // spawn (legacy single-shell path) gets the struct default
+        // (true) which matches VTE's own initial state.
+        const audible = if (spawn) |s| s.audible_bell else true;
+        vte_terminal_set_audible_bell(terminal, @intFromBool(audible));
 
         // Drag-drop into the terminal. Attaches a GtkDropTarget that
         // converts file-manager drops (text/uri-list) to shell-quoted
@@ -279,6 +310,7 @@ pub const Terminal = struct {
         // that it did.
         var handler_box: ?*Handler = null;
         var child_exited_id: c_ulong = 0;
+        var bell_id: c_ulong = 0;
         if (handler) |h| {
             const box = try allocator.create(Handler);
             errdefer allocator.destroy(box);
@@ -291,6 +323,21 @@ pub const Terminal = struct {
                 null,
                 0,
             );
+            // VTE `bell(VteTerminal*, gpointer)` fires on PTY BEL
+            // regardless of `set_audible_bell` state. Connect only
+            // when the host wants the dispatch (visual bell path).
+            // Reuses the same `handler_box` so a single `destroy` in
+            // deinit covers both signals.
+            if (h.on_bell != null) {
+                bell_id = g_signal_connect_data(
+                    @ptrCast(terminal),
+                    "bell",
+                    @ptrCast(&onBell),
+                    @ptrCast(box),
+                    null,
+                    0,
+                );
+            }
             handler_box = box;
         }
 
@@ -302,18 +349,23 @@ pub const Terminal = struct {
             .argv = argv,
             .handler_box = handler_box,
             .child_exited_handler_id = child_exited_id,
+            .bell_handler_id = bell_id,
         };
     }
 
     pub fn deinit(self: *Terminal) void {
-        // Disconnect the child-exited handler before freeing its
-        // user_data box. The widget itself is owned by its parent
-        // container (set via panel.attachChild), so a dispatch in
-        // flight against the still-live widget would otherwise
-        // deref a freed Handler.
+        // Disconnect both signal handlers before freeing their
+        // shared user_data box. The widget itself is owned by its
+        // parent container (set via panel.attachChild), so a
+        // dispatch in flight against the still-live widget would
+        // otherwise deref a freed Handler.
         if (self.child_exited_handler_id != 0) {
             g_signal_handler_disconnect(@ptrCast(self.widget), self.child_exited_handler_id);
             self.child_exited_handler_id = 0;
+        }
+        if (self.bell_handler_id != 0) {
+            g_signal_handler_disconnect(@ptrCast(self.widget), self.bell_handler_id);
+            self.bell_handler_id = 0;
         }
         self.allocator.free(self.argv);
         self.allocator.free(self.command_path);
@@ -426,6 +478,15 @@ pub const Terminal = struct {
             g_signal_handler_disconnect(@ptrCast(self.widget), self.child_exited_handler_id);
             self.child_exited_handler_id = 0;
         }
+        // The bell signal could still fire during the imminent
+        // widget destroy (theoretical: a queued BEL ahead of SIGHUP)
+        // and would dispatch into the about-to-be-replaced slot's
+        // visual flash. Disconnect alongside the exit handler so
+        // restartActive has one paired call to make.
+        if (self.bell_handler_id != 0) {
+            g_signal_handler_disconnect(@ptrCast(self.widget), self.bell_handler_id);
+            self.bell_handler_id = 0;
+        }
     }
 
     /// Scroll the scrollback view by one screen-page in the requested
@@ -449,6 +510,12 @@ pub const Terminal = struct {
 fn onChildExited(_: *VteTerminal, _: c_int, user_data: gpointer) callconv(.c) void {
     const h: *Handler = @ptrCast(@alignCast(user_data orelse return));
     h.on_child_exited(h.ctx, h.extra);
+}
+
+fn onBell(_: *VteTerminal, user_data: gpointer) callconv(.c) void {
+    const h: *Handler = @ptrCast(@alignCast(user_data orelse return));
+    const cb = h.on_bell orelse return;
+    cb(h.ctx, h.extra);
 }
 
 test "Terminal type compiles" {

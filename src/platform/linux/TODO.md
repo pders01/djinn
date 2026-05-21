@@ -512,11 +512,6 @@ Tested on CachyOS + KDE Plasma Wayland 6.x.
 
 **Not yet wired** — exists on darwin but no linux analogue:
 
-- Per-profile bell (`profile.<name>.bell-*`). Fields already
-  parsed; need a `playBell(profile)` route in `notifier.zig`
-  plus a `bell` signal hookup in `terminal.zig`. Bell subsystem
-  is its own thread — see the `notifier.zig` `playSound`
-  note in the resilience polish batch.
 - Hot-reload reconcile for multi-profile. Watcher's
   `onConfigChanged` already fires; the linux analogue of
   `src/session/live.zig` (add / remove / re-point sessions in
@@ -903,8 +898,6 @@ editing the file always wins over state.json.
   watcher fire. The tab strip is built once at startup today —
   reconcile needs to also rebuild the chip row when a profile is
   added / removed / renamed.
-- **Per-profile bell** (`profile.<name>.bell-*`). Fields already
-  parsed; needs a `playBell(profile)` route + VTE `bell` signal.
 
 ### Darwin parity (May 2026 Tier A)
 
