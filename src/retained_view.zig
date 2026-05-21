@@ -34,7 +34,12 @@ const objc = @import("objc");
 /// coerce to `[*c]T`, so the wider type lives at the parameter
 /// boundary and the `@ptrCast` to `objc.c.id` happens once here.
 pub fn detach(view_id: ?*anyopaque) void {
-    const id: objc.c.id = @ptrCast(view_id);
+    // `*anyopaque` nominally has alignment 1; `objc.c.id`
+    // (`[*c]struct_objc_object`) wants pointer alignment. The
+    // runtime alignment is fine — NSView pointers come from
+    // `[NSView alloc]` which returns properly-aligned heap memory —
+    // we just have to assert it past Zig's static check.
+    const id: objc.c.id = @ptrCast(@alignCast(view_id));
     const view = objc.Object.fromId(id);
     view.msgSend(void, "removeFromSuperview", .{});
     view.msgSend(void, "release", .{});
