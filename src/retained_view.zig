@@ -27,11 +27,15 @@
 const objc = @import("objc");
 
 /// Remove `view_id` from its superview and release the +1 retain the
-/// alloc/init pair owed us. Caller passes the raw NSView id (the
-/// `?*anyopaque` slot we tend to stash on `Session.surface_host` /
-/// `app.g.palette.view_id` / etc).
-pub fn detach(view_id: objc.c.id) void {
-    const view = objc.Object.fromId(view_id);
+/// alloc/init pair owed us. Parameter is `?*anyopaque` to accept both
+/// the `Session.surface_host` slot (`*anyopaque`) and the `objc.c.id`
+/// slots stashed on `app.g.{palette,cheatsheet,layout}.*_id` — `[*c]T`
+/// coerces in via the C-pointer rules, but `*anyopaque` does not
+/// coerce to `[*c]T`, so the wider type lives at the parameter
+/// boundary and the `@ptrCast` to `objc.c.id` happens once here.
+pub fn detach(view_id: ?*anyopaque) void {
+    const id: objc.c.id = @ptrCast(view_id);
+    const view = objc.Object.fromId(id);
     view.msgSend(void, "removeFromSuperview", .{});
     view.msgSend(void, "release", .{});
 }
