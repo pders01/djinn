@@ -715,7 +715,7 @@ pub fn main() !void {
     var ghostty_surface_handle: ?ghostty_runtime.c.ghostty_surface_t = null;
     if (ghostty_app_opt) |*ga| {
         app.g.ghostty.app = ga;
-        ghostty_surface_handle = surface_lifecycle.bindGhosttySurface(allocator, ga, surface_host, cmd, active_session.profile.cwd) orelse {
+        ghostty_surface_handle = surface_lifecycle.bindGhosttySurface(allocator, active_session, ga, surface_host, cmd, active_session.profile.cwd) orelse {
             std.debug.print("error: ghostty surface_new returned null\n", .{});
             std.process.exit(1);
         };

@@ -66,7 +66,7 @@ pub fn activateSession(idx: usize) bool {
     if (!new_sess.spawned) {
         const ga = app.g.ghostty.app orelse return false;
         const allocator = app.g.allocator orelse return false;
-        const surf = bindGhosttySurface(allocator, ga, new_host, new_sess.profile.command, new_sess.profile.cwd) orelse {
+        const surf = bindGhosttySurface(allocator, new_sess, ga, new_host, new_sess.profile.command, new_sess.profile.cwd) orelse {
             std.debug.print("error: lazy surface spawn failed for profile '{s}'\n", .{new_sess.profile.name});
             return false;
         };
@@ -166,7 +166,7 @@ fn restartSurfaceCallback(ctx_opaque: ?*anyopaque) callconv(.c) void {
     const host_raw = active.surface_host orelse return;
     const host = objc.Object.fromId(host_raw);
 
-    const surf = bindGhosttySurface(allocator, ga, host, ctx.cmd, ctx.cwd) orelse {
+    const surf = bindGhosttySurface(allocator, active, ga, host, ctx.cmd, ctx.cwd) orelse {
         std.debug.print("error: restart surface spawn failed for profile '{s}'\n", .{active.profile.name});
         return;
     };
@@ -203,8 +203,14 @@ fn restartSurfaceCallback(ctx_opaque: ?*anyopaque) callconv(.c) void {
 /// Provider override flows through as argv[0]; a shell command (`zsh`,
 /// `bash`, …) maps to null so ghostty applies its own `-i / -l` logic.
 /// `cwd` overrides the spawn working directory; null = ghostty default.
+///
+/// `sess.spawn_arena` owns the dupeZ'd cmd + cwd buffers handed to
+/// ghostty. Lazily created on first bind; reset on every re-bind so
+/// restart traffic doesn't leak prior spawn args across the program
+/// lifetime. Bounded at "active sessions × current spawn args".
 pub fn bindGhosttySurface(
     allocator: std.mem.Allocator,
+    sess: *Session,
     ga: *ghostty_runtime.App,
     surface_host: objc.Object,
     cmd: []const u8,
@@ -216,14 +222,24 @@ pub fn bindGhosttySurface(
     else
         1.0;
 
+    // Lazily create + reset the per-session spawn arena. Arena is the
+    // right shape here: the buffers live exactly as long as the surface
+    // binding does, and every re-bind frees the previous batch wholesale.
+    const arena_ptr = sess.spawn_arena orelse blk: {
+        const a = allocator.create(std.heap.ArenaAllocator) catch return null;
+        a.* = std.heap.ArenaAllocator.init(allocator);
+        sess.spawn_arena = a;
+        break :blk a;
+    };
+    _ = arena_ptr.reset(.retain_capacity);
+    const spawn_alloc = arena_ptr.allocator();
+
     const surface_cmd: ?[*:0]const u8 = if (isShell(cmd)) null else blk: {
-        // Heap-dup so the C side has a stable pointer for the surface
-        // lifetime — intentional process-lifetime leak.
-        const dup = allocator.dupeZ(u8, cmd) catch break :blk null;
+        const dup = spawn_alloc.dupeZ(u8, cmd) catch break :blk null;
         break :blk dup.ptr;
     };
     const surface_cwd: ?[*:0]const u8 = if (cwd) |w| blk: {
-        const dup = allocator.dupeZ(u8, w) catch break :blk null;
+        const dup = spawn_alloc.dupeZ(u8, w) catch break :blk null;
         break :blk dup.ptr;
     } else null;
 

@@ -47,6 +47,13 @@ pub const Session = struct {
     /// True after the child process exits. The tab strip can use this
     /// to show a restart hint; Cmd+R / Cmd+Shift+R restarts the session.
     exited: bool = false,
+    /// Per-session arena for spawn-time string dupes (cmd + cwd handed
+    /// to ghostty as `[*:0]`). Created lazily on first `bindGhosttySurface`
+    /// and `reset(.retain_capacity)`-ed on every re-bind so the prior
+    /// dupes free without growing forever across restarts. Destroyed by
+    /// `SessionManager.deinit` for the program-exit path and by
+    /// `removeSessionLive` for the live-removal path.
+    spawn_arena: ?*std.heap.ArenaAllocator = null,
 };
 
 pub const SessionManager = struct {
@@ -113,6 +120,12 @@ pub const SessionManager = struct {
     }
 
     pub fn deinit(self: *SessionManager) void {
+        for (self.sessions.items) |sess| {
+            if (sess.spawn_arena) |a| {
+                a.deinit();
+                self.allocator.destroy(a);
+            }
+        }
         self.sessions.deinit(self.allocator);
         for (self.owned_strings.items) |s| self.allocator.free(s);
         self.owned_strings.deinit(self.allocator);

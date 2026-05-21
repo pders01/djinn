@@ -145,6 +145,13 @@ pub fn removeSessionLive(idx: usize) void {
         // instead of leaking on every profile removal.
         sh.msgSend(void, "release", .{});
     }
+    // Free the per-session spawn arena. SessionManager.deinit handles
+    // the program-exit path; this is the live-removal counterpart so
+    // the cmd/cwd dupes don't linger after the profile is gone.
+    if (dying.spawn_arena) |a| {
+        a.deinit();
+        sm.allocator.destroy(a);
+    }
     _ = sm.removeAt(idx);
 
     if (sm.count() <= 1) ensureTabStripVisible(false);
