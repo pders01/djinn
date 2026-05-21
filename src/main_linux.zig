@@ -216,31 +216,26 @@ const Dispatch = struct {
         self.panel.quit();
     }
 
-    /// VTE `child-exited` — the spawned shell terminated (typed
+    /// VTE `child-exited`: the spawned shell terminated (typed
     /// `exit`, was killed, etc.). `idx` carries the session index
     /// (SessionHost stamps it into Terminal.Handler.extra at spawn
-    /// time). Active session's exit closes the panel — preserves the
-    /// "typing `exit` quits djinn" gesture across multi-profile.
-    /// Inactive session's exit flips `entry.exited`, which fans
-    /// through `on_exit_changed` into `tab_strip.markExited` so the
-    /// dead session's chip dims + gains a strikethrough. The user
-    /// activates the chip and hits Ctrl+R to revive it; restartActive
+    /// time). Flips `entry.exited`, which fans through
+    /// `on_exit_changed` into `tab_strip.markExited` so the dead
+    /// session's chip dims + gains a strikethrough. Also feeds a
+    /// dim inline banner into the VTE so single-profile setups (tab
+    /// strip hidden) still get a visible cue. User revives the
+    /// session via Ctrl+R (`restart_session`); `restartActive`
     /// clears the bit through the same hook.
+    ///
+    /// Mirrors darwin's `handleChildExited`: the panel never quits
+    /// on child exit. The window close-request path remains the
+    /// canonical way to terminate djinn.
     fn onChildExited(ctx: *anyopaque, idx: usize) void {
         const self: *Dispatch = @ptrCast(@alignCast(ctx));
-        const host = self.session_host orelse {
-            // No SessionHost yet means a single-session bringup
-            // racing with init — fall back to the legacy quit so a
-            // child-exit during the eager-spawn window doesn't strand
-            // the panel with a dead VTE. session_host gets stamped
-            // before the first VTE's signal handlers can fire so this
-            // branch is theoretical, but keep it as a safety net.
-            self.panel.quit();
-            return;
-        };
-        if (idx == host.sm.active_idx) {
-            self.panel.quit();
-            return;
+        const host = self.session_host orelse return;
+        if (host.terminalAt(idx)) |term| {
+            const banner = "\r\n\x1b[2m[djinn] Process exited. Press Ctrl+R to restart, Ctrl+Shift+R for a fresh shell.\x1b[0m\r\n";
+            term.feedScreen(banner);
         }
         host.markExited(idx, true);
     }

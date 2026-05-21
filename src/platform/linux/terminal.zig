@@ -46,9 +46,12 @@ const g_signal_connect_data = gtk.g_signal_connect_data;
 const g_signal_handler_disconnect = gtk.g_signal_handler_disconnect;
 
 /// Caller-supplied dispatch hook. Invoked on the GLib main thread when
-/// VTE emits `child-exited` — i.e. when the shell process the terminal
-/// hosts has terminated. The handler typically maps to `panel.quit()`
-/// so typing `exit` closes the window.
+/// VTE emits `child-exited`, i.e. when the shell process the terminal
+/// hosts has terminated. The host typically flips a per-session exited
+/// bit so the chip dims and the user can hit Ctrl+R to revive; the
+/// panel itself stays up regardless of which session exited (matches
+/// the darwin path's "Press any key to close" semantics where ghostty
+/// owns the inline message).
 ///
 /// `extra` is an opaque caller-defined payload that comes back through
 /// the callback. Terminal stores whatever the caller put in here and
@@ -101,6 +104,11 @@ extern "c" fn vte_terminal_set_font_scale(terminal: *VteTerminal, scale: f64) vo
 extern "c" fn vte_terminal_get_font_scale(terminal: *VteTerminal) f64;
 extern "c" fn vte_terminal_reset(terminal: *VteTerminal, clear_tabstops: c_int, clear_history: c_int) void;
 extern "c" fn vte_terminal_feed_child(terminal: *VteTerminal, data: [*]const u8, length: isize) void;
+/// Feed bytes into VTE's screen buffer directly (NOT the PTY).
+/// Used to paint synthetic host messages after the child has
+/// already exited, when `feed_child` would have nowhere to go.
+/// ANSI escapes work (CSI/SGR are interpreted by VTE itself).
+extern "c" fn vte_terminal_feed(terminal: *VteTerminal, data: [*]const u8, length: isize) void;
 
 // VTE inherits GtkScrollable since 0.40 — its vertical GtkAdjustment
 // is the canonical scrollback driver. `vte_terminal_get_vadjustment`
@@ -262,12 +270,13 @@ pub const Terminal = struct {
         );
 
         // `child-exited(VteTerminal*, gint status, gpointer)` fires
-        // when the spawned shell terminates — e.g. the user types
-        // `exit`, the kernel kills it, or it segfaults. Hosts wire the
-        // handler to `panel.quit()` so the window goes away with the
-        // shell rather than presenting a blank terminal. Status is
-        // ignored — djinn doesn't restart shells, and the GUI is
-        // tearing down anyway.
+        // when the spawned shell terminates (user types `exit`,
+        // kernel kills it, it segfaults, etc.). SessionHost routes
+        // the dispatcher, which marks the entry exited and paints
+        // an inline "Press Ctrl+R to restart" banner via
+        // `feedScreen`; the panel itself stays open. Status is
+        // ignored: djinn doesn't care WHY the child died, only
+        // that it did.
         var handler_box: ?*Handler = null;
         var child_exited_id: c_ulong = 0;
         if (handler) |h| {
@@ -382,13 +391,27 @@ pub const Terminal = struct {
         vte_terminal_feed_child(terminal, ctrl_l.ptr, @intCast(ctrl_l.len));
     }
 
+    /// Paint `data` directly into VTE's screen buffer, bypassing the
+    /// PTY. Used by the host to drop a synthetic "Process exited"
+    /// banner after the child terminates so single-profile setups
+    /// (tab strip hidden, no chip strikethrough cue) still get a
+    /// visible signal. ANSI escapes work (VTE interprets SGR/CSI
+    /// itself).
+    pub fn feedScreen(self: *Terminal, data: []const u8) void {
+        if (data.len == 0) return;
+        const terminal: *VteTerminal = @ptrCast(self.widget);
+        vte_terminal_feed(terminal, data.ptr, @intCast(data.len));
+    }
+
     /// Disconnect the `child-exited` signal so an imminent widget
-    /// destroy (via `gtk_stack_remove` during a session restart) can
-    /// hangup the PTY child without fanning the resulting SIGHUP-then-
-    /// child-exited back into the host's `panel.quit` handler. Called
-    /// by `SessionHost.restartActive` right before tearing the old
-    /// VTE widget down. Idempotent — `deinit`'s own disconnect
-    /// short-circuits when `child_exited_handler_id == 0`.
+    /// destroy (via `gtk_stack_remove` during a session restart)
+    /// can hangup the PTY child without fanning the resulting
+    /// SIGHUP-then-child-exited into the host's exit-tracking
+    /// dispatch (which would mark the about-to-be-replaced slot
+    /// exited just before the new spawn lands, causing a chip
+    /// flicker). Called by `SessionHost.restartActive` right before
+    /// tearing the old VTE widget down. Idempotent: `deinit`'s own
+    /// disconnect short-circuits when `child_exited_handler_id == 0`.
     ///
     /// Why we don't use `vte_terminal_set_pty(t, NULL)` for the
     /// hangup: VTE 0.84's set_pty(NULL) path NULL-derefs at offset

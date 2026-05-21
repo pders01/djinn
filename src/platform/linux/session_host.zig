@@ -126,13 +126,12 @@ const Entry = struct {
     name_z: [*:0]const u8,
     terminal: ?Terminal = null,
     /// True once this session's shell has exited *without* a
-    /// SessionHost-driven restart. The active session never carries
-    /// `exited = true` for long — the host fans `on_active_exited`
-    /// at panel-quit, the panel tears down before the user can
-    /// observe the flag. Inactive sessions retain the bit until the
-    /// user activates them and hits Ctrl+R (restartActive clears it).
-    /// Tab strip reads `markExited(idx, true)` from the host's
-    /// `on_exit_changed` hook to re-skin the chip.
+    /// SessionHost-driven restart. Set on every child-exit (active
+    /// or inactive; the panel never closes on shell exit), cleared
+    /// by `restartActive` after a successful re-spawn. Tab strip
+    /// reads the flip via the host's `on_exit_changed` hook to
+    /// re-skin the chip (dim + strikethrough). User revives the
+    /// session by activating its chip and hitting Ctrl+R.
     exited: bool = false,
 };
 
@@ -148,9 +147,10 @@ pub const SessionHost = struct {
     /// Handler template fanned to every spawned VTE. Each spawn copies
     /// the template and stamps `extra = idx` so the host's
     /// `on_child_exited` callback can tell which session just lost its
-    /// shell — needed to branch active (panel.quit) vs inactive (flip
-    /// `entry.exited` + re-skin the chip). The shared template's own
-    /// `extra` field is unread; SessionHost overwrites it per session.
+    /// shell. The dispatcher flips `entry.exited` and feeds an inline
+    /// banner via `terminalAt(idx).?.feedScreen` so the user sees the
+    /// session is dead. The shared template's own `extra` field is
+    /// unread; SessionHost overwrites it per session.
     handler: ?TerminalHandler,
     /// Late-stamped pointer to the find overlay so each `activate`
     /// can call `setTarget(new_vte)` and keep the find chip's
@@ -175,10 +175,10 @@ pub const SessionHost = struct {
     /// leave the rest as lazy slots. Returns a SessionHost the caller
     /// embeds into its layout via `widget()`.
     ///
-    /// `handler` is shared across every session — the child-exited
-    /// fan-out is fine because `panel.quit()` is idempotent. If we
-    /// later need per-session exit treatment, the handler struct
-    /// grows a `session_idx` slot.
+    /// `handler` is shared across every session; SessionHost stamps
+    /// per-session `extra = idx` in `handlerFor(idx)` so the
+    /// dispatcher can identify the firing session and mark it
+    /// exited / paint its banner.
     pub fn init(
         allocator: std.mem.Allocator,
         sm: *SessionManager,
@@ -339,11 +339,16 @@ pub const SessionHost = struct {
     /// Strategy: build the fresh Terminal FIRST (so an OOM doesn't
     /// strand the slot empty), then detach the old's exit signal,
     /// `gtk_stack_remove` the old widget (which finalizes it, VTE
-    /// closes the pty, child gets SIGHUP — the disconnected handler
-    /// means no panel.quit fan-out), deinit the old Terminal's
+    /// closes the pty, child gets SIGHUP), deinit the old Terminal's
     /// owned strings, and add the new widget under the same stack
     /// name. Same tab, same log pane, same window position; only
     /// the VTE widget under the hood is fresh.
+    ///
+    /// Why detach the old handler first: the SIGHUP from
+    /// `gtk_stack_remove` would otherwise race into
+    /// `markExited(idx, true)` just before the new spawn lands,
+    /// flickering the chip and painting a stale "Process exited"
+    /// banner into a buffer about to be discarded.
     ///
     /// Why widget replacement, not in-place re-spawn:
     /// `vte_terminal_set_pty(t, NULL)` NULL-derefs at +0x18 inside
@@ -375,9 +380,10 @@ pub const SessionHost = struct {
             return false;
         };
 
-        // Commit: detach old handler (no panel.quit on the imminent
-        // SIGHUP), remove old widget (finalize → pty close → child
-        // SIGHUP), deinit old Terminal's owned strings.
+        // Commit: detach old handler (so the imminent SIGHUP doesn't
+        // race into markExited on the about-to-be-replaced slot),
+        // remove old widget (finalize → pty close → child SIGHUP),
+        // deinit old Terminal's owned strings.
         var old_term = entry.terminal.?;
         old_term.detachExitHandler();
         gtk_stack_remove(@ptrCast(self.stack), old_term.widget);
@@ -480,6 +486,15 @@ pub const SessionHost = struct {
     pub fn isExited(self: *SessionHost, idx: usize) bool {
         if (idx >= self.entries.items.len) return false;
         return self.entries.items[idx].exited;
+    }
+
+    /// Mutable pointer to the Terminal at `idx`, or null when the
+    /// slot is lazy (never activated) or `idx` is out of bounds.
+    /// Used by the child-exited dispatcher to feed an inline banner
+    /// into the VTE that just lost its shell.
+    pub fn terminalAt(self: *SessionHost, idx: usize) ?*Terminal {
+        if (idx >= self.entries.items.len) return null;
+        return if (self.entries.items[idx].terminal) |*t| t else null;
     }
 };
 
