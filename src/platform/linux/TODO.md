@@ -17,14 +17,16 @@ during the prototype phase; remaining work is opportunistic
 darwin-parity ports and the deferred per-action user_data
 refactor.
 
-1. **Darwin-parity opportunistic ports for linux**: right-click
-   "Copy entry" in log pane, per-client header color, filter
-   prefix syntax + level pills, tab-strip agent-state dot, and
-   palette enrichment + duplicate-active row already shipped on
-   darwin (see the consolidated multi-profile commit); each
-   waits on a separate session to land its linux counterpart
-   because the surrounding code is unfamiliar. The Tier A block
-   under `## Pick-up plan` has the per-feature shape.
+1. **Darwin-parity opportunistic ports for linux**: per-client
+   header color, filter prefix syntax + level pills, and palette
+   enrichment + duplicate-active row already shipped on darwin
+   (see the consolidated multi-profile commit); each waits on a
+   separate session to land its linux counterpart because the
+   surrounding code is unfamiliar. Right-click "Copy entry",
+   per-profile bell, per-profile window-size memory, and the
+   tab-strip agent-state dot landed in the May 2026 polish wave.
+   The Tier A block under `## Pick-up plan` has the per-feature
+   shape for the remaining items.
 2. **Per-action `*anyopaque` user_data for keymap actions** (deferred).
    Today every handler takes `*Context` and reaches for the slots it
    needs; the Popovers sub-struct cleaned up the late-stamped
@@ -941,19 +943,6 @@ shape before porting.
   immediately above it); the toggle's `notify::active` handler
   rewrites the entry text via `composeNeedle`. Cheatsheet update
   in `linux/cheatsheet.zig` mirrors darwin's footer block.
-- **Tab strip agent-state dot** (global, trailing edge).
-  Darwin: `session/tab_strip.zig:drawRectImpl` paints a 7pt circle
-  at `bounds.size.width - 12` with color from
-  `app.g.agent.state.snapshot().state` (working=info,
-  attention=warn, error=err, idle/done=invisible). Refresh path
-  hooks into the `tickImpl` state-flip branch in
-  `terminal/view.zig`.
-  Linux: append a small `GtkDrawingArea` (or a `.djinn-state-dot`
-  `GtkLabel` with a CSS-painted `:before`) to
-  `linux/tab_strip.zig`'s container. Drive it from the existing
-  agent-state poll already running for the tray icon
-  (`tray.zig::observeAgentState`) — share the snapshot rather
-  than spinning a second timer.
 - **Profile palette enrichment + "+ duplicate active profile" row.**
   Darwin: `session/palette.zig` row renderer now emits
   `{label}  ·  {cwd or command}`; a synthetic row past the last

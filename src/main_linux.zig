@@ -1302,6 +1302,10 @@ pub fn main() !void {
     // coupling two subsystems with different lifetimes (tray is
     // optional; log pane always exists).
     log_pane.observeAgentState(&agent_state);
+    // Tab strip's trailing-edge agent-state dot. Same self-poll
+    // pattern as the tray + log pane; the mutex hits are cheap and
+    // each observer stays decoupled from the others.
+    tab_strip.observeAgentState(&agent_state);
 
     var notifier = platform.Notifier.init(.{
         .enabled = config.notifications.system_notifications,

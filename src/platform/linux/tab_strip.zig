@@ -60,6 +60,8 @@ const builtin = @import("builtin");
 const gtk = @import("gtk.zig");
 const SessionManager = @import("../../session/manager.zig").SessionManager;
 const ThemeOptions = @import("terminal.zig").ThemeOptions;
+const AgentState = @import("../../agent/state.zig").AgentState;
+const Agent = @import("../../agent/state.zig").Agent;
 
 const GtkWidget = gtk.GtkWidget;
 const GdkDisplay = gtk.GdkDisplay;
@@ -95,6 +97,17 @@ extern "c" fn gtk_widget_add_css_class(widget: *GtkWidget, css_class: [*:0]const
 extern "c" fn gtk_widget_remove_css_class(widget: *GtkWidget, css_class: [*:0]const u8) void;
 extern "c" fn gtk_widget_set_hexpand(widget: *GtkWidget, expand: gboolean) void;
 extern "c" fn gtk_widget_set_vexpand(widget: *GtkWidget, expand: gboolean) void;
+extern "c" fn gtk_widget_set_halign(widget: *GtkWidget, align_: c_int) void;
+extern "c" fn gtk_widget_set_valign(widget: *GtkWidget, align_: c_int) void;
+extern "c" fn gtk_widget_set_size_request(widget: *GtkWidget, w: c_int, h: c_int) void;
+
+// GtkAlign enum: FILL=0, START=1, END=2, CENTER=3.
+const GTK_ALIGN_END: c_int = 2;
+const GTK_ALIGN_CENTER: c_int = 3;
+
+const g_timeout_add = gtk.g_timeout_add;
+const g_source_remove = gtk.g_source_remove;
+const G_SOURCE_CONTINUE: c_int = 1;
 
 // ─── Public surface ──────────────────────────────────────────────────
 
@@ -139,6 +152,22 @@ pub const TabStrip = struct {
     /// (when hot-reload reconcile lands) can re-skin without main_linux
     /// re-passing the theme.
     theme_opts: ThemeOptions,
+    /// Small CSS-painted circle pinned to the trailing edge. Color
+    /// per agent state (working / attention / error / idle-or-done);
+    /// idle and done render transparent so the dot is invisible in
+    /// the quiet state. Lives in the strip's GtkBox after the last
+    /// chip with `hexpand=true; halign=END` so it gravitates to the
+    /// right without disturbing chip layout.
+    state_dot: *GtkWidget,
+    /// Latest pushed state, used to skip no-op CSS class swaps.
+    last_state: Agent = .idle,
+    /// AgentState observed by `observeAgentState`. Null until
+    /// wiring lands; the poll callback short-circuits while null.
+    observed_state: ?*AgentState = null,
+    /// `g_timeout_add` tag for the 250ms agent-state poll. 0 when
+    /// not running; cleared in `deinit` so the timer doesn't fire
+    /// against a freed strip after teardown.
+    state_poll_id: c_uint = 0,
 
     /// Build the strip + one chip per session. The active session's
     /// chip gets `.djinn-tab-active` from the start so the first
@@ -166,6 +195,22 @@ pub const TabStrip = struct {
             );
         }
 
+        // Agent-state dot. Created here (before buildButtons) so
+        // the field assignment below can reach it, but appended to
+        // the container AFTER the chips so it sits at the trailing
+        // edge. The widget itself is an empty GtkBox; CSS draws the
+        // colored circle via background-color + border-radius. Min
+        // size 8x8 keeps the visual stable across GTK themes that
+        // would otherwise inflate empty containers to their padding
+        // minimum.
+        const state_dot = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
+        gtk_widget_add_css_class(state_dot, "djinn-state-dot");
+        gtk_widget_add_css_class(state_dot, "djinn-state-dot-idle");
+        gtk_widget_set_size_request(state_dot, 8, 8);
+        gtk_widget_set_halign(state_dot, GTK_ALIGN_END);
+        gtk_widget_set_valign(state_dot, GTK_ALIGN_CENTER);
+        gtk_widget_set_hexpand(state_dot, 1);
+
         var self: TabStrip = .{
             .allocator = allocator,
             .sm = sm,
@@ -173,16 +218,23 @@ pub const TabStrip = struct {
             .container = container,
             .provider = provider,
             .theme_opts = theme_opts,
+            .state_dot = state_dot,
         };
         // The buildButtons path mutates self.* — taking &self once
         // here avoids re-creating the receiver inside the loop.
         try self.buildButtons();
+        // Dot lands AFTER chips so it pins to the trailing edge.
+        gtk_box_append(@ptrCast(container), state_dot);
         self.applyTheme(theme_opts);
         gtk_widget_set_visible(container, if (sm.count() > 1) 1 else 0);
         return self;
     }
 
     pub fn deinit(self: *TabStrip) void {
+        if (self.state_poll_id != 0) {
+            _ = g_source_remove(self.state_poll_id);
+            self.state_poll_id = 0;
+        }
         for (self.buttons.items, self.clicked_ids.items) |b, id| {
             if (id != 0) g_signal_handler_disconnect(@ptrCast(b), id);
         }
@@ -249,6 +301,39 @@ pub const TabStrip = struct {
         } else {
             gtk_widget_remove_css_class(button, "djinn-tab-exited");
         }
+    }
+
+    /// Swap the trailing-edge dot's CSS class so its background
+    /// color tracks the agent's state. Same-value calls are cheap
+    /// (GTK no-ops on duplicate class adds/removes); same-state
+    /// re-polls hit the early return above via `last_state`.
+    pub fn markState(self: *TabStrip, state: Agent) void {
+        const klass: [*:0]const u8 = stateClass(state);
+        // Drop every state-specific class, then add the new one.
+        // Cheaper than tracking the previous class string and
+        // robust to a future re-init that left a stale class on
+        // the widget.
+        gtk_widget_remove_css_class(self.state_dot, "djinn-state-dot-idle");
+        gtk_widget_remove_css_class(self.state_dot, "djinn-state-dot-working");
+        gtk_widget_remove_css_class(self.state_dot, "djinn-state-dot-attention");
+        gtk_widget_remove_css_class(self.state_dot, "djinn-state-dot-done");
+        gtk_widget_remove_css_class(self.state_dot, "djinn-state-dot-error");
+        gtk_widget_add_css_class(self.state_dot, klass);
+        self.last_state = state;
+    }
+
+    /// Begin polling `state` on the GLib main thread at the same
+    /// 250ms cadence the tray uses. The poll snapshots state under
+    /// AgentState.mutex, releases the lock, then calls `markState`
+    /// when the value differs from the last push. Idempotent;
+    /// re-calling replaces the prior timer. Cleared in `deinit`.
+    pub fn observeAgentState(self: *TabStrip, state: *AgentState) void {
+        if (self.state_poll_id != 0) {
+            _ = g_source_remove(self.state_poll_id);
+            self.state_poll_id = 0;
+        }
+        self.observed_state = state;
+        self.state_poll_id = g_timeout_add(250, pollStateTick, @ptrCast(self));
     }
 
     /// Reload the strip's CSS from `opts`. Mirrors
@@ -330,6 +415,38 @@ pub const TabStrip = struct {
 fn onClicked(_: *GObject, user_data: gpointer) callconv(.c) void {
     const slot: *Slot = @ptrCast(@alignCast(user_data orelse return));
     _ = slot.strip.on_activate.on_invoke(slot.strip.on_activate.ctx, slot.idx);
+}
+
+/// 250ms agent-state poll. Same shape as `tray.zig::pollAgentTick`:
+/// snapshot under the AgentState mutex, release, then re-skin the
+/// dot when state actually changed. Skipping the no-op rewrite
+/// keeps GTK's CSS engine quiet during idle stretches.
+fn pollStateTick(user_data: gpointer) callconv(.c) c_int {
+    const self: *TabStrip = @ptrCast(@alignCast(user_data orelse return G_SOURCE_CONTINUE));
+    const state = self.observed_state orelse return G_SOURCE_CONTINUE;
+
+    var snap: Agent = .idle;
+    {
+        state.mutex.lock();
+        defer state.mutex.unlock();
+        snap = state.state;
+    }
+    if (snap == self.last_state) return G_SOURCE_CONTINUE;
+    self.markState(snap);
+    return G_SOURCE_CONTINUE;
+}
+
+/// CSS class name for each Agent value. Kept in one place so the
+/// list in `markState` (remove-all-then-add) and the rules in
+/// `writeThemedCss` (color per class) stay in lockstep.
+fn stateClass(state: Agent) [*:0]const u8 {
+    return switch (state) {
+        .idle => "djinn-state-dot-idle",
+        .working => "djinn-state-dot-working",
+        .attention => "djinn-state-dot-attention",
+        .done => "djinn-state-dot-done",
+        .@"error" => "djinn-state-dot-error",
+    };
 }
 
 // ─── Theming ─────────────────────────────────────────────────────────
@@ -503,6 +620,75 @@ fn writeThemedCss(
             \\}
             \\button.djinn-tab.djinn-tab-exited:hover {
             \\  color: alpha(@theme_fg_color, 0.6);
+            \\}
+            \\
+        );
+    }
+
+    // Agent-state dot at the trailing edge. Idle + done render
+    // transparent so the strip is visually quiet during the resting
+    // states; working / attention / error paint in the ANSI slot
+    // colors that match the rest of djinn's chrome conventions:
+    //   palette[4] (blue)  = working / info
+    //   palette[3] (yellow)= attention / warn
+    //   palette[1] (red)   = error / err
+    // GTK named-color fallbacks mirror those semantic roles for
+    // setups without ghostty palette inheritance.
+    try w.writeAll(
+        \\box.djinn-state-dot {
+        \\  background-image: none;
+        \\  border-radius: 50%;
+        \\  min-width: 8px;
+        \\  min-height: 8px;
+        \\  margin-right: 8px;
+        \\}
+        \\box.djinn-state-dot.djinn-state-dot-idle,
+        \\box.djinn-state-dot.djinn-state-dot-done {
+        \\  background-color: transparent;
+        \\}
+        \\
+    );
+    if (opts.palette[4]) |c| {
+        try w.print(
+            "box.djinn-state-dot.djinn-state-dot-working {{\n" ++
+                "  background-color: rgb({d}, {d}, {d});\n" ++
+                "}}\n",
+            .{ c.r, c.g, c.b },
+        );
+    } else {
+        try w.writeAll(
+            \\box.djinn-state-dot.djinn-state-dot-working {
+            \\  background-color: @accent_color;
+            \\}
+            \\
+        );
+    }
+    if (opts.palette[3]) |c| {
+        try w.print(
+            "box.djinn-state-dot.djinn-state-dot-attention {{\n" ++
+                "  background-color: rgb({d}, {d}, {d});\n" ++
+                "}}\n",
+            .{ c.r, c.g, c.b },
+        );
+    } else {
+        try w.writeAll(
+            \\box.djinn-state-dot.djinn-state-dot-attention {
+            \\  background-color: @warning_color;
+            \\}
+            \\
+        );
+    }
+    if (opts.palette[1]) |c| {
+        try w.print(
+            "box.djinn-state-dot.djinn-state-dot-error {{\n" ++
+                "  background-color: rgb({d}, {d}, {d});\n" ++
+                "}}\n",
+            .{ c.r, c.g, c.b },
+        );
+    } else {
+        try w.writeAll(
+            \\box.djinn-state-dot.djinn-state-dot-error {
+            \\  background-color: @error_color;
             \\}
             \\
         );
