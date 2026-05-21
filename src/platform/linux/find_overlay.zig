@@ -95,16 +95,25 @@ const GtkOrientation = c_int;
 const GTK_POS_BOTTOM: GtkPositionType = 3;
 const GTK_ORIENTATION_HORIZONTAL: GtkOrientation = 0;
 
+const GdkRectangle = extern struct {
+    x: c_int,
+    y: c_int,
+    width: c_int,
+    height: c_int,
+};
+
 extern "c" fn gtk_popover_new() *GtkWidget;
 extern "c" fn gtk_popover_set_child(popover: *GtkPopover, child: ?*GtkWidget) void;
 extern "c" fn gtk_popover_set_position(popover: *GtkPopover, pos: GtkPositionType) void;
 extern "c" fn gtk_popover_set_has_arrow(popover: *GtkPopover, has: gboolean) void;
 extern "c" fn gtk_popover_set_autohide(popover: *GtkPopover, autohide: gboolean) void;
+extern "c" fn gtk_popover_set_pointing_to(popover: *GtkPopover, rect: ?*const GdkRectangle) void;
 extern "c" fn gtk_popover_popup(popover: *GtkPopover) void;
 extern "c" fn gtk_popover_popdown(popover: *GtkPopover) void;
 extern "c" fn gtk_widget_set_parent(widget: *GtkWidget, parent: *GtkWidget) void;
 extern "c" fn gtk_widget_unparent(widget: *GtkWidget) void;
 extern "c" fn gtk_widget_grab_focus(widget: *GtkWidget) gboolean;
+extern "c" fn gtk_widget_get_width(widget: *GtkWidget) c_int;
 
 extern "c" fn gtk_box_new(orientation: GtkOrientation, spacing: c_int) *GtkWidget;
 extern "c" fn gtk_box_append(box: *GtkBox, child: *GtkWidget) void;
@@ -123,6 +132,11 @@ extern "c" fn gtk_widget_set_tooltip_text(widget: *GtkWidget, text: [*:0]const u
 pub const FindOverlay = struct {
     terminal: *VteTerminal,
     popover: *GtkWidget,
+    /// Parent widget the popover anchors to. Stored so `open()` can
+    /// re-read its width on each popup and rebuild the pointing-to
+    /// rect against the live panel size. Same idiom as `palette.open`
+    /// / `cheatsheet.open`.
+    anchor: *GtkWidget,
     entry: *GtkWidget,
     /// Currently-compiled regex (one per non-empty entry text), or
     /// null when the entry is empty / a compile failed. Owned: each
@@ -181,6 +195,7 @@ pub const FindOverlay = struct {
         return .{
             .terminal = terminal,
             .popover = popover,
+            .anchor = anchor,
             .entry = entry,
             .prev_button = prev_button,
             .next_button = next_button,
@@ -271,6 +286,20 @@ pub const FindOverlay = struct {
     /// Pop up the popover + focus the entry. Idempotent — GTK's
     /// `popup` is a no-op when already visible.
     pub fn open(self: *FindOverlay) void {
+        // Without `set_pointing_to`, GTK4 anchors against the parent's
+        // full bounds + GTK_POS_BOTTOM, which drops the chip below the
+        // panel entirely (same bug `palette.open` hit). Aim at a 1x1
+        // rect near the top edge so the chip hangs from the top of the
+        // terminal area, matching the browser / iTerm find-bar idiom
+        // the surrounding comments call for.
+        const w = gtk_widget_get_width(self.anchor);
+        const rect: GdkRectangle = .{
+            .x = @divTrunc(@max(w, 0), 2),
+            .y = 12,
+            .width = 1,
+            .height = 1,
+        };
+        gtk_popover_set_pointing_to(@ptrCast(self.popover), &rect);
         gtk_popover_popup(@ptrCast(self.popover));
         _ = gtk_widget_grab_focus(self.entry);
     }
