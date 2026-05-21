@@ -32,18 +32,27 @@ across rebuilds. Local iteration no longer needs `tccutil reset`.
 ### Roadmap from UX review (2026-05-11)
 
 Full review in conversation; consolidated tier list below. Friction
-themes:
+themes — most cleared during the mid-May feature pass, see the
+"Recently shipped" log for the commit map:
 
 - No first-run flow; user reads 200-line README before hotkey works.
 - MCP endpoint rotates per launch → re-paste into every project.
 - `djinn_attention` is one-way; user must context-switch to terminal.
-- Log pane is fire-and-forget — no filter, search, copy-entry, jump.
-- Multi-client confusion (raw 6-hex client ids, no nickname / mute).
-- Notification spam from `djinn_progress` floods Notification Center.
-- No keyboard discovery (`Cmd+?` cheatsheet absent).
-- Window size memory is global, not per-profile.
-- Profile creation is config-file-only (Cmd+Shift+N overlay missing).
-- Drag-drop image temp files in `/tmp/djinn-drop-*` never reaped.
+- ~~Log pane is fire-and-forget~~ ✅ filter chip, copy entry, level
+  pills, per-client color, sticky attentions.
+- ~~Multi-client confusion~~ ✅ nicknames + mute + color-coded
+  client name in header.
+- ~~Notification spam from `djinn_progress`~~ ✅ rate-limit per
+  (client, kind) + per-state gates suppress chatter by default.
+- ~~No keyboard discovery (`Cmd+?` cheatsheet absent)~~ ✅
+  `session/cheatsheet.zig` overlay (Cmd+Shift+. after rebind).
+- ~~Window size memory is global, not per-profile~~ ✅
+  `state.profiles[<name>].{w,h}`.
+- Profile creation is config-file-only (Cmd+Shift+N now duplicates
+  the active profile, but a true "+ new profile from scratch"
+  overlay still requires config writeback).
+- ~~Drag-drop image temp files in `/tmp/djinn-drop-*` never reaped~~
+  ✅ stale `djinn-drop-*` reaped on launch.
 
 **Deferred Tier S items** (recorded for later):
 
@@ -63,11 +72,12 @@ themes:
   Defer until we can pair with a keychain-backed token store +
   `chmod 600` enforcement.
 
-**Tier S4 — Cmd+? cheatsheet overlay** *(early candidate, picked up
-after Tier A pass)*. Reuse `session/palette.zig` overlay pattern;
-render `actions[]` grouped by category, reflect user keymap
-overrides. Reuses `chrome.Style`; standalone module
-`session/cheatsheet.zig`.
+**Tier S4 — Cmd+? cheatsheet overlay** ✅ — shipped as
+`session/cheatsheet.zig` (commits `f2db861` + `6e3e9ff` + `1a2deef`).
+Reuses the `session/palette.zig` overlay pattern; renders `actions[]`
+grouped by category, reflects user keymap overrides, reskins with the
+chrome `Style`. Final binding is **Cmd+Shift+.** — the original Cmd+?
+mapping conflicted with macOS shortcut help on US layouts.
 
 **Tier A — high value, medium cost (target this pass):**
 
@@ -111,10 +121,11 @@ overrides. Reuses `chrome.Style`; standalone module
      its path in the agent log on next show (degraded UX —
      scrollback lives outside the live terminal).
    Revisit when upstream lands the inject path.
-6. **Window-per-profile size memory** — currently `state.json`
-   tracks one global size. Split into
-   `state.profiles[<name>].{w,h,pos}` so log-heavy profile (Claude
-   review) can be tall+wide while shell profile stays compact.
+6. **Window-per-profile size memory** ✅ — shipped in `f92a241`.
+   `state.json` now carries `profiles[<name>].{w,h}`; active-profile
+   switch via tab strip / palette / Cmd+number restores the cached
+   dimensions. Config-pinned `window-width` / `window-height` still
+   win — explicit user override beats implicit-from-drag memory.
 
 **Tier B — quality-of-life:**
 
@@ -124,12 +135,17 @@ overrides. Reuses `chrome.Style`; standalone module
 9. Selection → MCP push (Cmd+Shift+L) — selection becomes
    `djinn_log(info, <text>)` so the agent can introspect what the
    user pinned. Pairs with MCP read tools below.
-10. **MCP read tools** — `djinn_recent_logs(n)`,
-    `djinn_recent_attentions()`, `djinn_active_profile()`. Mirrors
-    the write surface; lets agents read user-visible state.
-11. Theme toggle hotkey (`Cmd+Shift+T`) cycles light → dark → auto.
-12. Drag-drop image temp cleanup on launch + on panel hide. Reap
-    `/tmp/djinn-drop-*` so the dir doesn't grow forever.
+10. **MCP read tools** ✅ — `djinn_recent_logs`,
+    `djinn_recent_attentions`, `djinn_active_profile` (`fc4f3fd`).
+    Pairs with the still-open #9 (selection → MCP push) so agents
+    can both read and write user-visible state.
+11. **Theme toggle hotkey** ✅ — `Cmd+Shift+T` cycles
+    null (system) → light → dark → null (`e5508d7`). Override
+    survives ghostty config reloads (`98c4afb` fixes the regression
+    where reloadConfigFromDisk wiped the override).
+12. **Drag-drop image temp cleanup** ✅ — `f09ad8e` reaps
+    `/tmp/djinn-drop-*` on launch. Panel-hide reap was deemed
+    unnecessary since launch reap caps growth across sessions.
 13. Find chip toggles *(deferred — ghostty API gap)*. The
     `ghostty_action_start_search_s` struct in ghostty.h carries
     only `const char* needle`; case / regex / word flags aren't
@@ -141,7 +157,10 @@ overrides. Reuses `chrome.Style`; standalone module
     large scrollbacks).
 14. Mouse-less terminal nav — `Cmd+J` jump-to-prompt (regex per
     profile). Skips most scrollback dragging.
-15. Per-profile bell config (`profile.<name>.bell-audible = false`).
+15. **Per-profile bell config** ✅ — `profile.<name>.bell-audible /
+    bell-visual / bell-sound` (`110e082`). `handleRingBell` consults
+    profile overrides before falling back to the global `bell.*`
+    keys.
 
 **Tier C — speculative / lower payoff:**
 
@@ -168,20 +187,27 @@ to a `[]const struct { k: []const u8, v: []const u8 }` on the entry.
 Spawn path: pass through to ghostty via `surface_config_s.env_*`
 (`_count` + `_pairs` pattern in ghostty.h).
 
-### Dynamic profile creation *(deferred — needs config writeback)*
+### Dynamic profile creation *(partly addressed — duplicate-active shipped)*
 
-Currently profiles are file-defined. A `Cmd+Shift+N → New profile`
-overlay would let users add a profile at runtime, but persisting it
-requires writing back to `~/.config/djinn/config` without clobbering
-comments / formatting. Either:
+`Cmd+Shift+N` now duplicates the active profile in place (`ac67e3c`),
+and `Cmd+Shift+W` closes the active profile (`c4979ff` +
+`ca44c09` for the atomic-write rollback on remove). Both write back
+to `~/.config/djinn/config` by appending to the bottom of the file —
+preserves comments above, doesn't try to round-trip the existing
+layout.
 
-1. Append `profile.<name>.*` lines to the bottom of the file (simplest,
-   preserves comments above).
-2. Build a structure-preserving editor — read line-by-line, find the
-   profile section, insert in place.
+What's still missing is a true **"+ new profile from scratch"**
+affordance: today every duplicated profile inherits the active
+profile's command / cwd / bell config, so first-time users
+without an existing profile have nothing to fork. Options when
+this comes up:
 
-Pick (1) for v1 if this lands. The palette-switcher UX from `ab9b18e`
-is the natural place to surface a "+ New profile…" affordance.
+1. Add a "+ blank profile" row to the palette switcher alongside
+   the existing "+ duplicate active profile" row. Writes a minimal
+   `profile.<name>.command = /bin/zsh` stanza.
+2. Build a structure-preserving editor — read line-by-line, find
+   the profile section, insert in place — only worth doing once
+   we have more than 1-2 writeback paths.
 
 ### Lower-priority NSResponder gaps *(audit residue)*
 
@@ -328,6 +354,88 @@ Each item became its own commit so reverts stay surgical.
 - 8 unit tests added (was: 7 keymap tests; now 7 + 4 find + 4 palette)
 - Per-session arena bounds the cmd/cwd leak
 - Four NSView leaks fixed (per-cycle, not per-program)
+
+### Mid-May feature pass (2026-05-07 → 2026-05-20)
+
+Three-week feature wave between the architecture refactor and the
+post-refactor cleanup, clearing most of the UX-review friction
+themes recorded above.
+
+**Tier S4 — keyboard discovery:**
+- **`feat(cheatsheet) f2db861`** — Cmd+? keymap overlay
+  (`session/cheatsheet.zig`). `actions[]` grouped by category,
+  reflects keymap overrides.
+- **`fix(cheatsheet) 6e3e9ff`** — replace `{s: <[width]}` runtime
+  formatter (Zig 0.15 doesn't accept the bracketed-width form) with
+  a manual space-pad loop.
+- **`fix(cheatsheet) 1a2deef`** — rebind Cmd+? → Cmd+Shift+. + use
+  monospaced row font so the column alignment lands on any layout.
+
+**Tier A — per-profile chrome:**
+- **`feat(window) f92a241`** — per-profile window size memory in
+  `state.profiles[<name>]`. Tab switch / palette / Cmd+number
+  restores cached dimensions; config-pinned `window-{width,height}`
+  still wins.
+- **`feat(notify) 6f7630c`** — per-state notification gates
+  (`notify_on_{attention,error,done,progress}`) + rate-limit per
+  (client, kind) tuple.
+- **`feat(client) 89cf528`** — per-client identity surface:
+  nicknames + mute toggle + color-coded client name in log header.
+- **`feat(log) 834fbc8`** — sticky attention banner.
+- **`feat(log) 95e4f97`** — free-text filter chip with prefix
+  syntax (`level:warn,err`, `client:<name>`) + clickable `[i][w][e]`
+  level pills that rewrite the chip needle on click.
+
+**Tier B — MCP + theme + drops:**
+- **`feat(mcp) fc4f3fd`** — read tools: `djinn_recent_logs`,
+  `djinn_recent_attentions`, `djinn_active_profile`. Mirrors the
+  write surface; agents can introspect user-visible state.
+- **`feat(theme) e5508d7`** — Cmd+Shift+T cycles
+  null (system) → light → dark → null. `actionThemeToggle` logs
+  the new state to the agent log so the action stays observable
+  even when the user's ghostty theme isn't dual-variant.
+- **`fix(theme) 98c4afb`** — runtime override survives
+  `reloadConfigFromDisk` (previously the override was wiped on
+  every config reload).
+- **`chore(tmp) f09ad8e`** — reap stale `/tmp/djinn-drop-*` on
+  launch so the directory doesn't grow forever.
+- **`feat(profile) 110e082`** — per-profile bell overrides
+  (`bell-audible / bell-visual / bell-sound`); falls back to global
+  `bell.*` when unset.
+
+**Profile lifecycle:**
+- **`feat(profile) ac67e3c`** — Cmd+Shift+N duplicates the active
+  profile in place. Appends `profile.<copy>.*` to the config bottom
+  so comments are preserved.
+- **`feat(profile) c4979ff`** — Cmd+Shift+W closes the active
+  profile + writes back to config.
+- **`fix(profile) ca44c09`** — atomic write for profile removal so
+  a crash mid-rewrite doesn't strand the user with a partial
+  config.
+
+**Log filter chip polish (3 commits):**
+- **`fix(log-filter) e2504bc`** — chip is always visible when a
+  filter is active; auto-opens the log pane when a needle has
+  results.
+- **`fix(log-filter) 6c28de8`** — mount chip on the log-pane
+  wrapper instead of the container so it tracks pane visibility.
+- **`fix(log-filter) 89350de`** — clear filter state on pane hide
+  so the next show starts clean.
+
+**Linux port (separate thread, archived):**
+- **`feat(linux) c874296`** — initial GTK4 / Wayland port.
+- **`build(linux) 31592a7`** — packaging + CI + resilience polish.
+- **`feat(linux) cc89bb0`** — multi-profile sessions + darwin-
+  parity Tier A. Linux now has the same tab-strip / palette /
+  per-profile-size UX as darwin.
+- **`refactor(linux) 27236ab`** — log_pane split + code-shape
+  pass.
+- **`ci(linux) 28e4027`** — build gtk4-layer-shell from source on
+  ubuntu-24.04 (noble's universe doesn't ship the package).
+- **`test(linux) d39cd0c`** — relax watcher inode-recreate
+  assertion to accommodate Azure CI tmpfs inode reuse.
+- **`docs(linux) 02b7e03`** — collapse TODO chain narrative; full
+  history on `archive/linux/pre-squash-after-prototype`.
 
 ### Architecture wave: god-module split + AppState grouping + low-hanging fixes
 *(commits `1c62051` → `d49ba5a`, 18 commits, build + tests green throughout)*
