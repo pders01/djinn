@@ -103,6 +103,13 @@ const GTK_POLICY_NEVER: GtkPolicyType = 2;
 const GTK_POLICY_AUTOMATIC: GtkPolicyType = 1;
 const GTK_PHASE_CAPTURE: GtkPropagationPhase = 1;
 
+const GdkRectangle = extern struct {
+    x: c_int,
+    y: c_int,
+    width: c_int,
+    height: c_int,
+};
+
 // `gtk_css_provider_add_provider_for_display` priority constant.
 // Matches `STYLE_PROVIDER_PRIORITY_APPLICATION` (above the system
 // theme, below user `~/.config/gtk-4.0/gtk.css`).
@@ -120,8 +127,11 @@ extern "c" fn gtk_popover_set_child(popover: *GtkPopover, child: ?*GtkWidget) vo
 extern "c" fn gtk_popover_set_position(popover: *GtkPopover, pos: GtkPositionType) void;
 extern "c" fn gtk_popover_set_has_arrow(popover: *GtkPopover, has: gboolean) void;
 extern "c" fn gtk_popover_set_autohide(popover: *GtkPopover, autohide: gboolean) void;
+extern "c" fn gtk_popover_set_pointing_to(popover: *GtkPopover, rect: ?*const GdkRectangle) void;
 extern "c" fn gtk_popover_popup(popover: *GtkPopover) void;
 extern "c" fn gtk_popover_popdown(popover: *GtkPopover) void;
+extern "c" fn gtk_widget_get_width(widget: *GtkWidget) c_int;
+extern "c" fn gtk_widget_get_height(widget: *GtkWidget) c_int;
 extern "c" fn gtk_widget_set_parent(widget: *GtkWidget, parent: *GtkWidget) void;
 extern "c" fn gtk_widget_unparent(widget: *GtkWidget) void;
 extern "c" fn gtk_widget_grab_focus(widget: *GtkWidget) gboolean;
@@ -210,6 +220,11 @@ pub const Palette = struct {
     sm: *SessionManager,
     on_activate: OnActivate,
     popover: *GtkWidget,
+    /// Parent widget the popover anchors to. Stored so `open()` can
+    /// re-read its width/height on each popup and rebuild the
+    /// pointing-to rect against the live panel size. Same idiom as
+    /// `cheatsheet.open`.
+    anchor: *GtkWidget,
     entry: *GtkWidget,
     list_box: *GtkWidget,
     /// Module-local CSS provider - reloaded in place on `applyTheme`,
@@ -323,6 +338,7 @@ pub const Palette = struct {
             .sm = sm,
             .on_activate = on_activate,
             .popover = popover,
+            .anchor = anchor,
             .entry = entry,
             .list_box = list_box,
             .provider = provider,
@@ -411,6 +427,21 @@ pub const Palette = struct {
     /// selects the first row so each open starts from a clean slate.
     /// Idempotent -`gtk_popover_popup` no-ops when already visible.
     pub fn open(self: *Palette) void {
+        // Without `set_pointing_to`, GTK4 anchors the popover against
+        // the parent widget's full bounds + GTK_POS_BOTTOM, which lands
+        // it below the panel window. Re-aim at a 1x1 rect roughly a
+        // third of the way down the anchor so the popover hangs into
+        // the visual center across the panel resizes. Same idiom as
+        // `cheatsheet.open`.
+        const w = gtk_widget_get_width(self.anchor);
+        const h = gtk_widget_get_height(self.anchor);
+        const rect: GdkRectangle = .{
+            .x = @divTrunc(@max(w, 0), 2),
+            .y = @max(@divTrunc(@max(h, 0), 3), 24),
+            .width = 1,
+            .height = 1,
+        };
+        gtk_popover_set_pointing_to(@ptrCast(self.popover), &rect);
         // Clearing the entry triggers `search-changed` → filter
         // invalidation → all rows visible → first-row selection. The
         // ordering matters: text clear first, then popup, then focus.
