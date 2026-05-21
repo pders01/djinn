@@ -437,6 +437,25 @@ themes recorded above.
 - **`docs(linux) 02b7e03`** — collapse TODO chain narrative; full
   history on `archive/linux/pre-squash-after-prototype`.
 
+**Linux May 2026 polish wave** *(5 commits, `7215113` → `4ee75e7`)*:
+- **`fix(linux) 7215113`**: stop quitting panel on child-exit;
+  always mark the slot exited + feed a "Press Ctrl+R…" banner
+  via the new `Terminal.feedScreen`. Mirrors darwin's
+  `handleChildExited` (panel never closes on shell exit).
+- **`fix(linux) e37f6ba`**: apply per-profile window size on
+  startup, not just on the `on_switch` hook. Closes the gap
+  where the initial `panel.open` used only the global state.json
+  slot.
+- **`feat(linux) 98ef114`**: per-profile bell. Audible via
+  `vte_terminal_set_audible_bell` resolved at spawn; visual via
+  `Panel.flashBell` (composition opacity 0.4 → 80ms restore).
+- **`feat(linux) f8247a4`**: right-click "Copy entry" on log
+  rows; per-label `GtkGestureClick` strips the `[LVL] ` prefix
+  and writes the body to `gdk_display_get_clipboard`.
+- **`feat(linux) 4ee75e7`**: tab-strip agent-state dot at the
+  trailing edge; CSS-painted circle driven by a 250ms
+  `observeAgentState` poll mirroring the tray's cadence.
+
 ### Architecture wave: god-module split + AppState grouping + low-hanging fixes
 *(commits `1c62051` → `d49ba5a`, 18 commits, build + tests green throughout)*
 

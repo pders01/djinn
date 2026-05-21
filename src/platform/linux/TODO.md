@@ -71,6 +71,12 @@ for the prevailing shape.
   sidesteps both). Source unregistered in `deinit`.
   `DJINN_NO_LAYER_SHELL=1` forces the plain-toplevel path on
   layer-shell-capable compositors (debugging utility).
+  `flashBell()` drops `gtk_widget_set_opacity` to 0.4 for 80ms
+  then restores via a one-shot `g_timeout_add` (tag stashed in
+  `bell_restore_id`, cancelled in `deinit`). Re-entrant: a
+  second flash mid-dim cancels the pending restore so each bell
+  gets the full 80ms. Triggered by `Dispatch.onBell` when the
+  firing profile (or global) has `bell-visual = true`.
   **Popover-grab counter**: `popover_grab_count: u32` tracks
   active `autohide=true` popovers owned by djinn (find overlay,
   palette). `pushPopoverGrab` / `popPopoverGrab` bump the counter
@@ -97,10 +103,21 @@ for the prevailing shape.
   Pango font-family availability check before setting
   `vte_terminal_set_font` and logs a clear warning when the family
   isn't installed (avoids the "wide-cell" rendering bug from silent
-  Pango substitution to non-monospace). `child-exited` is wired to
-  `panel.quit` so typing `exit` closes the window. SIGTERM is
-  routed onto the GLib main loop via `g_unix_signal_add` and quits
-  the panel cleanly — needed by systemd user units. SIGINT already
+  Pango substitution to non-monospace). `child-exited` flips the
+  owning session's `exited` bit via the host dispatcher (chip
+  dims + strikethrough, panel stays up); the user revives the
+  slot with Ctrl+R (`restart_session`) or Ctrl+Shift+R
+  (`shell_session`). Mirrors darwin's "Press any key to close"
+  semantics. `bell` signal connects when `Handler.on_bell` is
+  set; Audible bell is per-VTE via
+  `vte_terminal_set_audible_bell` from `Spawn.audible_bell` so
+  per-profile mute (`profile.<name>.bell-audible`) lands without
+  the host needing the dispatch. `feedScreen(data)` paints
+  directly into VTE's screen buffer (used to drop a "Process
+  exited. Press Ctrl+R…" banner into the dying VTE so single-
+  profile setups still get a visible cue). SIGTERM is routed
+  onto the GLib main loop via `g_unix_signal_add` and quits the
+  panel cleanly (needed by systemd user units). SIGINT already
   worked through GLib's default signal-fd watch.
 - `session_host.zig` — multi-profile container. Owns a `GtkStack`
   of one VTE per profile, lazy-spawned on first `activate(idx)`;
@@ -121,26 +138,35 @@ for the prevailing shape.
   import a typed pointer would create). `restartActive
   (override_cmd)` replaces the active VTE widget in place:
   build a fresh `Terminal` first, `detachExitHandler` on the
-  old so widget destroy can't fan child-exited out as
-  `panel.quit`, `gtk_stack_remove` the old (closes the pty,
-  child gets SIGHUP), then `gtk_stack_add_named` the new
-  under the same stack name. Wired into Ctrl+R (keeps the
-  profile command) / Ctrl+Shift+R (passes `/bin/zsh`) from
-  the keymap. The simpler `vte_terminal_set_pty(t, NULL)`
-  approach NULL-derefs at +0x18 inside VTE 0.84's PTY
-  dispose; see the matching "Decisions you should not undo"
-  entry.
+  old so the imminent SIGHUP doesn't race into
+  `markExited(idx, true)` ahead of the new spawn and flicker
+  the chip + paint a stale banner the user never sees,
+  `gtk_stack_remove` the old (closes the pty, child gets
+  SIGHUP), then `gtk_stack_add_named` the new under the same
+  stack name. Wired into Ctrl+R (keeps the profile command) /
+  Ctrl+Shift+R (passes `/bin/zsh`) from the keymap. The simpler
+  `vte_terminal_set_pty(t, NULL)` approach NULL-derefs at +0x18
+  inside VTE 0.84's PTY dispose; see the matching "Decisions
+  you should not undo" entry.
   **Per-session exit tracking**: `Entry.exited: bool` flips
-  true when an INACTIVE session's shell exits; the active
-  session's exit still routes to `panel.quit` so the "type
-  exit to close djinn" gesture stays intact. Per-VTE handler
-  carries the session idx via `Terminal.Handler.extra`
-  (stamped by `handlerFor(idx)`); Dispatch reads the idx and
-  branches against `host.sm.active_idx`. `markExited
-  (idx, value)` mutates the bit and fans `on_exit_changed`
-  when the value flips — caller (main_linux) wires the hook
-  to `tab_strip.markExited(idx, value)` so the chip dims +
-  gains a strikethrough on exit, drops the class on restart.
+  true on every child-exit (active or inactive; the panel
+  never closes on shell exit). Mirrors darwin's
+  `handleChildExited`. Per-VTE handler carries the session idx
+  via `Terminal.Handler.extra` (stamped by `handlerFor(idx)`);
+  Dispatch reads the idx and feeds a "Process exited. Press
+  Ctrl+R…" banner into the firing VTE before marking the slot.
+  `markExited (idx, value)` mutates the bit and fans
+  `on_exit_changed` when the value flips; the caller (main_linux)
+  wires the hook to `tab_strip.markExited(idx, value)` so the
+  chip dims + gains a strikethrough on exit, drops the class on
+  restart.
+  **Per-spawn bell config**: SessionHost stamps
+  `bell_audible_default` at init (from `cfg.bell.audible`) and
+  resolves `profile.bell_audible orelse default` per spawn,
+  passing the result through `Spawn.audible_bell` so each
+  profile's VTE gets the right mute state. Hot-reload of
+  `cfg.bell.audible` lands on next spawn; existing VTEs keep
+  construction-time value.
   `restartActive` clears the bit on its success path so a
   user reviving an exited session via Ctrl+R re-skins the
   chip automatically. `isExited(idx)` peeks the bit without
@@ -171,6 +197,16 @@ for the prevailing shape.
   so the selector matches across themes). Fed by SessionHost's
   `on_exit_changed` hook so the chip stays in lockstep with
   `Entry.exited`.
+  **Agent-state dot**: small CSS-painted circle at the trailing
+  edge (`box.djinn-state-dot` with `hexpand + halign=END` so it
+  gravitates right without disturbing chip layout). `markState`
+  swaps a per-state class on the dot; `observeAgentState`
+  starts a 250ms `g_timeout_add` mirroring the tray's poll
+  cadence. Color per `Agent`: `palette[4]` (blue) for working,
+  `palette[3]` (yellow) for attention, `palette[1]` (red) for
+  error, transparent for idle and done. Two AgentState
+  observers (tray + tab strip + log pane = three) is cheap;
+  each module stays decoupled.
 - `palette.zig` — `Ctrl+Shift+P` type-to-switch profile palette.
   `GtkPopover` anchored to `host.widget()` (the GtkStack) so it
   survives profile switches without reparenting. Vertical box
@@ -323,6 +359,15 @@ for the prevailing shape.
   matching body row — no orphan headers under a narrow filter.
   `formatHeaderTime` mirrors darwin's `formatEntryHeader` (UTC
   HH:MM) so the two surfaces read identically.
+  **Right-click "Copy entry"**: each body label gets a
+  GtkGestureClick (`button = GDK_BUTTON_SECONDARY`); the
+  `pressed` handler reads the label's text via
+  `gtk_label_get_text`, strips the leading `[LVL] ` prefix
+  when present, and writes the message to the system
+  clipboard via `gdk_display_get_clipboard`. No user_data
+  needed; the handler reaches back through the gesture →
+  widget chain. Left-click drag-selection still works because
+  the gesture is scoped to the right button only.
 - `tray.zig` — hand-rolled `org.kde.StatusNotifierItem` +
   `com.canonical.dbusmenu` over GDBus. State-driven themed icon
   (idle/working/attention/done/error), left-click toggles the panel,
@@ -579,8 +624,10 @@ Tested on CachyOS + KDE Plasma Wayland 6.x.
   field accessed mid-dispose. Deferring the spawn via `g_idle_add`
   doesn't help — the crash is in the hangup path. `SessionHost.
   restartActive` instead builds a fresh `Terminal`, detaches the
-  old's `child-exited` (so widget destroy can't fan out as
-  `panel.quit`), `gtk_stack_remove`s the old (which finalizes it,
+  old's `child-exited` (so the imminent SIGHUP doesn't race into
+  `markExited(idx, true)` ahead of the new spawn and paint a
+  stale "Process exited" banner into a buffer about to be
+  discarded), `gtk_stack_remove`s the old (which finalizes it,
   closes the pty, SIGHUPs the child), then `gtk_stack_add_named`s
   the new under the same stack name. Sidesteps the buggy codepath
   entirely; matches darwin's `restartSurfaceCallback` shape.
@@ -862,10 +909,11 @@ widget in place. First-cut shape was in-place re-spawn:
 PTY dispose (`set_pty -> inner helper -> libvte+0x4a7b4`) and
 crashed every Ctrl+R. The deployed shape: build a fresh
 `Terminal` first (so an OOM doesn't strand the slot empty),
-`Terminal.detachExitHandler` on the old (so widget destroy
-can't fan child-exited out as `panel.quit`), `gtk_stack_remove`
-the old widget (closes the pty, child gets SIGHUP), `deinit`
-the old's owned strings, then `gtk_stack_add_named` the fresh
+`Terminal.detachExitHandler` on the old (so the imminent SIGHUP
+doesn't race into `markExited` on the about-to-be-replaced
+slot), `gtk_stack_remove` the old widget (closes the pty, child
+gets SIGHUP), `deinit` the old's owned strings, then
+`gtk_stack_add_named` the fresh
 widget under the same stack name. Tab strip, log pane, window
 position all preserved. Mirrors darwin's
 `restartSurfaceCallback` (free old surface, bind a fresh one
@@ -900,6 +948,47 @@ editing the file always wins over state.json.
   watcher fire. The tab strip is built once at startup today —
   reconcile needs to also rebuild the chip row when a profile is
   added / removed / renamed.
+
+### May 2026 polish wave *(landed)*
+
+Five-commit follow-up cleared the child-exit hang report and four
+adjacent linux-only gaps. Each landed as its own commit (`7215113`
+→ `4ee75e7`) so reverts stay surgical; full diff statable via
+`git log 73c6c09..4ee75e7`.
+
+- **`fix(linux) 7215113`**: `Dispatch.onChildExited` stops
+  calling `panel.quit()` and instead always feeds a dim
+  "Process exited. Press Ctrl+R…" banner into the firing VTE
+  via the new `Terminal.feedScreen`, then flips
+  `entry.exited`. Matches darwin's `handleChildExited`; the
+  underlying teardown hang on `g_main_loop_quit` no longer
+  fires on the common close-the-shell path. New extern:
+  `vte_terminal_feed`. New SessionHost getter: `terminalAt(idx)`.
+- **`fix(linux) e37f6ba`**: startup applies the active-at-
+  startup profile's persisted dims via
+  `Dispatch.applyProfileWindowSize` right after SessionManager
+  comes up. Closes the gap where the initial `panel.open`
+  only knew the global state.json slot.
+- **`feat(linux) 98ef114`**: per-profile bell. Audible side
+  is per-VTE via `vte_terminal_set_audible_bell`
+  (resolved from `profile.bell_audible orelse cfg.bell.audible`
+  at spawn time, threaded through `Spawn.audible_bell`). Visual
+  side is `Panel.flashBell` (composition opacity 0.4 → 80ms
+  restore via `g_timeout_add`). Handler gains `on_bell` slot;
+  `Dispatch.onBell` reads the firing profile's `bell_visual`
+  at fire time so live config flips work on the visual path.
+- **`feat(linux) f8247a4`**: right-click "Copy entry" on log
+  rows. `GtkGestureClick` (button = `GDK_BUTTON_SECONDARY`) per
+  body label; pressed handler reads `gtk_label_get_text`, strips
+  the `[LVL] ` prefix, writes to `gdk_display_get_clipboard`.
+  Left-click drag-select on the label still works because the
+  gesture is scoped to right button only.
+- **`feat(linux) 4ee75e7`**: tab-strip agent-state dot at
+  trailing edge. Small CSS-painted circle (`box.djinn-state-dot`
+  with `hexpand + halign=END`), color per `Agent` state from
+  the palette[1/3/4] slots, transparent in idle and done.
+  `observeAgentState` starts a 250ms GLib timer mirroring the
+  tray's poll cadence.
 
 ### Darwin parity (May 2026 Tier A)
 
