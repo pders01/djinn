@@ -1,6 +1,6 @@
 # djinn TODO
 
-State as of May 6, 2026. **0.1.0-alpha.1 cut**: signed `.app` bundle,
+State as of May 21, 2026. **0.1.0-alpha.1 cut**: signed `.app` bundle,
 GitHub Actions CI + release workflow, branded `.icns`, MIT LICENSE +
 NOTICES, multi-profile sessions, theme inheritance for `light:X,dark:Y`
 specs, dim-priority semantics for `state.json` vs config.
@@ -246,55 +246,88 @@ Mostly window-manager actions (new_window, new_tab, toggle_fullscreen)
 that don't apply to a Quake-drop panel. **Skip** — listed so nobody
 re-litigates.
 
-### Post-refactor leftovers *(low priority — view.zig is no longer a god-module)*
+### Post-refactor leftovers — all landed 2026-05-21
 
-Module split + AppState grouping wave landed (commits `1c62051`
-through `d49ba5a`). Below is what remains, ranked by ROI.
-
-1. **`view.applyLogLayout` + `checkResize` → `window/layout.zig`**
-   `divider.zig` currently back-imports `view.applyLogLayout` for the
-   drag-resize reflow. Moving `applyLogLayout` (+ its `checkResize`
-   helper) into `window/layout.zig` — already home to `buildContainer`
-   + `computeLogWidth` — drops the cyclic edge. Make `checkResize`
-   pub on view.zig, layout calls it back. ~120 LOC moved.
-
-2. **`bindGhosttySurface` per-session arena**
-   Today every `restartActiveSession` dupeZ-leaks cmd + cwd. Per-session
-   `std.heap.ArenaAllocator` freed in `removeSessionLive` would cap the
-   leak at "active sessions × current spawn args". Cheap; well-bounded
-   to `ghostty/surface_lifecycle.zig`.
-
-3. **Tests for find / palette key handlers**
-   `terminal/find.zig` `handleKey` and `session/palette.zig` filter
-   logic are pure state machines on `app.g.find.*` / `app.g.palette.*`.
-   Same testing ROI as the keymap unit tests — exercise needle
-   manipulation, prefix-match scoring, selection-cycling without
-   spinning Cocoa.
-
-4. **Drag-drop callbacks → `terminal/dragdrop.zig`** *(~150 LOC)*
-   `draggingEnteredImpl` + `performDragOperationImpl` + `tryDropImage`
-   form a self-contained NSDraggingDestination surface inside view.zig.
-   No responder-chain coupling. Extractable when next change touches
-   drag handling.
-
-5. **Theme reapply → `terminal/theme_apply.zig`** *(~150 LOC)*
-   `reapplyTheme` + `reapplyThemeIfChanged` + `reloadTheme` cross
-   chrome + log_view + tab_strip + find overlay; centralizing the
-   "reskin everything" path makes the fan-out explicit. Worth doing
-   when adding any new chrome surface that reskins on appearance flip.
-
-6. **`RetainedView` ownership helper** *(NSObject manual ref-count)*
-   `removeSessionLive` calls `release` to balance the +1 from
-   `[NSView alloc]`. Open question: which other paths take alloc'd
-   views to a place where `removeFromSuperview` doesn't drop the last
-   retain? A small `RetainedView` wrapper struct that pairs alloc +
-   manual release would catch new occurrences at the type level.
-
-None are urgent. Each addresses real friction; the codebase no longer
-has a god-module at the center, so prioritize features over more
-extraction.
+Six-commit wave (`9b900b7` → `15bf4d4`) cleared the ranked list from
+the prior session. Net: `view.zig` 1458 → 1166 LOC (−20%), three new
+modules (`terminal/dragdrop.zig`, `terminal/theme_apply.zig`,
+`retained_view.zig`), per-session arena bounds the spawn-arg leak,
+eight new unit tests cover the find + palette state machines, and
+three latent NSView leaks (tab-strip teardown, palette close,
+cheatsheet close) found during the retained-view audit are fixed.
+See "Recently shipped — current session" below for the commit map.
 
 ## Recently shipped — current session
+
+### Post-refactor leftovers cleared (2026-05-21)
+*(commits `9b900b7` → `15bf4d4`, 6 commits — each one `zig
+ast-check`-clean, build verification deferred to CI)*
+
+Walked the entire post-refactor punch list from the prior session.
+Each item became its own commit so reverts stay surgical.
+
+**Module moves (3 commits):**
+- **`refactor(layout)` `9b900b7`** — `applyLogLayout` moved out of
+  `terminal/view.zig` into `window/layout.zig` (home of
+  `buildContainer` + `computeLogWidth`). `terminal/divider.zig` no
+  longer back-imports `view.zig` for the drag-resize reflow; it
+  reaches `window/layout.applyLogLayout` directly. `checkResize`
+  bumped to `pub` so the new home can call back into the surface-
+  size push. view.zig: 1458 → 1400 LOC.
+- **`refactor(terminal)` `6928510`** — Drag-drop callbacks
+  (`draggingEnteredImpl`, `performDragOperationImpl`,
+  `tryDropImage`) extracted to `terminal/dragdrop.zig` (~150 LOC).
+  Self-contained `NSDraggingDestination` surface, no responder-chain
+  coupling. Mirrors the same `forwardText` local-duplicate idiom as
+  `ime.zig` and `find.zig` so imports stay flat. view.zig: 1400 →
+  1249 LOC.
+- **`refactor(theme)` `287147a`** — `reapplyTheme` +
+  `reapplyThemeIfChanged` + `reloadTheme` centralized in
+  `terminal/theme_apply.zig`. Fan-out (chrome, log_view, find
+  overlay, tab strip, panel) now has a single registration point
+  for the next chrome surface that reskins on appearance flip.
+  Internal callers (`viewDidChangeEffectiveAppearance`,
+  `actionThemeToggle`) plus external callers in `main.zig`
+  (hot-config reload) and `window/panel.zig` (panel show recovery)
+  all route through the new module. view.zig: 1249 → 1166 LOC.
+
+**Bounded allocation + leak fixes (2 commits):**
+- **`refactor(session)` `1947242`** — per-session
+  `std.heap.ArenaAllocator` on `Session.spawn_arena` owns the
+  cmd + cwd `dupeZ` buffers ghostty needs as `[*:0]`. Lazily
+  created on first `bindGhosttySurface`, reset on every re-bind
+  so restart traffic doesn't accumulate. `removeSessionLive`
+  destroys it; `SessionManager.deinit` walks the list for the
+  program-exit path. Caps the prior process-lifetime dupe leak
+  at "active sessions × current spawn args" — bounded, explicit.
+- **`fix(session)` `15bf4d4`** — `src/retained_view.zig:detach`
+  pairs `removeFromSuperview` with the manual `release` Cocoa
+  requires for the +1 retain `[NSView alloc]` returns. Plugged
+  three latent leaks the audit surfaced beyond the previously-
+  fixed `removeSessionLive` case: `ensureTabStripVisible(false)`
+  leaked the strip on every 2↔1 profile crossing;
+  `palette.close` leaked the overlay (and rendered rows) on
+  every open/close; `cheatsheet.close` leaked the wrapper + its
+  NSTextView subtree on every Cmd+? toggle.
+
+**Tests (1 commit):**
+- **`test(terminal)` `34040a1`** — pulled `appendChars` +
+  `backspaceNeedle` out of `find.handleKey` so the needle buffer
+  state machine is exercised without spinning Cocoa. Four find
+  tests (grow, control-byte rejection, capacity saturation,
+  backspace-at-empty) + four palette tests (`matches`,
+  `firstMatch`, `moveSelection` cycle through synthetic duplicate
+  row, filter respecting cycle). Palette tests install a temporary
+  SessionManager fixture and swap `app.g.palette` /
+  `app.g.session_manager` so tests don't leak state.
+
+**Net impact:**
+- view.zig: 1458 → 1166 LOC (−292, −20%)
+- New modules: `terminal/dragdrop.zig` (178), `terminal/theme_apply.zig`
+  (104), `retained_view.zig` (37)
+- 8 unit tests added (was: 7 keymap tests; now 7 + 4 find + 4 palette)
+- Per-session arena bounds the cmd/cwd leak
+- Four NSView leaks fixed (per-cycle, not per-program)
 
 ### Architecture wave: god-module split + AppState grouping + low-hanging fixes
 *(commits `1c62051` → `d49ba5a`, 18 commits, build + tests green throughout)*
