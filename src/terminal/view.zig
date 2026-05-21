@@ -32,8 +32,6 @@ pub const NSRange = extern struct { location: c_ulong, length: c_ulong };
 // other module reads them.
 var g_class_registered: bool = false;
 
-pub const divider_width = divider_mod.width;
-
 /// Forward a UTF-8 text blob to the ghostty surface (paste / drop /
 /// IME commit / unmapped-key fallback path). Returns false when the
 /// surface isn't bound yet — caller decides whether that's a hard
@@ -165,62 +163,6 @@ pub const TerminalView = struct {
         app.g.agent.log_view = log_view;
     }
 };
-
-pub const createDivider = divider_mod.create;
-
-/// Reflow terminal + divider + log + surface_host frames to a new
-/// split. Shared between drag-to-resize + log-pane toggle so the
-/// layout invariants live in one place. Reserves `tab_strip.tab_h`
-/// at the top when the multi-profile tab strip is present.
-pub fn applyLogLayout(container: objc.Object, term_w: f64, log_w: f64, height: f64) void {
-    const tab_strip = @import("../session/tab_strip.zig");
-    const tab_h: f64 = if (app.g.layout.tab_strip_id != null) tab_strip.tab_h else 0;
-    const term_h = @max(1.0, height - tab_h);
-    const view_id = app.g.term.view_id orelse return;
-    const term_view = objc.Object.fromId(view_id);
-    term_view.msgSend(void, "setFrame:", .{NSRect{
-        .origin = .{ .x = 0, .y = 0 },
-        .size = .{ .width = term_w, .height = term_h },
-    }});
-    if (app.g.layout.divider_view_id) |did| {
-        objc.Object.fromId(did).msgSend(void, "setFrame:", .{NSRect{
-            .origin = .{ .x = term_w, .y = 0 },
-            .size = .{ .width = if (log_w > 0) divider_width else 0, .height = term_h },
-        }});
-    }
-    if (app.g.agent.log_view) |lv| {
-        const div_w: f64 = if (log_w > 0) divider_width else 0;
-        lv.view.msgSend(void, "setFrame:", .{NSRect{
-            .origin = .{ .x = term_w + div_w, .y = 0 },
-            .size = .{ .width = log_w, .height = term_h },
-        }});
-    }
-    if (app.g.layout.tab_strip_id) |tid| {
-        objc.Object.fromId(tid).msgSend(void, "setFrame:", .{NSRect{
-            .origin = .{ .x = 0, .y = term_h },
-            .size = .{ .width = container.msgSend(NSRect, "bounds", .{}).size.width, .height = tab_h },
-        }});
-    }
-    // Reflow every session's surface_host so inactive sessions stay
-    // sized identically to the active one (autoresizingMask covers
-    // window resize; this covers term/log split changes from
-    // setLogPaneHidden + drag-to-resize). main() guarantees the
-    // session_manager pointer is set before any caller of
-    // applyLogLayout fires; no fallback path needed.
-    if (app.g.session_manager) |sm| {
-        for (sm.sessions.items) |sess| {
-            if (sess.surface_host) |sid| {
-                objc.Object.fromId(sid).msgSend(void, "setFrame:", .{NSRect{
-                    .origin = .{ .x = 0, .y = 0 },
-                    .size = .{ .width = term_w, .height = term_h },
-                }});
-            }
-        }
-    }
-    checkResize(term_view);
-    container.msgSend(void, "setNeedsLayout:", .{@as(c_int, 1)});
-    container.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
-}
 
 fn registerClass() void {
     if (g_class_registered) return;
@@ -500,7 +442,7 @@ fn viewDidEndLiveResizeImpl(self_id: objc.c.id, _: objc.c.SEL) callconv(.c) void
 /// every tick. Cheap — surfaceSetSize / surfaceSetContentScale dedupe
 /// internally. Also pokes the log pane to repaint, since its layout
 /// can lag behind a window-resize cascade.
-fn checkResize(view: objc.Object) void {
+pub fn checkResize(view: objc.Object) void {
     const bounds = view.msgSend(NSRect, "bounds", .{});
 
     // Push size + scale to the ghostty surface. The
@@ -1234,9 +1176,9 @@ pub fn relayout() void {
     if (app.g.agent.log_view) |lv| {
         log_w = lv.view.msgSend(NSRect, "frame", .{}).size.width;
     }
-    const eff_div_w: f64 = if (log_w > 0) divider_width else 0;
+    const eff_div_w: f64 = if (log_w > 0) divider_mod.width else 0;
     const term_w = @max(1.0, c_bounds.size.width - log_w - eff_div_w);
-    applyLogLayout(container, term_w, log_w, c_bounds.size.height);
+    @import("../window/layout.zig").applyLogLayout(container, term_w, log_w, c_bounds.size.height);
 }
 
 /// Show or hide the log pane at runtime. Hidden state collapses log +
@@ -1255,10 +1197,10 @@ pub fn setLogPaneHidden(hide: bool) void {
     const layout = @import("../window/layout.zig");
     const log_baseline_w: f64 = layout.computeLogWidth(c_bounds.size.width, cfg);
     const log_w: f64 = if (hide) 0 else log_baseline_w;
-    const eff_div_w: f64 = if (hide) 0 else divider_width;
+    const eff_div_w: f64 = if (hide) 0 else divider_mod.width;
     const term_w: f64 = @max(1.0, c_bounds.size.width - log_w - eff_div_w);
 
-    applyLogLayout(container, term_w, log_w, c_bounds.size.height);
+    layout.applyLogLayout(container, term_w, log_w, c_bounds.size.height);
 
     // Clear log filter state when the pane hides — chip is a
     // subview of the log pane wrapper, so without this the chip

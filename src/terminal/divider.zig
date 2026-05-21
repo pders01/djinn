@@ -3,7 +3,7 @@
 //! resetCursorRects so the user can drag-to-resize the log column.
 //!
 //! Drag math + responder hookup live here; the actual reflow lands in
-//! `view.applyLogLayout` (shared with the log-pane toggle path).
+//! `window/layout.applyLogLayout` (shared with the log-pane toggle path).
 
 const objc = @import("objc");
 const app = @import("../app.zig");
@@ -94,7 +94,7 @@ fn mouseDraggedImpl(self: objc.c.id, _: objc.c.SEL, event: objc.c.id) callconv(.
     var new_log_w = c_bounds.size.width - cont_loc.x - width;
     new_log_w = @max(cfg.log_pane.width_min, @min(cfg.log_pane.width_max, new_log_w));
     const new_term_w = @max(1.0, c_bounds.size.width - new_log_w - width);
-    @import("view.zig").applyLogLayout(container, new_term_w, new_log_w, c_bounds.size.height);
+    @import("../window/layout.zig").applyLogLayout(container, new_term_w, new_log_w, c_bounds.size.height);
 }
 
 fn resetCursorRectsImpl(self: objc.c.id, _: objc.c.SEL) callconv(.c) void {

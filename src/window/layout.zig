@@ -9,6 +9,7 @@
 const objc = @import("objc");
 const app = @import("../app.zig");
 const Config = @import("../config.zig").Config;
+const divider_mod = @import("../terminal/divider.zig");
 const view_mod = @import("../terminal/view.zig");
 const tab_strip = @import("../session/tab_strip.zig");
 
@@ -46,7 +47,7 @@ pub fn buildContainer(
     );
     container.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, (1 << 1) | (1 << 4))});
 
-    const divider_w: f64 = view_mod.divider_width;
+    const divider_w: f64 = divider_mod.width;
     const term_w = @max(1.0, width - log_width - divider_w);
 
     // Multi-profile tab strip: built when more than one profile is
@@ -85,7 +86,7 @@ pub fn buildContainer(
     // handlers (drag-to-resize) and a resize cursor rect. Width = 4px
     // is wide enough to grab reliably; the visible alpha is kept low
     // so the line still reads as a hairline.
-    const divider = view_mod.createDivider(term_w, term_h);
+    const divider = divider_mod.create(term_w, term_h);
     container.msgSend(void, "addSubview:", .{divider});
     app.g.layout.divider_view_id = divider.value;
 
@@ -106,4 +107,57 @@ pub fn buildContainer(
     }
 
     return container;
+}
+
+/// Reflow terminal + divider + log + surface_host frames to a new
+/// split. Shared between drag-to-resize + log-pane toggle so the
+/// layout invariants live in one place. Reserves `tab_strip.tab_h`
+/// at the top when the multi-profile tab strip is present.
+pub fn applyLogLayout(container: objc.Object, term_w: f64, log_w: f64, height: f64) void {
+    const tab_h: f64 = if (app.g.layout.tab_strip_id != null) tab_strip.tab_h else 0;
+    const term_h = @max(1.0, height - tab_h);
+    const view_id = app.g.term.view_id orelse return;
+    const term_view = objc.Object.fromId(view_id);
+    term_view.msgSend(void, "setFrame:", .{NSRect{
+        .origin = .{ .x = 0, .y = 0 },
+        .size = .{ .width = term_w, .height = term_h },
+    }});
+    if (app.g.layout.divider_view_id) |did| {
+        objc.Object.fromId(did).msgSend(void, "setFrame:", .{NSRect{
+            .origin = .{ .x = term_w, .y = 0 },
+            .size = .{ .width = if (log_w > 0) divider_mod.width else 0, .height = term_h },
+        }});
+    }
+    if (app.g.agent.log_view) |lv| {
+        const div_w: f64 = if (log_w > 0) divider_mod.width else 0;
+        lv.view.msgSend(void, "setFrame:", .{NSRect{
+            .origin = .{ .x = term_w + div_w, .y = 0 },
+            .size = .{ .width = log_w, .height = term_h },
+        }});
+    }
+    if (app.g.layout.tab_strip_id) |tid| {
+        objc.Object.fromId(tid).msgSend(void, "setFrame:", .{NSRect{
+            .origin = .{ .x = 0, .y = term_h },
+            .size = .{ .width = container.msgSend(NSRect, "bounds", .{}).size.width, .height = tab_h },
+        }});
+    }
+    // Reflow every session's surface_host so inactive sessions stay
+    // sized identically to the active one (autoresizingMask covers
+    // window resize; this covers term/log split changes from
+    // setLogPaneHidden + drag-to-resize). main() guarantees the
+    // session_manager pointer is set before any caller of
+    // applyLogLayout fires; no fallback path needed.
+    if (app.g.session_manager) |sm| {
+        for (sm.sessions.items) |sess| {
+            if (sess.surface_host) |sid| {
+                objc.Object.fromId(sid).msgSend(void, "setFrame:", .{NSRect{
+                    .origin = .{ .x = 0, .y = 0 },
+                    .size = .{ .width = term_w, .height = term_h },
+                }});
+            }
+        }
+    }
+    view_mod.checkResize(term_view);
+    container.msgSend(void, "setNeedsLayout:", .{@as(c_int, 1)});
+    container.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
 }
