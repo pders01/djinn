@@ -998,13 +998,6 @@ is one focused session.
 
 ## Known issues
 
-- **No per-profile window size memory.** `Dispatch.onPanelResize`
-  now routes `sm.active().profile.name` into `persist.saveDebounced`,
-  but `state.json` itself still carries a single global `{w, h}` —
-  every profile writes the same slot. Reader side is missing too:
-  `SessionHost.activate` doesn't consult per-profile dims. Mirror
-  darwin's `applyProfileWindowSize` when state.json grows the
-  `profiles[<name>]` slot.
 - **Tray uses generic themed icons.** Each state maps to a
   freedesktop name (`utilities-terminal`, `dialog-warning`,
   `task-due`, `task-complete`, `dialog-error`). Swap for per-state

@@ -254,10 +254,10 @@ const Dispatch = struct {
     /// initial GTK measure pass settled with non-default dims).
     /// Persists via `saveDebounced` so a continuous drag emits a
     /// single disk write 300ms after the user stops. `profile_name`
-    /// is the active profile so per-profile width/height memory
-    /// (state.json's `profiles[<name>]` slot) gets the right dims
-    /// when that feature lands; until then `persist.saveDebounced`
-    /// ignores the name and writes the global slot.
+    /// goes into `state.json`'s `profiles[<name>].{width,height}`
+    /// slot so the next activate of this profile (or the next launch
+    /// while it's active) restores its specific dims via
+    /// `applyProfileWindowSize`.
     fn onPanelResize(ctx: *anyopaque, w: u32, h: u32) void {
         const self: *Dispatch = @ptrCast(@alignCast(ctx));
         const profile_name: ?[]const u8 = if (self.session_manager) |sm|
@@ -882,6 +882,14 @@ pub fn main() !void {
     };
     defer session_manager.deinit();
     g_dispatch.session_manager = &session_manager;
+
+    // Snap the panel to the active-at-startup profile's persisted
+    // dims. The earlier `panel.open` only knew the global state.json
+    // slot since SessionManager didn't exist yet; now that the active
+    // profile name is resolvable, apply its specific entry if any.
+    // Subsequent profile switches go through the `on_switch` hook
+    // (see `onSessionSwitched`).
+    g_dispatch.applyProfileWindowSize(session_manager.active_idx);
 
     std.debug.print(
         "sessions — {d} profile(s), active='{s}'\n",
