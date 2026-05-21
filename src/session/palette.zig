@@ -434,3 +434,121 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
         dup_str.msgSend(void, "drawAtPoint:withAttributes:", .{ NSPoint{ .x = 16, .y = dup_y }, dup_attrs });
     }
 }
+
+// Tests --------------------------------------------------------------
+//
+// Pure state machine on `app.g.palette.*` + `app.g.session_manager`.
+// Each test installs a temporary SessionManager + palette filter,
+// runs assertions, and restores the previous app.g pointers on exit
+// so other tests don't see leakage.
+
+const Config = @import("../config.zig").Config;
+const SessionManager = @import("manager.zig").SessionManager;
+
+const PaletteFixture = struct {
+    mgr: SessionManager,
+    prev_mgr: ?*SessionManager,
+    prev_palette: app.AppState.PaletteState,
+
+    fn deinit(self: *PaletteFixture) void {
+        self.mgr.deinit();
+        app.g.session_manager = self.prev_mgr;
+        app.g.palette = self.prev_palette;
+    }
+};
+
+fn buildFixture(entries: []const Config.ProfileEntry) !PaletteFixture {
+    var cfg = Config{};
+    cfg.profiles.entries = entries;
+
+    var fixture = PaletteFixture{
+        .mgr = try SessionManager.init(std.testing.allocator, &cfg),
+        .prev_mgr = app.g.session_manager,
+        .prev_palette = app.g.palette,
+    };
+    app.g.session_manager = &fixture.mgr;
+    app.g.palette = .{};
+    return fixture;
+}
+
+fn setQuery(text: []const u8) void {
+    @memcpy(app.g.palette.query_buf[0..text.len], text);
+    app.g.palette.query_len = text.len;
+}
+
+test "palette: matches is case-insensitive substring" {
+    const entries = [_]Config.ProfileEntry{ .{ .name = "Main" } };
+    var fx = try buildFixture(&entries);
+    defer fx.deinit();
+
+    setQuery("");
+    try std.testing.expect(matches("anything"));
+    setQuery("MA");
+    try std.testing.expect(matches("Main"));
+    try std.testing.expect(matches("formats"));
+    setQuery("zzz");
+    try std.testing.expect(!matches("Main"));
+}
+
+test "palette: firstMatch walks sessions in order" {
+    const entries = [_]Config.ProfileEntry{
+        .{ .name = "alpha" },
+        .{ .name = "beta" },
+        .{ .name = "gamma" },
+    };
+    var fx = try buildFixture(&entries);
+    defer fx.deinit();
+
+    setQuery("");
+    try std.testing.expectEqual(@as(?usize, 0), firstMatch());
+    setQuery("a"); // all three names contain 'a'
+    try std.testing.expectEqual(@as(?usize, 0), firstMatch());
+    setQuery("ga");
+    try std.testing.expectEqual(@as(?usize, 2), firstMatch());
+    setQuery("zzz");
+    try std.testing.expectEqual(@as(?usize, null), firstMatch());
+}
+
+test "palette: moveSelection cycles through filtered list + duplicate row" {
+    const entries = [_]Config.ProfileEntry{
+        .{ .name = "alpha" },
+        .{ .name = "beta" },
+        .{ .name = "gamma" },
+    };
+    var fx = try buildFixture(&entries);
+    defer fx.deinit();
+
+    setQuery("");
+    app.g.palette.selected = 0;
+    moveSelection(1);
+    try std.testing.expectEqual(@as(usize, 1), app.g.palette.selected);
+    moveSelection(1);
+    try std.testing.expectEqual(@as(usize, 2), app.g.palette.selected);
+    moveSelection(1);
+    // Next slot past gamma is the synthetic duplicate row.
+    try std.testing.expectEqual(duplicateRowIdx(), app.g.palette.selected);
+    moveSelection(1); // already at last
+    try std.testing.expectEqual(duplicateRowIdx(), app.g.palette.selected);
+    moveSelection(-1);
+    try std.testing.expectEqual(@as(usize, 2), app.g.palette.selected);
+}
+
+test "palette: moveSelection respects active filter" {
+    const entries = [_]Config.ProfileEntry{
+        .{ .name = "alpha" },
+        .{ .name = "beta" },
+        .{ .name = "gamma" },
+    };
+    var fx = try buildFixture(&entries);
+    defer fx.deinit();
+
+    // Filter "ga" matches only gamma + the duplicate row.
+    setQuery("ga");
+    app.g.palette.selected = 2; // gamma
+    moveSelection(1);
+    try std.testing.expectEqual(duplicateRowIdx(), app.g.palette.selected);
+    moveSelection(-1);
+    try std.testing.expectEqual(@as(usize, 2), app.g.palette.selected);
+    moveSelection(-1); // already at top of filter
+    try std.testing.expectEqual(@as(usize, 2), app.g.palette.selected);
+}

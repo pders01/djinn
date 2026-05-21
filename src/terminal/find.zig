@@ -354,6 +354,32 @@ pub fn actionOpen() void {
     enterMode();
 }
 
+/// Drop the last byte from the needle buffer. Returns whether the
+/// buffer actually shrank (false on empty needle). Split out so the
+/// state-machine half of `handleKey` is exercised by unit tests
+/// without spinning Cocoa.
+pub fn backspaceNeedle() bool {
+    if (app.g.find.query_len == 0) return false;
+    app.g.find.query_len -= 1;
+    return true;
+}
+
+/// Append printable text to the needle buffer, bounded by remaining
+/// room. Filters out single control chars (< 0x20) the way AppKit
+/// delivers Tab / Ctrl combos through `event.characters`. Returns
+/// whether the buffer grew. Split out for the same unit-test reason
+/// as `backspaceNeedle`.
+pub fn appendChars(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (s.len == 1 and s[0] < 0x20) return false;
+    const room = app.g.find.query_buf.len - app.g.find.query_len;
+    if (room == 0) return false;
+    const take = @min(s.len, room);
+    @memcpy(app.g.find.query_buf[app.g.find.query_len .. app.g.find.query_len + take], s[0..take]);
+    app.g.find.query_len += take;
+    return true;
+}
+
 /// Handle a keystroke while find_mode is active. Caller (keyDownImpl)
 /// only invokes this when find_mode is true and no command modifier
 /// is held.
@@ -366,10 +392,7 @@ pub fn handleKey(event: objc.Object, keycode: u16) void {
     // Backspace — shrink needle. Re-pushes (empty needle stops search
     // per ghostty semantics, but UI stays in find mode).
     if (keycode == 51) {
-        if (app.g.find.query_len > 0) {
-            app.g.find.query_len -= 1;
-            pushNeedle();
-        }
+        if (backspaceNeedle()) pushNeedle();
         return;
     }
     // Append printable text from event.characters.
@@ -378,15 +401,7 @@ pub fn handleKey(event: objc.Object, keycode: u16) void {
     const chars_ptr = chars_obj.msgSend([*c]const u8, "UTF8String", .{});
     if (chars_ptr == null) return;
     const s = std.mem.sliceTo(chars_ptr, 0);
-    if (s.len == 0) return;
-    // Skip control chars (< 0x20) — covers Tab, Ctrl combos that AppKit
-    // delivers via characters even when not intended as text.
-    if (s.len == 1 and s[0] < 0x20) return;
-    const room = app.g.find.query_buf.len - app.g.find.query_len;
-    const take = @min(s.len, room);
-    @memcpy(app.g.find.query_buf[app.g.find.query_len .. app.g.find.query_len + take], s[0..take]);
-    app.g.find.query_len += take;
-    pushNeedle();
+    if (appendChars(s)) pushNeedle();
 }
 
 pub fn actionNext() void {
@@ -395,4 +410,54 @@ pub fn actionNext() void {
 
 pub fn actionPrev() void {
     forwardBindingAction("navigate_search:previous");
+}
+
+// Tests --------------------------------------------------------------
+//
+// Pure state machine on `app.g.find.query_*`. Each test resets the
+// global needle slot up-front so ordering between tests is moot
+// (Zig test runners share process state).
+
+fn resetFindState() void {
+    app.g.find.query_len = 0;
+    app.g.find.total = null;
+    app.g.find.selected = null;
+}
+
+test "find: appendChars grows the needle and tracks length" {
+    resetFindState();
+    try std.testing.expect(appendChars("foo"));
+    try std.testing.expectEqual(@as(usize, 3), app.g.find.query_len);
+    try std.testing.expectEqualSlices(u8, "foo", app.g.find.query_buf[0..3]);
+}
+
+test "find: appendChars rejects empty + single control bytes" {
+    resetFindState();
+    try std.testing.expect(!appendChars(""));
+    try std.testing.expect(!appendChars("\t"));
+    try std.testing.expect(!appendChars(&[_]u8{0x1b}));
+    try std.testing.expectEqual(@as(usize, 0), app.g.find.query_len);
+}
+
+test "find: appendChars saturates at buffer capacity" {
+    resetFindState();
+    const cap = app.g.find.query_buf.len;
+    var huge: [256]u8 = undefined;
+    @memset(&huge, 'x');
+    // First call fills the buffer.
+    try std.testing.expect(appendChars(huge[0..cap]));
+    try std.testing.expectEqual(cap, app.g.find.query_len);
+    // Second call has no room left.
+    try std.testing.expect(!appendChars("y"));
+    try std.testing.expectEqual(cap, app.g.find.query_len);
+}
+
+test "find: backspaceNeedle shrinks one byte at a time and stops at empty" {
+    resetFindState();
+    try std.testing.expect(appendChars("ab"));
+    try std.testing.expect(backspaceNeedle());
+    try std.testing.expectEqual(@as(usize, 1), app.g.find.query_len);
+    try std.testing.expect(backspaceNeedle());
+    try std.testing.expectEqual(@as(usize, 0), app.g.find.query_len);
+    try std.testing.expect(!backspaceNeedle());
 }
