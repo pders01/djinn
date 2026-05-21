@@ -39,7 +39,10 @@ pub fn close() void {
     if (!app.g.cheatsheet.mode) return;
     app.g.cheatsheet.mode = false;
     if (app.g.cheatsheet.view_id) |vid| {
-        objc.Object.fromId(vid).msgSend(void, "removeFromSuperview", .{});
+        // mountOverlay alloc/init'd the wrapper; release the +1 here
+        // so each open/close cycle doesn't leak the overlay + its
+        // text-view subtree for the program lifetime.
+        @import("../retained_view.zig").detach(vid);
         app.g.cheatsheet.view_id = null;
     }
     if (app.g.term.view_id) |tid| {

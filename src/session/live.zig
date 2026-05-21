@@ -46,8 +46,7 @@ pub fn ensureTabStripVisible(visible: bool) void {
         app.g.layout.tab_strip_id = strip.value;
         if (app.g.theme.chrome_style) |s| tab_strip.applyStyle(s);
     } else {
-        const sid = app.g.layout.tab_strip_id.?;
-        objc.Object.fromId(sid).msgSend(void, "removeFromSuperview", .{});
+        @import("../retained_view.zig").detach(app.g.layout.tab_strip_id.?);
         app.g.layout.tab_strip_id = null;
         app.g.layout.tab_strip_separator_id = null;
     }
@@ -136,14 +135,11 @@ pub fn removeSessionLive(idx: usize) void {
         if (app.g.ghostty.app) |ga| ga.surfaceFree(@ptrCast(sp));
     }
     if (dying.surface_host) |sh_id| {
-        const sh = objc.Object.fromId(sh_id);
-        sh.msgSend(void, "removeFromSuperview", .{});
-        // removeFromSuperview drops the container's retain, but the
-        // +1 from `[NSView alloc]` in addSessionLive is still ours.
-        // Release it so the NSView (and its CAMetalLayer / backing
-        // store from the bound ghostty surface) actually deallocs
-        // instead of leaking on every profile removal.
-        sh.msgSend(void, "release", .{});
+        // Drops AppKit's retain + the +1 from `[NSView alloc]` in
+        // addSessionLive so the surface_host (and its CAMetalLayer /
+        // backing store from the bound ghostty surface) actually
+        // deallocs instead of leaking on every profile removal.
+        @import("../retained_view.zig").detach(sh_id);
     }
     // Free the per-session spawn arena. SessionManager.deinit handles
     // the program-exit path; this is the live-removal counterpart so

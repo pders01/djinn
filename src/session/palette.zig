@@ -54,8 +54,10 @@ pub fn close() void {
     app.g.palette.mode = false;
     app.g.palette.query_len = 0;
     if (app.g.palette.view_id) |vid| {
-        const view = objc.Object.fromId(vid);
-        view.msgSend(void, "removeFromSuperview", .{});
+        // mountOverlay alloc/init'd the view; release the +1 here so
+        // each open/close cycle doesn't leak the palette NSView (and
+        // its drawn rows) for the program lifetime.
+        @import("../retained_view.zig").detach(vid);
         app.g.palette.view_id = null;
     }
     // Re-anchor first responder on the terminal view; AppKit can
