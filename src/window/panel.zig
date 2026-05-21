@@ -314,7 +314,7 @@ pub const Panel = struct {
         // pane updates but the chrome around it lags. The internal
         // `last_appearance == current_tag` guard makes this a no-op
         // when nothing actually changed.
-        @import("../terminal/view.zig").reapplyThemeIfChanged();
+        @import("../terminal/theme_apply.zig").reapplyIfChanged();
 
         // Force a fresh redraw of the entire view hierarchy. orderOut may
         // discard the backing store; without an explicit invalidation, AppKit

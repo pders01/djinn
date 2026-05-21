@@ -181,12 +181,11 @@ fn onConfigChanged() void {
     session_live.reconcileProfiles(old, new_cfg);
 
     cfg_ptr.* = new_cfg;
-    // reloadTheme → reapplyTheme already calls
+    // theme_apply.reload → reapply already calls
     // ghostty_runtime.reloadConfigFromDisk + appSetColorScheme as
-    // part of its path (see view.zig:reapplyTheme). Calling it
-    // explicitly here too would do the same file-read + parse twice
-    // on every save.
-    view_mod.reloadTheme();
+    // part of its path. Calling it explicitly here too would do the
+    // same file-read + parse twice on every save.
+    @import("terminal/theme_apply.zig").reload();
     // Old Config's arena is NOT released here: SessionManager's
     // `Profile.name` / `.command` / `.bell_sound` etc. point directly
     // into the arena (see `resolveEntry` — no copy), and
