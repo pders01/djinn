@@ -22,10 +22,14 @@
 //!     senderName)` to tell the system tray we exist. The host
 //!     (plasmashell / waybar / panel) then queries our properties and
 //!     draws the icon.
-//!   - The dbusmenu object exposes a static two-item menu (Toggle,
-//!     Quit). Hosts call `GetLayout` once at popup time; we return
-//!     the menu tree. Click events come back via `Event(id, "clicked",
-//!     ...)` and we dispatch on the integer id.
+//!   - The dbusmenu object mirrors darwin's menubar layout: disabled
+//!     status line at the top (rebuilt from the agent state at each
+//!     popup), Show / Hide, Copy MCP config, Settings, Quit. Hosts
+//!     call `GetLayout` (or `AboutToShow` + `GetGroupProperties`)
+//!     immediately before each popup, so the status row's label
+//!     reflects the latest state without dbusmenu signal traffic
+//!     between opens. Click events come back via `Event(id,
+//!     "clicked", ...)` and `dispatchClick` fans on the integer id.
 //!
 //! Activate/SecondaryActivate both map to panel-toggle. The icon +
 //! Title + Status reflect `agent/state.zig.Agent` — host re-queries
@@ -324,6 +328,14 @@ pub const Handler = struct {
     on_activate: *const fn (ctx: *anyopaque) void,
     /// User selected "Quit" from the dropdown menu.
     on_quit: *const fn (ctx: *anyopaque) void,
+    /// "Copy MCP config to clipboard". Mirrors the menubar entry on
+    /// darwin — reads `~/.config/djinn/mcp.json` and writes to the
+    /// system clipboard. No-op if the file is missing.
+    on_copy_mcp_config: *const fn (ctx: *anyopaque) void,
+    /// "Settings…" — open `~/.config/djinn/config` in the user's
+    /// default text editor. Mirrors darwin's `openSettings`, where
+    /// the path is created with a defaults skeleton if absent.
+    on_open_settings: *const fn (ctx: *anyopaque) void,
 };
 
 pub const Tray = struct {
@@ -502,6 +514,26 @@ pub const Tray = struct {
         emitSignal(ctx, "NewStatus", status_params);
     }
 
+    /// Re-emit `NewIcon` / `NewToolTip` so the SNI host re-resolves
+    /// the themed icon name against the now-current GTK / Plasma
+    /// icon theme. Called after a system color-scheme flip — the
+    /// freedesktop icon name we publish (`utilities-terminal` etc.)
+    /// resolves to a different glyph variant under dark vs. light
+    /// themes, but hosts like KDE Plasma cache the rendered pixmap
+    /// and only re-resolve when they receive a `NewIcon` signal.
+    ///
+    /// No-op if the SNI host isn't watching us (the bus still
+    /// dispatches the signal — there's just nobody to receive it).
+    /// Safe to call when the agent state is unchanged: `NewIcon`
+    /// only invalidates the host's icon cache, it doesn't replay
+    /// state through `updateState` or touch `last_pushed_state`.
+    pub fn notifyAppearanceChanged(self: *Tray) void {
+        const ctx = self.ctx;
+        emitSignal(ctx, "NewIcon", null);
+        emitSignal(ctx, "NewAttentionIcon", null);
+        emitSignal(ctx, "NewToolTip", null);
+    }
+
     /// Start polling `state` on the GLib main thread and pushing every
     /// transition through `updateState`. Matches darwin's 250ms poll
     /// cadence (TerminalView.tickImpl) — agent state changes settle in
@@ -662,6 +694,19 @@ const Context = struct {
 const ROOT_ID: i32 = 0;
 const ITEM_TOGGLE: i32 = 1;
 const ITEM_QUIT: i32 = 2;
+/// Disabled status line at the top of the menu — mirrors the macOS
+/// menubar's "Idle" / "Working — …" entry. Label is rebuilt from
+/// `ctx.state` + `ctx.message_buf` at GetLayout / GetGroupProperties
+/// time so each menu-open shows the current agent state without
+/// having to emit dbusmenu signal traffic on every transition.
+const ITEM_STATUS: i32 = 3;
+const ITEM_COPY_MCP: i32 = 4;
+const ITEM_SETTINGS: i32 = 5;
+/// Separator items get their own ids so hosts can address them in
+/// GetGroupProperties. Numbering starts above the click-target ids
+/// to keep the ranges visually distinct in protocol traces.
+const ITEM_SEP_TOP: i32 = 100;
+const ITEM_SEP_BOTTOM: i32 = 101;
 
 // ─── vtables ─────────────────────────────────────────────────────────
 
@@ -800,12 +845,12 @@ fn menuMethodCall(
     const m = std.mem.span(method_name);
 
     if (std.mem.eql(u8, m, "GetLayout")) {
-        g_dbus_method_invocation_return_value(invocation, buildGetLayoutReply());
+        g_dbus_method_invocation_return_value(invocation, buildGetLayoutReply(ctx));
         return;
     }
 
     if (std.mem.eql(u8, m, "GetGroupProperties")) {
-        g_dbus_method_invocation_return_value(invocation, buildGroupPropertiesReply());
+        g_dbus_method_invocation_return_value(invocation, buildGroupPropertiesReply(ctx));
         return;
     }
 
@@ -837,11 +882,7 @@ fn menuMethodCall(
         const event_id = std.mem.span(gdbus.g_variant_get_string(event_id_v, null));
 
         if (std.mem.eql(u8, event_id, "clicked")) {
-            switch (id) {
-                ITEM_TOGGLE => ctx.handler.on_activate(ctx.handler.ctx),
-                ITEM_QUIT => ctx.handler.on_quit(ctx.handler.ctx),
-                else => {},
-            }
+            dispatchClick(ctx, id);
         }
         g_dbus_method_invocation_return_value(invocation, null);
         return;
@@ -889,11 +930,7 @@ fn menuMethodCall(
             defer gdbus.g_variant_unref(event_id_v);
             const id = gdbus.g_variant_get_int32(id_v);
             const event_id = std.mem.span(gdbus.g_variant_get_string(event_id_v, null));
-            if (std.mem.eql(u8, event_id, "clicked")) switch (id) {
-                ITEM_TOGGLE => ctx.handler.on_activate(ctx.handler.ctx),
-                ITEM_QUIT => ctx.handler.on_quit(ctx.handler.ctx),
-                else => {},
-            };
+            if (std.mem.eql(u8, event_id, "clicked")) dispatchClick(ctx, id);
         }
         const tup = gdbus.g_variant_builder_new(vt("(ai)"));
         gdbus.g_variant_builder_add_value(tup, gdbus.g_variant_new_array(vt("i"), null, 0));
@@ -961,19 +998,34 @@ fn buildToolTip(state: Agent, message: []const u8) *GVariant {
 }
 
 /// GetLayout reply: (u revision, (i id, a{sv} props, av children) root).
-/// Bumping revision on each call is conservative — the menu is static
-/// so a host that caches by revision will only refetch when our
-/// revision changes (currently never, since we don't emit
-/// `LayoutUpdated`). Returning a stable revision=1 is fine.
-fn buildGetLayoutReply() *GVariant {
+/// Layout itself is static; the only field that varies between menu
+/// opens is the status item's label (driven by `ctx.state` /
+/// `ctx.message_buf`). We rebuild it at GetLayout time rather than
+/// emitting `ItemsPropertiesUpdated` on every agent-state transition
+/// — hosts call GetLayout (or `AboutToShow` + GetGroupProperties)
+/// before each popup, so the open always sees the current state
+/// without dbusmenu signal traffic between opens.
+///
+/// Revision stays at 1 since the layout shape never changes. If a
+/// future change adds runtime layout edits (hide/show entries based
+/// on config), bump the revision and emit `LayoutUpdated`.
+fn buildGetLayoutReply(ctx: *Context) *GVariant {
+    var status_buf: [320]u8 = undefined;
+    const status_label = renderStatusLabel(&status_buf, ctx.state, ctx.message_buf[0..ctx.message_len]);
+
     const root_props = gdbus.g_variant_builder_new(vt("a{sv}"));
     addStringDictEntry(root_props, "children-display", "submenu");
     const root_props_v = gdbus.g_variant_builder_end(root_props);
     gdbus.g_variant_builder_unref(root_props);
 
     const children = gdbus.g_variant_builder_new(vt("av"));
-    gdbus.g_variant_builder_add_value(children, gdbus.g_variant_new_variant(buildMenuItem(ITEM_TOGGLE, "Toggle djinn")));
-    gdbus.g_variant_builder_add_value(children, gdbus.g_variant_new_variant(buildMenuItem(ITEM_QUIT, "Quit")));
+    gdbus.g_variant_builder_add_value(children, gdbus.g_variant_new_variant(buildStandardItem(ITEM_STATUS, status_label, false)));
+    gdbus.g_variant_builder_add_value(children, gdbus.g_variant_new_variant(buildSeparatorItem(ITEM_SEP_TOP)));
+    gdbus.g_variant_builder_add_value(children, gdbus.g_variant_new_variant(buildStandardItem(ITEM_TOGGLE, "Show / Hide djinn", true)));
+    gdbus.g_variant_builder_add_value(children, gdbus.g_variant_new_variant(buildStandardItem(ITEM_COPY_MCP, "Copy MCP config to clipboard", true)));
+    gdbus.g_variant_builder_add_value(children, gdbus.g_variant_new_variant(buildStandardItem(ITEM_SETTINGS, "Settings\u{2026}", true)));
+    gdbus.g_variant_builder_add_value(children, gdbus.g_variant_new_variant(buildSeparatorItem(ITEM_SEP_BOTTOM)));
+    gdbus.g_variant_builder_add_value(children, gdbus.g_variant_new_variant(buildStandardItem(ITEM_QUIT, "Quit djinn", true)));
     const children_v = gdbus.g_variant_builder_end(children);
     gdbus.g_variant_builder_unref(children);
 
@@ -992,11 +1044,13 @@ fn buildGetLayoutReply() *GVariant {
     return result;
 }
 
-/// Single leaf menu item: (i id, a{sv} props, av children).
-fn buildMenuItem(id: i32, label: [:0]const u8) *GVariant {
+/// Standard click-target item: (i id, a{sv} props, av children). The
+/// status row reuses this with `enabled=false` so it renders as
+/// non-interactive (matches the disabled state-line on macOS).
+fn buildStandardItem(id: i32, label: [:0]const u8, enabled: bool) *GVariant {
     const props = gdbus.g_variant_builder_new(vt("a{sv}"));
     addStringDictEntry(props, "label", label.ptr);
-    addBoolDictEntry(props, "enabled", true);
+    addBoolDictEntry(props, "enabled", enabled);
     addBoolDictEntry(props, "visible", true);
     const props_v = gdbus.g_variant_builder_end(props);
     gdbus.g_variant_builder_unref(props);
@@ -1014,15 +1068,49 @@ fn buildMenuItem(id: i32, label: [:0]const u8) *GVariant {
     return result;
 }
 
-/// GetGroupProperties reply: (a(ia{sv})). Always returns the full set
-/// for ITEM_TOGGLE + ITEM_QUIT — the caller's `propertyNames` filter
-/// is advisory, and the menu is small enough that filtering is more
-/// code than just returning the full property bag.
-fn buildGroupPropertiesReply() *GVariant {
+/// Separator: dbusmenu treats any item with `type=separator` as a
+/// horizontal rule. Hosts ignore label/enabled for separators, so we
+/// only need the property + an id unique to this item.
+fn buildSeparatorItem(id: i32) *GVariant {
+    const props = gdbus.g_variant_builder_new(vt("a{sv}"));
+    addStringDictEntry(props, "type", "separator");
+    addBoolDictEntry(props, "visible", true);
+    const props_v = gdbus.g_variant_builder_end(props);
+    gdbus.g_variant_builder_unref(props);
+
+    const children = gdbus.g_variant_builder_new(vt("av"));
+    const children_v = gdbus.g_variant_builder_end(children);
+    gdbus.g_variant_builder_unref(children);
+
+    const tup = gdbus.g_variant_builder_new(vt("(ia{sv}av)"));
+    gdbus.g_variant_builder_add_value(tup, gdbus.g_variant_new_int32(id));
+    gdbus.g_variant_builder_add_value(tup, props_v);
+    gdbus.g_variant_builder_add_value(tup, children_v);
+    const result = gdbus.g_variant_builder_end(tup);
+    gdbus.g_variant_builder_unref(tup);
+    return result;
+}
+
+/// GetGroupProperties reply: (a(ia{sv})). Always returns the full
+/// property bag for every menu id — the caller's `propertyNames`
+/// filter is advisory, and the menu is small enough that filtering
+/// is more code than just emitting the full set. Status label is
+/// reconstructed from `ctx.state` / `ctx.message_buf` so a host
+/// that bypasses GetLayout (some KDE versions cache the layout +
+/// only re-fetch property bags) still sees the current state.
+fn buildGroupPropertiesReply(ctx: *Context) *GVariant {
+    var status_buf: [320]u8 = undefined;
+    const status_label = renderStatusLabel(&status_buf, ctx.state, ctx.message_buf[0..ctx.message_len]);
+
     const arr = gdbus.g_variant_builder_new(vt("a(ia{sv})"));
 
-    appendGroupItem(arr, ITEM_TOGGLE, "Toggle djinn");
-    appendGroupItem(arr, ITEM_QUIT, "Quit");
+    appendStandardGroupItem(arr, ITEM_STATUS, status_label, false);
+    appendSeparatorGroupItem(arr, ITEM_SEP_TOP);
+    appendStandardGroupItem(arr, ITEM_TOGGLE, "Show / Hide djinn", true);
+    appendStandardGroupItem(arr, ITEM_COPY_MCP, "Copy MCP config to clipboard", true);
+    appendStandardGroupItem(arr, ITEM_SETTINGS, "Settings\u{2026}", true);
+    appendSeparatorGroupItem(arr, ITEM_SEP_BOTTOM);
+    appendStandardGroupItem(arr, ITEM_QUIT, "Quit djinn", true);
 
     const arr_v = gdbus.g_variant_builder_end(arr);
     gdbus.g_variant_builder_unref(arr);
@@ -1034,10 +1122,26 @@ fn buildGroupPropertiesReply() *GVariant {
     return result;
 }
 
-fn appendGroupItem(arr: *GVariantBuilder, id: i32, label: [:0]const u8) void {
+fn appendStandardGroupItem(arr: *GVariantBuilder, id: i32, label: [:0]const u8, enabled: bool) void {
     const props = gdbus.g_variant_builder_new(vt("a{sv}"));
     addStringDictEntry(props, "label", label.ptr);
-    addBoolDictEntry(props, "enabled", true);
+    addBoolDictEntry(props, "enabled", enabled);
+    addBoolDictEntry(props, "visible", true);
+    const props_v = gdbus.g_variant_builder_end(props);
+    gdbus.g_variant_builder_unref(props);
+
+    const entry = gdbus.g_variant_builder_new(vt("(ia{sv})"));
+    gdbus.g_variant_builder_add_value(entry, gdbus.g_variant_new_int32(id));
+    gdbus.g_variant_builder_add_value(entry, props_v);
+    const entry_v = gdbus.g_variant_builder_end(entry);
+    gdbus.g_variant_builder_unref(entry);
+
+    gdbus.g_variant_builder_add_value(arr, entry_v);
+}
+
+fn appendSeparatorGroupItem(arr: *GVariantBuilder, id: i32) void {
+    const props = gdbus.g_variant_builder_new(vt("a{sv}"));
+    addStringDictEntry(props, "type", "separator");
     addBoolDictEntry(props, "visible", true);
     const props_v = gdbus.g_variant_builder_end(props);
     gdbus.g_variant_builder_unref(props);
@@ -1053,17 +1157,48 @@ fn appendGroupItem(arr: *GVariantBuilder, id: i32, label: [:0]const u8) void {
 
 /// Single-property fallback for dbusmenu.GetProperty. Hosts almost
 /// never call this — GetGroupProperties is the warm path — but a
-/// spec-conformant implementation needs it.
+/// spec-conformant implementation needs it. Status label gets a
+/// stale value here (no Context plumbed through GDBus's GetProperty
+/// signature), but hosts hit this path so rarely that the trade-off
+/// is acceptable. If a host turns out to depend on it for the
+/// status row, plumb `ctx` through and rebuild via `renderStatusLabel`.
 fn buildGetPropertyReply(id: i32, name: []const u8) *GVariant {
     const label: [:0]const u8 = switch (id) {
-        ITEM_TOGGLE => "Toggle djinn",
-        ITEM_QUIT => "Quit",
+        ITEM_TOGGLE => "Show / Hide djinn",
+        ITEM_QUIT => "Quit djinn",
+        ITEM_COPY_MCP => "Copy MCP config to clipboard",
+        ITEM_SETTINGS => "Settings\u{2026}",
+        ITEM_STATUS => "djinn",
         else => "",
+    };
+
+    if (std.mem.eql(u8, name, "type")) {
+        // Separators report type=separator; everything else reports
+        // type=standard (dbusmenu default — strictly we could return
+        // an empty string and hosts treat it as standard, but being
+        // explicit avoids ambiguity).
+        const ty: [:0]const u8 = switch (id) {
+            ITEM_SEP_TOP, ITEM_SEP_BOTTOM => "separator",
+            else => "standard",
+        };
+        const inner = gdbus.g_variant_new_string(ty.ptr);
+        const tup = gdbus.g_variant_builder_new(vt("(v)"));
+        gdbus.g_variant_builder_add_value(tup, gdbus.g_variant_new_variant(inner));
+        const result = gdbus.g_variant_builder_end(tup);
+        gdbus.g_variant_builder_unref(tup);
+        return result;
+    }
+
+    const enabled = switch (id) {
+        ITEM_STATUS, ITEM_SEP_TOP, ITEM_SEP_BOTTOM => false,
+        else => true,
     };
 
     const inner: *GVariant = if (std.mem.eql(u8, name, "label"))
         gdbus.g_variant_new_string(label.ptr)
-    else if (std.mem.eql(u8, name, "enabled") or std.mem.eql(u8, name, "visible"))
+    else if (std.mem.eql(u8, name, "enabled"))
+        gdbus.g_variant_new_boolean(if (enabled) 1 else 0)
+    else if (std.mem.eql(u8, name, "visible"))
         gdbus.g_variant_new_boolean(1)
     else
         gdbus.g_variant_new_string("");
@@ -1073,6 +1208,33 @@ fn buildGetPropertyReply(id: i32, name: []const u8) *GVariant {
     const result = gdbus.g_variant_builder_end(tup);
     gdbus.g_variant_builder_unref(tup);
     return result;
+}
+
+/// Click dispatch shared by `Event` and `EventGroup`. Hosts route
+/// every "clicked" event through one of these methods; both call
+/// here so the handler map stays in lockstep across them.
+fn dispatchClick(ctx: *Context, id: i32) void {
+    switch (id) {
+        ITEM_TOGGLE => ctx.handler.on_activate(ctx.handler.ctx),
+        ITEM_QUIT => ctx.handler.on_quit(ctx.handler.ctx),
+        ITEM_COPY_MCP => ctx.handler.on_copy_mcp_config(ctx.handler.ctx),
+        ITEM_SETTINGS => ctx.handler.on_open_settings(ctx.handler.ctx),
+        else => {},
+    }
+}
+
+/// Build the status row label from the current agent state +
+/// message. Format mirrors darwin's menubar status item:
+///   - idle, no message → "Idle"
+///   - state with message → "<State> — <msg>"
+///   - state without message → "<State>"
+/// Truncates the message into the caller's buffer on overflow.
+fn renderStatusLabel(buf: []u8, state: Agent, message: []const u8) [:0]u8 {
+    const label = stateLabel(state);
+    if (message.len == 0)
+        return std.fmt.bufPrintZ(buf, "{s}", .{label}) catch unreachable;
+    return std.fmt.bufPrintZ(buf, "{s} - {s}", .{ label, message }) catch
+        std.fmt.bufPrintZ(buf, "{s}", .{label}) catch unreachable;
 }
 
 // ─── Async reply callbacks ───────────────────────────────────────────
@@ -1208,8 +1370,29 @@ test "Tray type compiles" {
 
 test "menu item ids stay distinct" {
     if (builtin.os.tag != .linux) return;
-    try std.testing.expect(ROOT_ID != ITEM_TOGGLE);
-    try std.testing.expect(ITEM_TOGGLE != ITEM_QUIT);
+    const ids = [_]i32{
+        ROOT_ID,        ITEM_TOGGLE,   ITEM_QUIT,
+        ITEM_STATUS,    ITEM_COPY_MCP, ITEM_SETTINGS,
+        ITEM_SEP_TOP,   ITEM_SEP_BOTTOM,
+    };
+    for (ids, 0..) |a, i| for (ids[i + 1 ..]) |b|
+        try std.testing.expect(a != b);
+}
+
+test "renderStatusLabel: state-only with no message" {
+    if (builtin.os.tag != .linux) return;
+    var buf: [320]u8 = undefined;
+    try std.testing.expectEqualStrings("Idle", renderStatusLabel(&buf, .idle, ""));
+    try std.testing.expectEqualStrings("Working", renderStatusLabel(&buf, .working, ""));
+}
+
+test "renderStatusLabel: state plus message" {
+    if (builtin.os.tag != .linux) return;
+    var buf: [320]u8 = undefined;
+    try std.testing.expectEqualStrings(
+        "Needs attention - pick a branch",
+        renderStatusLabel(&buf, .attention, "pick a branch"),
+    );
 }
 
 test "iconName: all agent states map to a non-empty themed icon" {

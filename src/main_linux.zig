@@ -112,6 +112,57 @@ fn reapDragDropTemps() void {
     }
 }
 
+/// Written to `~/.config/djinn/config` the first time the tray's
+/// "Settings\u{2026}" entry is clicked on a fresh install. Mirrors
+/// `notify/menubar.zig::default_config_skeleton` but tailored for
+/// Linux: ctrl/alt/shift modifiers, no Apple-only sound names, and
+/// the `open-at-login` caveat about signed bundles gets dropped
+/// since the Linux autostart path uses an XDG `.desktop` file.
+const default_config_skeleton =
+    \\# djinn config
+    \\#
+    \\# Format: `key = value` per line, `#` line comments.
+    \\# Settings menu reopens this file via xdg-open.
+    \\
+    \\# Window
+    \\window-width = 800
+    \\window-height = 400
+    \\window-position = top_center        # 9-grid anchor
+    \\window-topmost = true
+    \\hide-on-blur = false
+    \\
+    \\# Toggle hotkey. Mods: ctrl, alt, shift. Bound via xdg-desktop-
+    \\# portal.GlobalShortcuts; on first run KDE prompts for approval.
+    \\hotkey = ctrl+space
+    \\
+    \\# Provider (claude / codex / aider / gemini / opencode / crush / pi / generic)
+    \\provider = generic
+    \\
+    \\# Terminal (inherit from ghostty unless overridden)
+    \\inherit-ghostty = true
+    \\# font-family = IosevkaTerm Nerd Font Mono
+    \\# font-size = 13
+    \\
+    \\# Log pane
+    \\log-pane-enabled = false
+    \\log-pane-width-fraction = 0.28
+    \\
+    \\# System
+    \\open-at-login = false
+    \\
+    \\# Bell
+    \\bell-audible = true
+    \\bell-visual = false
+    \\
+    \\# MCP server
+    \\mcp-enabled = true
+    \\
+    \\# Notifications
+    \\system-notifications = true
+    \\menubar-icon = true
+    \\
+;
+
 /// IPC dispatch glue. Lives at file scope (not inside `main`) so the
 /// stable address survives Ipc's registration — the GLib watch holds
 /// the handler.ctx pointer for the lifetime of the source.
@@ -161,6 +212,16 @@ const Dispatch = struct {
     /// don't dangle. Mirrors the eager-refresh pattern darwin uses.
     tool_table: ?*ToolTable = null,
     notifier: ?*platform.Notifier = null,
+    /// Tray slot. `onConfigChanged` fires `notifyAppearanceChanged`
+    /// so the SNI host re-resolves the themed icon name against the
+    /// now-current GTK / Plasma icon theme — the same trigger path
+    /// the portal `SettingChanged` signal feeds into, so a system-
+    /// wide light/dark flip auto-refreshes the tray glyph instead
+    /// of leaving the host's pixmap cache stale until the next
+    /// agent-state transition. Optional pointer; null when the SNI
+    /// watcher isn't running (bare wlroots) and `onConfigChanged`
+    /// no-ops the tray fan-out cleanly.
+    tray: ?*?platform.Tray = null,
 
     /// Read the persisted size for the profile at `idx` and resize the
     /// panel to match. Mirrors darwin's `applyProfileWindowSize` in
@@ -214,6 +275,74 @@ const Dispatch = struct {
     fn onTrayQuit(ctx: *anyopaque) void {
         const self: *Dispatch = @ptrCast(@alignCast(ctx));
         self.panel.quit();
+    }
+
+    /// "Copy MCP config to clipboard" — mirrors darwin Menubar's
+    /// `copyMcpConfigImpl`. Reads `$HOME/.config/djinn/mcp.json` and
+    /// writes the contents to the GDK clipboard via the panel's GTK
+    /// display. Missing file is a no-op so users without an MCP
+    /// config don't get a confusing failure.
+    fn onTrayCopyMcpConfig(ctx: *anyopaque) void {
+        const self: *Dispatch = @ptrCast(@alignCast(ctx));
+        const home = std.posix.getenv("HOME") orelse return;
+
+        const path = std.fmt.allocPrint(
+            self.allocator,
+            "{s}/.config/djinn/mcp.json",
+            .{home},
+        ) catch return;
+        defer self.allocator.free(path);
+
+        const file = std.fs.openFileAbsolute(path, .{}) catch return;
+        defer file.close();
+        const contents = file.readToEndAllocOptions(
+            self.allocator,
+            64 * 1024,
+            null,
+            .of(u8),
+            0,
+        ) catch return;
+        defer self.allocator.free(contents);
+
+        self.panel.copyTextToClipboard(contents);
+    }
+
+    /// "Settings\u{2026}" — open `$HOME/.config/djinn/config` in the
+    /// user's default text editor via xdg-open. Creates the file +
+    /// parent dir with a defaults skeleton if missing, matching
+    /// darwin's `openSettings`.
+    fn onTrayOpenSettings(ctx: *anyopaque) void {
+        const self: *Dispatch = @ptrCast(@alignCast(ctx));
+        const home = std.posix.getenv("HOME") orelse return;
+
+        const dir = std.fmt.allocPrint(
+            self.allocator,
+            "{s}/.config/djinn",
+            .{home},
+        ) catch return;
+        defer self.allocator.free(dir);
+
+        const path = std.fmt.allocPrint(
+            self.allocator,
+            "{s}/config",
+            .{dir},
+        ) catch return;
+        defer self.allocator.free(path);
+
+        std.fs.makeDirAbsolute(dir) catch {};
+        if (std.fs.accessAbsolute(path, .{})) {} else |_| {
+            if (std.fs.createFileAbsolute(path, .{})) |f| {
+                defer f.close();
+                f.writeAll(default_config_skeleton) catch {};
+            } else |_| {}
+        }
+
+        var child = std.process.Child.init(
+            &.{ "xdg-open", path },
+            self.allocator,
+        );
+        child.spawn() catch return;
+        _ = child.wait() catch {};
     }
 
     /// VTE `bell`: the PTY emitted BEL (0x07). Audible bell is
@@ -368,6 +497,16 @@ const Dispatch = struct {
         log_pane.applyTheme(opts);
         if (self.tab_strip) |ts| ts.applyTheme(opts);
         if (self.palette) |pal| pal.applyTheme(opts);
+
+        // Nudge the SNI host to re-resolve the themed icon name. The
+        // call path that brings us here covers both a portal color-
+        // scheme flip (auto theme-switch) and an explicit config
+        // save; in the latter case the icon usually hasn't changed,
+        // but emitting `NewIcon` is ~1ms of bus traffic that the
+        // host swallows cheaply. Without this nudge KDE Plasma in
+        // particular keeps the pre-flip icon variant in its pixmap
+        // cache until the next agent-state transition.
+        if (self.tray) |tray_slot| if (tray_slot.*) |*t| t.notifyAppearanceChanged();
 
         // Window size: layer-shell may clip, but on non-layer-shell
         // (GNOME) the resize takes effect immediately. Only fire the
@@ -1208,12 +1347,19 @@ pub fn main() !void {
             .ctx = @ptrCast(&g_dispatch),
             .on_activate = Dispatch.onTrayActivate,
             .on_quit = Dispatch.onTrayQuit,
+            .on_copy_mcp_config = Dispatch.onTrayCopyMcpConfig,
+            .on_open_settings = Dispatch.onTrayOpenSettings,
         },
     ) catch |err| blk: {
         std.debug.print("tray init failed: {} — proceeding without tray\n", .{err});
         break :blk null;
     };
     defer if (maybe_tray) |*t| t.deinit();
+    // Stamp the tray slot so the appearance listener's reload path
+    // can fan a NewIcon emit into the SNI host without having to
+    // touch the tray's late-built observer wiring (which lives after
+    // the AgentState is constructed below).
+    g_dispatch.tray = &maybe_tray;
 
     // Config-file watcher. Mirrors darwin's FSEventStream setup —
     // parent-dir granularity for atomic-rename safety, basename

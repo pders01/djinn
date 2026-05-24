@@ -51,6 +51,16 @@ const GObject = gtk.GObject;
 const gboolean = gtk.gboolean;
 const gpointer = gtk.gpointer;
 
+// Clipboard surface — same shape as `log_pane.zig` / `keymap.zig`'s
+// mcp-endpoint copy. We declare it here so Panel itself can expose a
+// `copyTextToClipboard` helper that Dispatch hooks (tray "Copy MCP
+// config") can reuse without each caller re-deriving the display.
+const GdkDisplay = opaque {};
+const GdkClipboard = opaque {};
+extern "c" fn gtk_widget_get_display(widget: *GtkWidget) ?*GdkDisplay;
+extern "c" fn gdk_display_get_clipboard(display: *GdkDisplay) ?*GdkClipboard;
+extern "c" fn gdk_clipboard_set_text(clipboard: *GdkClipboard, text: [*:0]const u8) void;
+
 extern "c" fn gtk_init() void;
 extern "c" fn gtk_window_new() *GtkWidget;
 extern "c" fn gtk_window_set_decorated(window: *GtkWindow, setting: gboolean) void;
@@ -560,6 +570,17 @@ pub const Panel = struct {
     pub fn clearOpaqueRegion(self: *Panel) void {
         const surface = gtk_native_get_surface(@ptrCast(self.window)) orelse return;
         gdk_surface_set_opaque_region(surface, null);
+    }
+
+    /// Write `text` to the system clipboard via the window's GdkDisplay.
+    /// No-op if the display or clipboard lookup fails (offscreen
+    /// rendering, unusual compositor setups). Caller owns `text`; we
+    /// only borrow the pointer for the GDK call, which copies into
+    /// the clipboard's own buffer.
+    pub fn copyTextToClipboard(self: *Panel, text: [:0]const u8) void {
+        const display = gtk_widget_get_display(@ptrCast(self.window)) orelse return;
+        const clipboard = gdk_display_get_clipboard(display) orelse return;
+        gdk_clipboard_set_text(clipboard, text.ptr);
     }
 
     /// One-call Quake-drop toggle. Whatever state the panel is in,
