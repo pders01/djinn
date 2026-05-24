@@ -1264,6 +1264,29 @@ pub fn main() !void {
         null;
     defer if (maybe_watcher) |*w| w.deinit();
 
+    // Auto theme-switch listener (xdg-desktop-portal Settings).
+    // Mirrors darwin's `viewDidChangeEffectiveAppearance` hook — a
+    // system-wide light/dark flip retriggers the reload chain so the
+    // VTE / log pane / tab strip pick up the matching `theme =
+    // light:X,dark:Y` variant without the user re-saving or pressing
+    // Ctrl+Shift+T. Re-uses `Dispatch.onConfigChanged` (same path the
+    // theme-toggle keybinding takes) so there's only one apply
+    // sequence to maintain. Late-stamped slots may not be wired yet
+    // if a signal races startup; the readiness gate inside
+    // `onConfigChanged` bails cleanly in that case, and the user's
+    // next actual flip retriggers cleanly once slots are stamped.
+    // Non-fatal init failure (no session bus / no portal) matches the
+    // hotkey + tray pattern — the manual Ctrl+Shift+T cycle and
+    // config-save path both keep working.
+    var maybe_appearance: ?platform.AppearanceListener = platform.AppearanceListener.init(
+        allocator,
+        .{ .ctx = @ptrCast(&g_dispatch), .on_changed = Dispatch.onConfigChanged },
+    ) catch |err| blk: {
+        std.debug.print("appearance listener init failed: {} — proceeding without auto theme switching\n", .{err});
+        break :blk null;
+    };
+    defer if (maybe_appearance) |*a| a.deinit();
+
     // Apply autostart preference. Idempotent on both branches —
     // register overwrites an existing entry with current Exec path,
     // unregister treats ENOENT as success. Failures are logged but
@@ -1375,6 +1398,7 @@ test {
     _ = @import("platform/linux/gtk.zig");
     _ = @import("platform/linux/ipc.zig");
     _ = @import("platform/linux/hotkey.zig");
+    _ = @import("platform/linux/appearance.zig");
     _ = @import("platform/linux/tray.zig");
     _ = @import("platform/linux/notifier.zig");
     _ = @import("platform/linux/watcher.zig");

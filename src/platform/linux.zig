@@ -48,6 +48,10 @@ pub const hotkey = @import("linux/hotkey.zig");
 pub const Hotkey = hotkey.Hotkey;
 pub const HotkeyHandler = hotkey.Handler;
 
+pub const appearance = @import("linux/appearance.zig");
+pub const AppearanceListener = appearance.Listener;
+pub const AppearanceHandler = appearance.Handler;
+
 pub const tray = @import("linux/tray.zig");
 pub const Tray = tray.Tray;
 pub const TrayHandler = tray.Handler;
