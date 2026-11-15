@@ -2,6 +2,8 @@
 //! exclude native API-body checks; test-compile checks those without linking.
 //! Never opens a display, reads personal configuration, or registers autostart.
 test {
+    // Include pure entry-point theme assembly; native main/API tests stay filtered.
+    _ = @import("main_linux.zig");
     _ = @import("platform/linux/autostart.zig");
     _ = @import("platform/linux/dragdrop.zig");
     _ = @import("platform/linux/theme.zig");

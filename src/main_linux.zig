@@ -538,7 +538,8 @@ test "buildThemeOptions: ghostty fills gaps when djinn unset" {
     try std.testing.expectEqualStrings("Inherited", opts.font_family.?);
     try std.testing.expectEqual(@as(?f64, 11), opts.font_size);
     try std.testing.expectEqual(@as(u8, 0xaa), opts.background.?.r);
-    try std.testing.expectEqual(@as(?f64, 0.95), opts.opacity);
+    // No explicit opacity means native reset, not the legacy window fallback.
+    try std.testing.expectEqual(@as(?f64, null), opts.opacity);
     try std.testing.expectEqual(@as(u8, 2), opts.palette[3].?.g);
 }
 test "buildThemeOptions: no ghostty inheritance" {
@@ -548,7 +549,20 @@ test "buildThemeOptions: no ghostty inheritance" {
     try std.testing.expectEqual(@as(u8, 0xab), opts.background.?.r);
     try std.testing.expect(opts.foreground == null);
     try std.testing.expect(opts.font_family == null);
+    try std.testing.expectEqual(@as(?f64, null), opts.opacity);
     for (opts.palette) |slot| try std.testing.expect(slot == null);
+}
+test "buildThemeOptions: opacity removal restores native policy without legacy fallback" {
+    var cfg: Config = .{};
+    // Legacy window opacity must not fill a removed terminal override.
+    cfg.window.opacity = 0.4;
+    for ([_]?f64{ 0.75, 0, 1, null }) |opacity| {
+        cfg.theme.opacity = opacity;
+        for ([_]?platform.GhosttyColors{ .{}, null }) |colors| {
+            const opts = buildThemeOptions(&cfg, colors);
+            try std.testing.expectEqual(opacity, opts.opacity);
+        }
+    }
 }
 test "terminal BEL attention follows emitting source and panel focus" {
     try std.testing.expect(!shouldNotifyBell(0, 0, true));
