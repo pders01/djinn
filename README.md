@@ -129,12 +129,19 @@ nix develop --command ./scripts/build.sh test-shared test-linux-models
 fixtures without GTK linkage. Native Linux API-body checks remain in the
 compile-only `test-compile` target and the native Linux test suite.
 
-Release tooling can be checked without installation or publication:
+Developer and release tooling can be checked without installation or publication:
 
 ```sh
+python3 scripts/test-tooling.py           # Python 3 stdlib and Bash
 bash scripts/install-from-release.sh --self-test
-python3 scripts/test-release-workflows.py  # Python 3, Ruby YAML/JSON stdlib, jq
+python3 scripts/test-release-workflows.py # Python 3, Ruby YAML/JSON stdlib, jq
+# Or run both Python fixture suites together:
+just test-tooling
 ```
+
+Tooling fixtures check repository/version metadata, Debian install-file coverage,
+terminal-compatible service policy, Arch version generation with mocked Git,
+installer messages with mocked rsync, and documented action availability.
 
 Cross-compilation is not a Linux link, runtime, or compositor test. Run the
 Linux CI/build/test commands on Linux before treating this reconciliation

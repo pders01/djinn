@@ -80,6 +80,11 @@ confinement to that workload's explicit launcher rather than the terminal.
 User/system-wide policies still apply. Native service and package acceptance
 (including ordinary privileged/JIT commands) remains required.
 
+Run `python3 scripts/test-tooling.py` from the repository root for offline
+metadata, service-policy, Debian manifest, Arch version, and documentation
+regressions. These fixtures never clone, install a package, enable a service,
+or replace an application; they do not substitute for native package builds.
+
 macOS builds/releases are Apple Silicon (arm64) only; Intel Macs are no longer
 supported. They still use the full Ghostty 1.4.0 Metal renderer, macOS 13
 deployment minimum, SDK 26.5, and a bundle-local `@loader_path` library. Linux

@@ -44,6 +44,9 @@ jobs:
       - name: Run unit suite
         run: nix develop --command ./scripts/build.sh test test-shared test-linux-models
 
+      - name: Offline developer tooling fixtures
+        run: python3 scripts/test-tooling.py
+
       - name: Offline release workflow validation fixtures
         run: python3 scripts/test-release-workflows.py
 

@@ -14,6 +14,11 @@ build *args:
 test *args:
     {{nix}} './scripts/build.sh test {{args}}'
 
+# Offline script/metadata and workflow fixtures (Python 3, Ruby and jq).
+test-tooling:
+    python3 scripts/test-tooling.py
+    python3 scripts/test-release-workflows.py
+
 # Build + launch from the dev cache (no .app bundle).
 run *args:
     {{nix}} './scripts/build.sh run {{args}}'
