@@ -304,6 +304,12 @@ coordinates are not portable and are reported as unsupported. Without
 layer-shell, the native toplevel/compositor controls placement and Djinn reports
 that limitation instead of promising coordinate parity.
 
+Legacy `window-opacity` and `window-font-size` settings are still parsed and
+validated, but neither terminal backend uses them. They emit migration warnings;
+replace them with `opacity` and `font-size`. No legacy opacity or font-size
+fallback is applied, and modern settings win regardless of the order of the
+legacy keys. Existing config files are never rewritten automatically.
+
 `scrollback-size` is a **line count**, not bytes: unset leaves backend defaults,
 zero retains no scrollback, and a positive value bounds retained lines. macOS
 uses Ghostty 1.4's `scrollback-limit-lines`; its independent byte cap may retain

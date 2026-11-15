@@ -37,9 +37,10 @@ pub const Config = struct {
         /// `window-position-y`, or via the `X,Y` form of `window-position`.
         position_x: ?f64 = null,
         position_y: ?f64 = null,
-        // Legacy: kept for backward compat. Prefer `theme.opacity`.
+        // Parse-only compatibility fields; neither terminal backend consumes
+        // them. Legacy keys warn with their modern replacements, without
+        // restoring old opacity/font fallbacks or changing explicit overrides.
         opacity: f64 = 0.95,
-        // Legacy: kept for backward compat. Prefer `terminal.font_size`.
         font_size: f64 = 14.0,
         toggle_style: ToggleStyle = .instant,
         topmost: bool = true,
@@ -245,6 +246,8 @@ pub const Config = struct {
                 std.debug.print("warning: config:{d}: removed key '{s}'; {s}\n", .{ line_no, key, help });
                 continue;
             }
+            if (legacyKeyReplacement(key)) |replacement|
+                std.debug.print("warning: config:{d}: legacy key '{s}' has no terminal effect; use '{s}' instead\n", .{ line_no, key, replacement });
             applyKey(&config, &keymap_list, &profile_list, allocator, key, val) catch |err| {
                 if (err == error.OutOfMemory) return error.OutOfMemory;
                 std.debug.print("warning: config:{d}: '{s}' = '{s}' ({}); check this setting in ~/.config/djinn/config\n", .{ line_no, key, val, err });
@@ -317,10 +320,10 @@ pub const Config = struct {
         } else if (eq(key, "hide-on-blur")) {
             config.window.hide_on_blur = try parseBool(val);
         } else if (eq(key, "window-opacity")) {
-            // Legacy. Prefer `opacity` (theme-level). Kept for back-compat.
+            // Parse and validate only; parseWithMode emits migration advice.
             config.window.opacity = try parseFloatRange(val, 0, 1);
         } else if (eq(key, "window-font-size")) {
-            // Legacy. Prefer `font-size`.
+            // Parse and validate only; use terminal.font_size at runtime.
             config.window.font_size = try parseFloatRange(val, 1, max_dimension);
         }
         // Hotkey ----------------------------------------------------------
@@ -475,6 +478,13 @@ fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+/// Accepted legacy scalars are validated but do not drive either backend.
+fn legacyKeyReplacement(key: []const u8) ?[]const u8 {
+    if (eq(key, "window-opacity")) return "opacity";
+    if (eq(key, "window-font-size")) return "font-size";
+    return null;
+}
+
 /// Migration diagnostics for removed infrastructure.
 fn removedKeyHelp(key: []const u8) ?[]const u8 {
     if (eq(key, "provider") or eq(key, "provider-command") or
@@ -610,6 +620,31 @@ test "Config: parse window settings" {
     try std.testing.expectEqual(@as(u32, 1024), config.window.width.?);
     try std.testing.expectEqual(@as(u32, 600), config.window.height.?);
     try std.testing.expect(config.window.opacity < 0.91 and config.window.opacity > 0.89);
+}
+
+test "Config: legacy window settings have migration advice and no terminal fallback" {
+    try std.testing.expectEqualStrings("opacity", legacyKeyReplacement("window-opacity").?);
+    try std.testing.expectEqualStrings("font-size", legacyKeyReplacement("window-font-size").?);
+    try std.testing.expect(legacyKeyReplacement("opacity") == null);
+    try std.testing.expect(legacyKeyReplacement("font-size") == null);
+    var config = try Config.parseStrict(std.testing.allocator, "window-opacity = 0.4\nwindow-font-size = 16\n");
+    defer config.deinit();
+    try std.testing.expectEqual(@as(f64, 0.4), config.window.opacity);
+    try std.testing.expectEqual(@as(f64, 16), config.window.font_size);
+    try std.testing.expect(config.theme.opacity == null);
+    try std.testing.expect(config.terminal.font_size == null);
+}
+
+test "Config: legacy window keys never override modern settings in either order" {
+    for ([_][]const u8{
+        "window-opacity = 0.4\nopacity = 0.8\nwindow-font-size = 16\nfont-size = 18\n",
+        "opacity = 0.8\nwindow-opacity = 0.4\nfont-size = 18\nwindow-font-size = 16\n",
+    }) |settings| {
+        var config = try Config.parseStrict(std.testing.allocator, settings);
+        defer config.deinit();
+        try std.testing.expectEqual(@as(?f64, 0.8), config.theme.opacity);
+        try std.testing.expectEqual(@as(?f64, 18), config.terminal.font_size);
+    }
 }
 
 test "Config: parse hotkey" {
