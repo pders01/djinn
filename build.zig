@@ -267,12 +267,16 @@ fn linuxModule(
     if (link_system) {
         // Keep layer-shell first: its Wayland symbol interposition requires
         // loading it before GTK's transitive libwayland dependency.
-        mod.linkSystemLibrary("gtk4-layer-shell-0", .{ .use_pkg_config = .force });
-        mod.linkSystemLibrary("gtk4", .{ .use_pkg_config = .force });
-        mod.linkSystemLibrary("vte-2.91-gtk4", .{ .use_pkg_config = .force });
-        mod.linkSystemLibrary("gobject-2.0", .{ .use_pkg_config = .force });
-        mod.linkSystemLibrary("glib-2.0", .{ .use_pkg_config = .force });
-        mod.linkSystemLibrary("gio-2.0", .{ .use_pkg_config = .force });
+        // Zig 0.17's .force also rejects unknown pkg-config flags, including
+        // GTK's transitive -mfpmath=sse/-msse/-msse2 C compiler options on x86.
+        // .yes retains pkg-config discovery and supported flags without that
+        // strict parsing; do not use .no (the pkg-config/library names differ).
+        mod.linkSystemLibrary("gtk4-layer-shell-0", .{ .use_pkg_config = .yes });
+        mod.linkSystemLibrary("gtk4", .{ .use_pkg_config = .yes });
+        mod.linkSystemLibrary("vte-2.91-gtk4", .{ .use_pkg_config = .yes });
+        mod.linkSystemLibrary("gobject-2.0", .{ .use_pkg_config = .yes });
+        mod.linkSystemLibrary("glib-2.0", .{ .use_pkg_config = .yes });
+        mod.linkSystemLibrary("gio-2.0", .{ .use_pkg_config = .yes });
     }
     return mod;
 }
