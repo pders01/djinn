@@ -467,7 +467,6 @@ fn tryDropImage(pb: objc.Object) bool {
     const NSArray = objc.getClass("NSArray") orelse return false;
     const NSBitmapImageRep = objc.getClass("NSBitmapImageRep") orelse return false;
     const NSDictionary = objc.getClass("NSDictionary") orelse return false;
-    const NSString = objc.getClass("NSString") orelse return false;
 
     const img_classes = NSArray.msgSend(objc.Object, "arrayWithObject:", .{NSImage});
     const images = pb.msgSend(objc.Object, "readObjectsForClasses:options:", .{ img_classes, @as(?*anyopaque, null) });
@@ -495,12 +494,8 @@ fn tryDropImage(pb: objc.Object) bool {
     });
     if (png.value == null) return false;
 
-    // Filename is randomised so a co-operating local process can't
-    // pre-position a symlink at the path and trick the writeToFile
-    // call into following it elsewhere. With a 128-bit suffix the
-    // path is unpredictable within the sub-millisecond create→write
-    // window — same protection mkstemp(3) provides via a different
-    // mechanism.
+    // Random naming plus exclusive mode-0600 creation prevents following a
+    // pre-positioned path and keeps clipboard image bytes private.
     var rand_buf: [16]u8 = undefined;
     platform.io().randomSecure(&rand_buf) catch return false;
     var hex_buf: [32]u8 = undefined;
@@ -511,16 +506,21 @@ fn tryDropImage(pb: objc.Object) bool {
     }
     var path_buf: [128]u8 = undefined;
     const path = std.mem.printSentinel(&path_buf, "/tmp/djinn-drop-{s}.png", .{hex_buf[0..]}, 0) catch return false;
-    const ns_path = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, path.ptr)});
-    if (ns_path.value == null) return false;
-    const wrote: bool = png.msgSend(bool, "writeToFile:atomically:", .{ ns_path, @as(c_int, 1) });
-    if (!wrote) return false;
-
-    // Paths under /tmp don't contain shell metacharacters; quoting
-    // unnecessary. Surface handles bracketed-paste internally based
-    // on the active mode.
-    _ = forwardText(path);
-    return true;
+    const bytes = png.msgSend(?[*]const u8, "bytes", .{}) orelse return false;
+    const length = png.msgSend(usize, "length", .{});
+    const io = platform.io();
+    const file = std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch return false;
+    var handed_off = false;
+    defer if (!handed_off) std.Io.Dir.deleteFileAbsolute(io, path) catch {};
+    {
+        defer file.close(io);
+        file.writeStreamingAll(io, bytes[0..length]) catch return false;
+    }
+    // A rejected paste has no consumer, so remove only this exact owned path.
+    // An accepted shell path has no completion acknowledgement: retaining it
+    // is safer than deleting it on a timer, shutdown, or a later app launch.
+    handed_off = forwardText(path);
+    return handed_off;
 }
 
 /// Final size synchronization after AppKit's live-resize cascade.

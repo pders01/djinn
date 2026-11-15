@@ -41,8 +41,6 @@ const libc_setenv = setenv;
 ///   - FSEventStream setup for live config reload
 fn deferredPostLaunchInit(_: ?*anyopaque) callconv(.c) void {
     const cfg = app.g.config orelse return;
-    reapDragDropTemps();
-
     syncLoginPolicy(cfg.system.open_at_login);
 
     var djinn_path_buf: [512]u8 = undefined;
@@ -214,34 +212,14 @@ fn loadConfigWithRetry(allocator: std.mem.Allocator) ?Config {
     return null;
 }
 
+/// Do not scan/reap image paths by prefix or age: pasted shell paths carry
+/// no consumer acknowledgement, and can outlive both the app and a relaunch.
 fn syncLoginPolicy(policy: ?bool) void {
     loginitem.setPolicy(policy);
     loginitem.syncPolicy() catch |err| {
         hostWarn("open-at-login policy sync failed ({}); use an installed signed Djinn.app", .{err});
     };
     if (app.g.menubar) |menubar| menubar.refresh();
-}
-
-/// Scan /tmp for `djinn-drop-*.png` files older than 1h and
-/// remove them. Called once at startup so `/tmp` doesn't grow
-/// unboundedly across launches. Failures are silent — a stale
-/// temp file is annoying, not breaking, and we don't want to
-/// block startup on a /tmp permission glitch.
-fn reapDragDropTemps() void {
-    var dir = std.Io.Dir.openDirAbsolute(platform.io(), "/tmp", .{ .iterate = true }) catch return;
-    defer dir.close(platform.io());
-    const now = platform.timestamp();
-    const max_age_s: i64 = 3600;
-    var it = dir.iterate();
-    while (it.next(platform.io()) catch return) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.startsWith(u8, entry.name, "djinn-drop-")) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".png")) continue;
-        const stat = dir.statFile(platform.io(), entry.name, .{}) catch continue;
-        const mtime_s = @divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s);
-        if (now - mtime_s < max_age_s) continue;
-        dir.deleteFile(platform.io(), entry.name) catch continue;
-    }
 }
 
 /// Resolve which profile will be active at startup, mirroring

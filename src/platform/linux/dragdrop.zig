@@ -1,6 +1,7 @@
 //! GTK drop controllers, scoped to their VTE widget. Text is validated and
 //! shell-quoted before VTE's bracketed-paste-aware API; never synthesize keys.
 const std = @import("std");
+const platform = @import("../../io/platform.zig");
 const gtk = @import("gtk.zig");
 const GtkWidget = gtk.GtkWidget;
 const VteTerminal = gtk.VteTerminal;
@@ -29,7 +30,9 @@ extern "c" fn g_bytes_unref(*GBytes) void;
 extern "c" fn g_object_set_data(*GObject, [*:0]const u8, ?*anyopaque) void;
 extern "c" fn g_object_get_data(*GObject, [*:0]const u8) ?*anyopaque;
 extern "c" fn vte_terminal_paste_text(*VteTerminal, [*:0]const u8) void;
+extern "c" fn mkdtemp([*:0]u8) ?[*:0]u8;
 extern "c" fn mkstemps([*:0]u8, c_int) c_int;
+extern "c" fn rmdir([*:0]const u8) c_int;
 extern "c" fn write(c_int, [*]const u8, usize) isize;
 extern "c" fn close(c_int) c_int;
 extern "c" fn unlink([*:0]const u8) c_int;
@@ -95,33 +98,86 @@ fn onDropImage(_: *GtkDropTarget, value: *const GValue, _: f64, _: f64, data: gt
     var len: usize = 0;
     const png = g_bytes_get_data(bytes, &len) orelse return 0;
     if (len == 0 or len > 64 * 1024 * 1024) return 0;
-    // Atomically create a mode-0600 file. Encode to bytes and write through
-    // that SAME descriptor; never re-open a guessed /tmp pathname for writing.
-    const path = "/tmp/djinn-drop-XXXXXX.png".*;
-    var path_z: [path.len:0]u8 = undefined;
-    @memcpy(&path_z, &path);
-    path_z[path.len] = 0;
-    const fd = mkstemps(&path_z, 4);
-    if (fd < 0) return 0;
-    var complete = false;
-    defer if (!complete) {
-        _ = unlink(&path_z);
-    };
-    var n: usize = 0;
-    while (n < len) {
-        const result = write(fd, png + n, len - n);
-        if (result <= 0) {
-            if (result < 0 and std.c.errno(result) == .INTR) continue;
-            _ = close(fd);
-            return 0;
-        }
-        n += @intCast(result);
-    }
-    if (close(fd) != 0) return 0;
-    complete = true;
-    vte_terminal_paste_text(@ptrCast(widget), &path_z);
+    // A private mode-0700 directory is the ownership boundary, not a wildcard
+    // filename. The image is mode 0600 and written through its creating fd.
+    const directory = "/tmp/djinn-drop-XXXXXX".*;
+    var directory_z: [directory.len:0]u8 = undefined;
+    @memcpy(&directory_z, &directory);
+    directory_z[directory.len] = 0;
+    var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    var image = OwnedImage.create(&directory_z, &path_buf) catch return 0;
+    defer image.deinit();
+    image.writeAndClose(png[0..len]) catch return 0;
+    var paste_buf: [std.Io.Dir.max_path_bytes * 4 + 3]u8 = undefined;
+    const paste = image.payload(&paste_buf) catch return 0;
+    vte_terminal_paste_text(@ptrCast(widget), paste.ptr);
+    // VTE's void API acknowledges no consumer completion. From this point the
+    // shell may retain/use the path indefinitely, even after Djinn exits.
+    image.handoff();
     return 1;
 }
+
+/// Stack-scoped ownership until paste handoff. Only exact paths created here
+/// are removed; no scans, age-based reaping, shutdown reaping, or recursive
+/// deletion. Accepted files intentionally survive: safe automatic reclamation
+/// requires an explicit consumer release protocol, which arbitrary shells lack.
+/// A process-local registry cannot establish that lifetime either.
+const OwnedImage = struct {
+    directory: [:0]const u8,
+    path: [:0]const u8,
+    fd: ?c_int,
+    handed_off: bool = false,
+
+    // Both caller-owned buffers must outlive this object.
+    fn create(directory_template: [:0]u8, path_buf: []u8) !OwnedImage {
+        _ = mkdtemp(directory_template.ptr) orelse return error.CreateDirectoryFailed;
+        errdefer _ = rmdir(directory_template.ptr);
+        const path = try std.mem.printSentinel(path_buf, "{s}/image-XXXXXX.png", .{directory_template}, 0);
+        const fd = mkstemps(path.ptr, 4);
+        if (fd < 0) return error.CreateImageFailed;
+        return .{ .directory = directory_template, .path = path, .fd = fd };
+    }
+
+    fn writeAndClose(self: *OwnedImage, bytes: []const u8) !void {
+        const fd = self.fd orelse return error.AlreadyClosed;
+        var n: usize = 0;
+        while (n < bytes.len) {
+            const result = write(fd, bytes.ptr + n, bytes.len - n);
+            if (result <= 0) {
+                if (result < 0 and std.c.errno(result) == .INTR) continue;
+                return error.WriteFailed;
+            }
+            n += @intCast(result);
+        }
+        // Never retry close (including EINTR): the fd may already be released.
+        self.fd = null;
+        if (close(fd) != 0) return error.CloseFailed;
+    }
+
+    fn payload(self: *const OwnedImage, out: []u8) ![:0]const u8 {
+        if (self.fd != null) return error.NotClosed;
+        if (out.len == 0) return error.NoSpace;
+        const n = try writeShellQuoted(out[0 .. out.len - 1], self.path, false);
+        out[n] = 0;
+        return out[0..n :0];
+    }
+
+    fn handoff(self: *OwnedImage) void {
+        std.debug.assert(self.fd == null);
+        self.handed_off = true;
+    }
+
+    fn deinit(self: *OwnedImage) void {
+        if (self.fd) |fd| {
+            _ = close(fd);
+            self.fd = null;
+        }
+        if (!self.handed_off) {
+            if (unlink(self.path.ptr) != 0) std.log.warn("could not remove failed image drop", .{});
+            if (rmdir(self.directory.ptr) != 0) std.log.warn("could not remove failed image drop directory", .{});
+        }
+    }
+};
 
 fn validText(text: []const u8) bool {
     if (!std.unicode.utf8ValidateSlice(text)) return false;
@@ -259,6 +315,65 @@ fn hexDigit(ch: u8) ?u8 {
         'A'...'F' => ch - 'A' + 10,
         else => null,
     };
+}
+
+test "owned images clean failed handoffs but survive accepted consumer lifetime" {
+    const a = std.testing.allocator;
+    const io = platform.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup(); // Fixture teardown stands in for explicit consumer release.
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const unrelated = try tmp.dir.createFile(io, "djinn-drop-unrelated.png", .{});
+    unrelated.close(io);
+    for (0..3) |stage| {
+        var directory_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const directory = try std.mem.printSentinel(&directory_buf, "{s}/owned-XXXXXX", .{root}, 0);
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        var image = try OwnedImage.create(directory, &path_buf);
+        const dir_stat = try std.Io.Dir.cwd().statFile(io, image.directory, .{});
+        const stat = try std.Io.Dir.cwd().statFile(io, image.path, .{});
+        try std.testing.expectEqual(@as(u32, 0o700), @as(u32, @intCast(dir_stat.permissions.toMode() & 0o777)));
+        try std.testing.expectEqual(@as(u32, 0o600), @as(u32, @intCast(stat.permissions.toMode() & 0o777)));
+        if (stage != 0) {
+            try image.writeAndClose("fixture PNG bytes");
+            var tiny: [1]u8 = undefined;
+            try std.testing.expectError(error.NoSpace, image.payload(&tiny));
+            if (stage == 2) {
+                var paste_buf: [std.Io.Dir.max_path_bytes * 4 + 3]u8 = undefined;
+                const paste = try image.payload(&paste_buf);
+                try std.testing.expect(paste.len != 0);
+                image.handoff();
+            }
+        }
+        image.deinit();
+        if (stage == 2) {
+            // Owner teardown must not reap a path merely because paste returned.
+            const contents = try std.Io.Dir.cwd().readFileAlloc(io, image.path, a, .unlimited);
+            defer a.free(contents);
+            try std.testing.expectEqualStrings("fixture PNG bytes", contents);
+        } else {
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, image.path, .{}));
+            try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, image.directory, .{}));
+        }
+        try tmp.dir.access(io, "djinn-drop-unrelated.png", .{});
+    }
+}
+
+test "owned image creation failure removes only its own private directory" {
+    const a = std.testing.allocator;
+    const io = platform.io();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var directory_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+    const directory = try std.mem.printSentinel(&directory_buf, "{s}/owned-XXXXXX", .{root}, 0);
+    var tiny: [1]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, OwnedImage.create(directory, &tiny));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, directory, .{}));
+    var entries = tmp.dir.iterate();
+    try std.testing.expect((try entries.next(io)) == null);
 }
 
 test "file list formats multiple decoded local paths without double decoding" {
