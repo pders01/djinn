@@ -21,6 +21,11 @@ Ghostty's renderer or Apple frameworks.
 
 ### macOS
 
+New macOS builds and releases require **Apple Silicon (arm64)**. Intel Macs
+are no longer supported. The deployment target remains **macOS 13.0**; it is
+separate from the macOS 15 CI runner OS and SDK version. Actual macOS 13
+runtime acceptance remains outstanding.
+
 Use full Xcode with its optional Metal Toolchain. If that component is missing,
 install it manually once:
 
@@ -154,13 +159,19 @@ dev-tree launch.
 
 Prebuilt bundles and the rolling `pre-release` installer are available at
 [Releases](https://github.com/pders01/djinn/releases). Rolling publication is
-manual-only pending explicit release approval; it validates both platform
-candidates before replacing downloads. Versioned releases resolve the requested
-tag to one exact commit for both builds. Choose a versioned tag for a pinned
-release. Downloads are not Developer ID signed/notarized, so Gatekeeper may
-require explicit approval.
+manual-only pending explicit release approval; it validates the **arm64 macOS
+ZIP and x86_64 Linux tarball**, each with a checksum, before replacing downloads.
+Linux aarch64 compile-only checks remain supported; there is no aarch64 Linux
+release tarball. Versioned releases resolve the requested tag to one exact commit
+for both builds. Choose a versioned tag for a pinned release. Downloads are not Developer ID signed/notarized, so Gatekeeper may
+require explicit approval. Historical versioned Intel assets are not modified;
+known Intel rolling assets are retired only after successful replacement
+publication. GitHub tag/asset updates and retirement are not atomic; a failure
+can require manual recovery.
 
-`scripts/install-from-release.sh` is macOS-only. It stages and validates the
+`scripts/install-from-release.sh` requires Apple Silicon macOS and refuses
+Intel/x86_64 execution before downloading or changing installation files. On
+Apple Silicon, run it natively, not under Rosetta. It stages and validates the
 archive/checksum, bundle, signature, and native architecture before replacement,
 keeping a same-filesystem rollback copy until replacement succeeds. Python 3 is
 required for bounded safe ZIP validation/extraction. It

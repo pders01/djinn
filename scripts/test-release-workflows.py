@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Offline workflow regressions. Requires Ruby's YAML/JSON stdlib and jq.
 
-Runs only extracted validation/architecture shell blocks with a mocked GitHub
-API and temporary fixtures. Never invokes Git, workflows, publication, or apps.
+Runs extracted validation/architecture/asset-retirement shell blocks with a
+mocked GitHub CLI and temporary fixtures, plus installer architecture refusals.
+Never invokes Git, workflows, real publication, installation, or apps.
 """
 import hashlib
 import json
@@ -49,7 +50,21 @@ for job in ("build-bundle", "build-linux"):
     checkout = release["jobs"][job]["steps"][0]
     assert checkout["with"]["ref"] == "${{ needs.resolve.outputs.sha }}"
 assert "gh release delete" not in block("publish", "Publish complete validated set")
-assert len(release["jobs"]["build-bundle"]["strategy"]["matrix"]["runner"]) == 2
+for workflow, job in ((ci, "bundle"), (release, "build-bundle")):
+    assert workflow["jobs"][job]["runs-on"] == "macos-15"
+    assert "strategy" not in workflow["jobs"][job]
+    steps = workflow["jobs"][job]["steps"]
+    architecture_index = next(i for i, s in enumerate(steps) if s.get("id") == "architecture")
+    nix_index = next(i for i, s in enumerate(steps) if s.get("name") == "Install Nix")
+    assert architecture_index < nix_index
+assert ci["jobs"]["test"]["runs-on"] == "macos-15"
+assert ci["jobs"]["linux"]["runs-on"] == "ubuntu-24.04"
+assert release["jobs"]["build-linux"]["runs-on"] == "ubuntu-24.04"
+publisher_steps = release["jobs"]["publish"]["steps"]
+publish_index = next(i for i, s in enumerate(publisher_steps) if s["name"] == "Publish complete validated set")
+retire_index = next(i for i, s in enumerate(publisher_steps) if s["name"] == "Retire legacy Intel rolling assets after successful publication")
+assert retire_index > publish_index
+assert publisher_steps[retire_index].get("if", "success()") == "success()"
 
 shell_blocks = 0
 for workflow in workflows:
@@ -70,6 +85,16 @@ with open("api-calls", "a") as log: log.write(" ".join(sys.argv[1:]) + "\\n")
 kind = os.environ["MOCK_KIND"]
 sha = os.environ["MOCK_SHA"]
 endpoint = sys.argv[2] if len(sys.argv) > 2 else ""
+if kind.startswith("retire"):
+    if sys.argv[1:4] == ["release", "view", "pre-release"]:
+        if kind == "retire-view-failure": raise SystemExit(1)
+        print(os.environ["MOCK_ASSETS"])
+    elif sys.argv[1:4] == ["release", "delete-asset", "pre-release"]:
+        allowed = [f"Djinn-pre-release-{arch}{suffix}" for arch in ("x86_64", "X64") for suffix in (".zip", ".zip.sha256")]
+        if sys.argv[4] not in allowed or sys.argv[5:] != ["--yes"]: raise SystemExit("unexpected deletion")
+        if kind == "retire-delete-failure": raise SystemExit(1)
+    else: raise SystemExit("unexpected retirement command")
+    raise SystemExit(0)
 if sys.argv[1] != "api": raise SystemExit("mutation forbidden")
 if kind == "missing": raise SystemExit(1)
 if "/git/ref/tags/" in endpoint:
@@ -119,7 +144,7 @@ else: raise SystemExit("unexpected endpoint")
     for workflow in (ci, release):
         name = "bundle" if workflow is ci else "build-bundle"
         script = next(s["run"] for s in workflow["jobs"][name]["steps"] if s.get("id") == "architecture")
-        for runner, arch in (("ARM64", "arm64"), ("X64", "x86_64"), ("unknown", None)):
+        for runner, arch in (("ARM64", "arm64"), ("X64", None), ("unknown", None)):
             output.unlink(missing_ok=True)
             result = run(script, directory, RUNNER_ARCH=runner)
             assert (result.returncode == 0) == (arch is not None)
@@ -127,10 +152,37 @@ else: raise SystemExit("unexpected endpoint")
                 assert f"name={arch}\n" in output.read_text()
                 installer = (ROOT / "scripts/install-from-release.sh").read_text()
                 assert 'ZIP_NAME="Djinn-${TAG}-${ARCH}.zip"' in installer
-                assert 'arm64|x86_64)' in installer
+                assert 'require_arm64 "$ARCH"' in installer
+            else:
+                assert not output.exists()
             architecture_cases += 1
 
-    # Candidate gate rejects missing/corrupt sets and tags moved during builds.
+    # Mock only OS/architecture probes; no download, staging or installed app
+    # may be touched on an unsupported host or for an unsupported archive.
+    uname = directory / "bin/uname"
+    uname.write_text('#!/bin/sh\ncase "$1" in -s) echo Darwin ;; -m) echo "$MOCK_ARCH" ;; *) exit 1 ;; esac\n')
+    uname.chmod(0o755)
+    curl = directory / "bin/curl"
+    curl.write_text('#!/bin/sh\ntouch unexpected-network\nexit 1\n')
+    curl.chmod(0o755)
+    installer_architecture_cases = 0
+    for host, args, message in (
+        ("x86_64", "", "Intel/x86_64 macOS is no longer supported"),
+        ("unknown", "", "unsupported macOS architecture"),
+        ("arm64", "--verify-archive fixture.zip fixture.sha256 x86_64", "Intel/x86_64 macOS is no longer supported"),
+        ("x86_64", "--verify-archive fixture.zip fixture.sha256 arm64", "Intel/x86_64 macOS is no longer supported"),
+    ):
+        result = run(f'bash "$INSTALLER" {args}', directory, MOCK_ARCH=host,
+                     INSTALLER=str(ROOT / "scripts/install-from-release.sh"))
+        assert result.returncode != 0 and message in result.stderr, result.stderr
+        assert not (directory / "Applications").exists()
+        assert not (directory / "unexpected-network").exists()
+        assert not list(directory.glob("djinn-candidate-verify.*"))
+        installer_architecture_cases += 1
+    uname.unlink()
+    curl.unlink()
+
+    # Candidate gate rejects missing/corrupt/extra sets and moved tags.
     assets = directory / "release-assets"
     assets.mkdir()
     (directory / "scripts").mkdir()
@@ -138,15 +190,21 @@ else: raise SystemExit("unexpected endpoint")
     (directory / "scripts/install-from-release.sh").write_bytes((ROOT / "scripts/install-from-release.sh").read_bytes())
     gate = block("publish", "Verify complete candidate set before any release mutation")
     publisher_cases = 0
-    for outcome in ("valid", "missing", "corrupt", "moved"):
+    for outcome in ("valid", "missing-macos", "missing-linux", "missing-checksum", "corrupt", "moved", "extra-intel"):
         for file in assets.iterdir():
             file.unlink()
-        for name in ("Djinn-pre-release-arm64.zip", "Djinn-pre-release-x86_64.zip", "djinn-pre-release-x86_64-linux.tar.gz"):
+        for name in ("Djinn-pre-release-arm64.zip", "djinn-pre-release-x86_64-linux.tar.gz"):
             data = b"fixture candidate"
             (assets / name).write_bytes(data)
             (assets / (name + ".sha256")).write_text(f"{hashlib.sha256(data).hexdigest()}  {name}\n")
-        if outcome == "missing":
+        if outcome == "missing-macos":
             (assets / "Djinn-pre-release-arm64.zip").unlink()
+        if outcome == "missing-linux":
+            (assets / "djinn-pre-release-x86_64-linux.tar.gz").unlink()
+        if outcome == "missing-checksum":
+            (assets / "Djinn-pre-release-arm64.zip.sha256").unlink()
+        if outcome == "extra-intel":
+            (assets / "Djinn-pre-release-x86_64.zip").write_bytes(b"unexpected Intel candidate")
         if outcome == "corrupt":
             (assets / "Djinn-pre-release-arm64.zip").write_bytes(b"wrong")
         result = run(gate, directory, LABEL="pre-release", TAG="v1.2.3", SHA="a" * 40,
@@ -154,5 +212,33 @@ else: raise SystemExit("unexpected endpoint")
         assert (result.returncode == 0) == (outcome == "valid"), result.stderr
         publisher_cases += 1
 
+    # Retirement is deliberately narrow and only runs after successful publish.
+    # Versioned releases do not even query assets. All commands use the mock gh.
+    retire = block("publish", "Retire legacy Intel rolling assets after successful publication")
+    retirement_cases = 0
+    preserved = ["Djinn-pre-release-arm64.zip", "Djinn-pre-release-arm64.zip.sha256",
+                 "djinn-pre-release-x86_64-linux.tar.gz", "install.sh", "unrelated.zip"]
+    normalized = [f"Djinn-pre-release-x86_64{suffix}" for suffix in (".zip", ".zip.sha256")]
+    legacy = [f"Djinn-pre-release-X64{suffix}" for suffix in (".zip", ".zip.sha256")]
+    for outcome, intel, expected in (
+        ("none", [], []), ("normalized", normalized, normalized),
+        ("legacy", normalized + legacy, normalized + legacy),
+        ("versioned", normalized, []), ("wrong-label", normalized, []),
+        ("view-failure", normalized, []), ("delete-failure", normalized, normalized[:1]),
+    ):
+        (directory / "api-calls").unlink(missing_ok=True)
+        result = run(retire, directory, MOCK_KIND=(f"retire-{outcome}"),
+                     MOCK_ASSETS="\n".join(preserved + intel),
+                     ROLLING="false" if outcome == "versioned" else "true",
+                     LABEL="v1.2.3" if outcome in ("versioned", "wrong-label") else "pre-release")
+        assert (result.returncode == 0) == (outcome not in ("wrong-label", "view-failure", "delete-failure")), result.stderr
+        calls = (directory / "api-calls").read_text().splitlines() if (directory / "api-calls").exists() else []
+        if outcome in ("versioned", "wrong-label"):
+            assert calls == []
+        deletions = [line.split()[3] for line in calls if line.startswith("release delete-asset ")]
+        assert deletions == expected, calls
+        retirement_cases += 1
+
 print(f"Workflow checks passed: {shell_blocks} shell blocks, {cases} tag cases, "
-      f"{architecture_cases} architecture cases, {publisher_cases} candidate-gate fixtures")
+      f"{architecture_cases} architecture cases, {installer_architecture_cases} installer refusals, "
+      f"{publisher_cases} candidate-gate fixtures, {retirement_cases} rolling-retirement fixtures")

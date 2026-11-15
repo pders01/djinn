@@ -17,6 +17,8 @@ pub fn build(b: *std.Build) void {
             .cpu_model = .baseline,
         } else .{ .cpu_model = .baseline },
     });
+    if (target.result.os.tag == .macos and target.result.cpu.arch != .aarch64)
+        @panic("macOS builds require Apple Silicon (aarch64); Intel Macs are no longer supported");
     const optimize = b.standardOptimizeOption(.{});
     const shared_tests = buildSharedTests(b, target, optimize);
 

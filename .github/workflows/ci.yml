@@ -163,17 +163,25 @@ jobs:
     # xcrun, bundle-local rpaths, runtime resources, plist version
     # interpolation, and ad-hoc codesign. release.yml uses the same build
     # path; publishing still depends on that workflow completing separately.
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [macos-15, macos-15-intel]
-    runs-on: ${{ matrix.runner }}
+    # macOS releases require Apple Silicon; Intel macOS is unsupported.
+    runs-on: macos-15
     timeout-minutes: 45
     needs: test
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Normalize release architecture (not cache identity)
+        id: architecture
+        env:
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          case "$RUNNER_ARCH" in
+            ARM64) arch=arm64 ;;
+            *) echo "macOS builds require Apple Silicon (ARM64), got: $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          echo "name=$arch" >> "$GITHUB_OUTPUT"
 
       - name: Install Nix
         uses: cachix/install-nix-action@v31
@@ -221,18 +229,6 @@ jobs:
 
       - name: Verify self-contained signed bundle
         run: ./scripts/verify-bundle.sh
-
-      - name: Normalize release architecture (not cache identity)
-        id: architecture
-        env:
-          RUNNER_ARCH: ${{ runner.arch }}
-        run: |
-          case "$RUNNER_ARCH" in
-            ARM64) arch=arm64 ;;
-            X64) arch=x86_64 ;;
-            *) echo "Unsupported runner architecture: $RUNNER_ARCH" >&2; exit 1 ;;
-          esac
-          echo "name=$arch" >> "$GITHUB_OUTPUT"
 
       - name: Installer fixture tests
         run: bash scripts/install-from-release.sh --self-test

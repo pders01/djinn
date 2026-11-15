@@ -13,6 +13,10 @@ resources="$bundle/Contents/Resources"
 minimum=$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$bundle/Contents/Info.plist")
 
 for artifact in "$binary" "$library"; do
+    if [[ "$(/usr/bin/lipo -archs "$artifact")" != arm64 ]]; then
+        printf 'error: macOS bundles require Apple Silicon (arm64): %s\n' "$artifact" >&2
+        exit 1
+    fi
     commands=$(/usr/bin/otool -l "$artifact")
     rpaths=$(printf '%s\n' "$commands" | awk '$1 == "cmd" && $2 == "LC_RPATH" { getline; getline; print $2 }')
     expected=""

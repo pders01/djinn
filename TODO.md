@@ -3,7 +3,8 @@
 ## Contract
 
 Terminal-first native drop-down terminal for macOS and Linux: Ghostty/AppKit
-on macOS, GTK4/VTE with Wayland layer-shell on Linux. Retain native
+on Apple Silicon macOS (arm64 only; Intel support retired), GTK4/VTE with
+Wayland layer-shell on Linux. Retain native
 hotkey/focus/window handling, find, clipboard/drag-drop, IME, themes,
 static session tabs, terminal notifications, settings, and platform packaging.
 No profiles are required: an ordinary default shell is the baseline.
@@ -27,15 +28,21 @@ verification further below remains historical; current checks are separate.
 
 ### Implemented release safeguards
 
-- [x] CI/release macOS assets normalize runner architecture to `arm64` and
-      `x86_64`, matching installer lookup without changing Zig cache identities.
-      Offline fixtures check both mappings.
+- [x] macOS builds, flake outputs and CI/release bundles are Apple Silicon-only.
+      Runner `ARM64` normalizes to `arm64` without changing Zig cache identities;
+      Intel/unknown runners fail before Nix setup, and unsupported installer
+      architectures fail before downloading or changing installation files.
+      Linux x86_64 releases and x86_64/aarch64 compile checks are retained.
+      Toolchain/deployment pins remain unchanged.
 - [x] Manual version tags resolve (including annotated tags) to an exact commit
       before either platform checkout. Both candidates use that SHA; missing,
       malformed, non-commit, and moved tags fail closed. Versioned releases refuse
       overwriting an existing release.
-- [x] One serialized publisher depends on both macOS matrix legs and Linux
-      build/test/artifact verification. No old release is deleted before validation.
+- [x] One serialized publisher depends on the arm64 macOS and x86_64 Linux
+      build/test/artifact verification. Both archives and checksums are required;
+      extra candidates (including Intel macOS) fail the gate. No old release is
+      deleted before validation. Historical versioned Intel assets are untouched;
+      known Intel rolling assets retire only after successful publication.
       A failed candidate preserves previous downloads. Rolling promotion uploads
       only after validation; GitHub tag/asset updates are **not atomic**, and API
       failure can require manual recovery. Mixed ZIP/checksum pairs fail closed,
@@ -99,7 +106,7 @@ verification further below remains historical; current checks are separate.
       deletion. Consumer-aware protocol/product policy is still unresolved.
 - [ ] Native Linux linking/tests, compositor/VTE/portal/tray/appearance/IME/drop
       acceptance and actual wrapped launcher environment. See Linux checklist.
-- [ ] Installed-app macOS acceptance, actual macOS 13 and Intel runtime checks,
+- [ ] Installed-app Apple Silicon macOS acceptance and actual macOS 13 checks,
       login registration, and slow-consumer image acceptance.
 - [ ] Measure Linux idle wakeups/CPU and drag write frequency before changing the
       inherited 500 ms geometry observer. No performance improvement is claimed.
@@ -107,7 +114,27 @@ verification further below remains historical; current checks are separate.
       audit. Ad-hoc validation does not satisfy these release gates.
 - [ ] Run CI/workflows only with authorization; no workflow was triggered here.
 
-### Current local verification
+### Apple Silicon-only policy verification
+
+- Flake evaluation exposes exactly `aarch64-darwin`, `x86_64-linux`, and
+  `aarch64-linux`; the lockfile and all toolchain/deployment pins are unchanged.
+- macOS `check test test-shared test-linux-models`: **19/19 build steps** pass
+  (test results cached). `bundle`: **121/121 steps** pass; both Mach-O artifacts
+  are `arm64`, and the plist minimum remains `13.0`.
+- Explicit `x86_64-macos` build fails with the intended unsupported-Intel message.
+  Both Linux architectures still pass `check test-compile` (4/4 steps each);
+  this is compile-only, not native Linux runtime acceptance.
+- Explicit ad-hoc signing (no keychain lookup), bundle verification with clean
+  relocated CLI, and a fresh arm64 ZIP/checksum `--verify-archive` all pass.
+  No installation or GUI launch was performed.
+- Installer fixtures: **24 archive + 8 replacement/recovery** pass. Offline
+  workflow fixtures pass: **39 shell blocks, 18 tag cases, 6 architecture cases,
+  4 early installer refusals, 7 candidate gates, and 7 rolling-asset retirement
+  cases**, using a mocked GitHub CLI. No workflow or publication was triggered.
+- Shell syntax, Zig formatting and diff whitespace checks pass. Installed-app,
+  macOS 13 runtime, native Linux desktop and release acceptance remain open.
+
+### Earlier correctness-fix verification
 
 - macOS arm64: **143/143 build steps succeeded** for bundle/check/test/resources/
   test-shared/test-linux-models. Native suite **146/146**, shared suite **66/66**
@@ -306,8 +333,8 @@ are not installed-app or native-interaction acceptance.
 - [ ] Settings creates only a missing file, opens existing settings unchanged,
       and reports inaccessible files. Migration starts no service and leaves
       old endpoint/token files untouched.
-- [ ] Run on actual macOS 13; the declared deployment floor is not proof of
-      runtime compatibility. Verify x86_64 packaging on an appropriate runner.
+- [ ] Run on actual macOS 13 on Apple Silicon; the declared deployment floor
+      is not proof of runtime compatibility. Intel macOS is no longer supported.
 
 ### Input, focus, and screens
 

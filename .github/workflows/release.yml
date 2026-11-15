@@ -71,11 +71,8 @@ jobs:
     # may need a one-time download per runner image — `xcodebuild
     # -downloadComponent` is idempotent.
     needs: resolve
-    strategy:
-      fail-fast: false
-      matrix:
-        runner: [macos-15, macos-15-intel]
-    runs-on: ${{ matrix.runner }}
+    # macOS releases require Apple Silicon; Intel macOS is unsupported.
+    runs-on: macos-15
     timeout-minutes: 45
     env:
       TAG: ${{ needs.resolve.outputs.label }}
@@ -94,8 +91,7 @@ jobs:
         run: |
           case "$RUNNER_ARCH" in
             ARM64) arch=arm64 ;;
-            X64) arch=x86_64 ;;
-            *) echo "Unsupported runner architecture: $RUNNER_ARCH" >&2; exit 1 ;;
+            *) echo "macOS builds require Apple Silicon (ARM64), got: $RUNNER_ARCH" >&2; exit 1 ;;
           esac
           echo "name=$arch" >> "$GITHUB_OUTPUT"
 
@@ -307,7 +303,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    # This is the ONLY writer. A failed/skipped platform or matrix leg never
+    # This is the ONLY writer. A failed/skipped platform never
     # reaches it, so validation failures leave every previous download intact.
     needs: [resolve, build-bundle, build-linux]
     runs-on: ubuntu-24.04
@@ -345,12 +341,12 @@ jobs:
         run: |
           set -euo pipefail
           cd release-assets
-          for file in "Djinn-${LABEL}-arm64.zip" "Djinn-${LABEL}-x86_64.zip" "djinn-${LABEL}-x86_64-linux.tar.gz"; do
+          for file in "Djinn-${LABEL}-arm64.zip" "djinn-${LABEL}-x86_64-linux.tar.gz"; do
             test -s "$file"
             test -s "$file.sha256"
             sha256sum -c "$file.sha256"
           done
-          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 6
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 4
           cp ../scripts/install-from-release.sh install.sh
           bash -n install.sh
           bash install.sh --self-test
@@ -384,7 +380,25 @@ jobs:
             if [[ "$ROLLING" == true || "$TAG" == *-* ]]; then args+=(--prerelease); fi
             gh release create "$LABEL" release-assets/* "${args[@]}"
           fi
-          printf 'Validated build of tag `%s`, exact commit `%s`.\n\nRolling promotion is manual-only pending approval.\n\nmacOS downloads are ad-hoc signed, not Developer ID signed/notarized.\n' "$TAG" "$SHA" > release-notes.md
+          printf 'Validated build of tag `%s`, exact commit `%s`.\n\nRolling promotion is manual-only pending approval.\n\nmacOS downloads require Apple Silicon (arm64), macOS 13 or newer; Intel Macs are unsupported.\n\nmacOS downloads are ad-hoc signed, not Developer ID signed/notarized.\n' "$TAG" "$SHA" > release-notes.md
           args=(--draft=false --notes-file release-notes.md)
           if [[ "$ROLLING" == true || "$TAG" == *-* ]]; then args+=(--prerelease --latest=false); fi
           gh release edit "$LABEL" "${args[@]}"
+
+      - name: Retire legacy Intel rolling assets after successful publication
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$ROLLING" == true ]] || exit 0
+          # Never touch historical versioned releases. Retire only known Intel
+          # rolling assets, and only AFTER the replacement set was published.
+          test "$LABEL" = pre-release
+          assets=$(gh release view "$LABEL" --json assets --jq '.assets[].name')
+          for arch in x86_64 X64; do
+            for suffix in .zip .zip.sha256; do
+              asset="Djinn-${LABEL}-${arch}${suffix}"
+              if grep -Fxq "$asset" <<< "$assets"; then
+                gh release delete-asset "$LABEL" "$asset" --yes
+              fi
+            done
+          done

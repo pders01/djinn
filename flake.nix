@@ -8,7 +8,8 @@
 
   outputs = { self, nixpkgs, flake-utils }:
     flake-utils.lib.eachSystem [
-      "aarch64-darwin" "x86_64-darwin" "x86_64-linux" "aarch64-linux"
+      # macOS builds/releases require Apple Silicon; Linux keeps both targets.
+      "aarch64-darwin" "x86_64-linux" "aarch64-linux"
     ] (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};

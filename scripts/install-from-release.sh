@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# macOS-only release installer. Requires curl, Python 3 (safe ZIP preflight),
+# Apple Silicon macOS-only release installer. Requires curl, Python 3 (safe ZIP preflight),
 # and macOS plist/signature/architecture tools. Never launches/quits the app,
 # removes quarantine, registers hotkeys/login items, or changes permissions.
 # DJINN_TAG defaults to pre-release; version tags use vMAJOR.MINOR.PATCH[-suffix].
@@ -11,6 +11,16 @@
 set -euo pipefail
 
 fail() { printf 'djinn installer: %s\n' "$*" >&2; return 1; }
+
+require_arm64() {
+    case "$1" in
+        arm64) ;;
+        x86_64)
+            fail 'Intel/x86_64 macOS is no longer supported; Apple Silicon (arm64) is required. On Apple Silicon, run natively rather than under Rosetta.'
+            return 1 ;;
+        *) fail "unsupported macOS architecture: $1 (requires Apple Silicon arm64)"; return 1 ;;
+    esac
+}
 
 archive_tool() {
     python3 - "$@" <<'PY'
@@ -324,10 +334,12 @@ if [[ "${1:-}" == --self-test ]]; then
 fi
 
 if [[ "${1:-}" == --verify-archive ]]; then
-    [[ $# -eq 4 && ( "$4" == arm64 || "$4" == x86_64 ) ]] || {
-        fail 'usage: --verify-archive ZIP CHECKSUM arm64|x86_64'; exit 1;
+    [[ $# -eq 4 ]] || {
+        fail 'usage: --verify-archive ZIP CHECKSUM arm64'; exit 1;
     }
+    require_arm64 "$4"
     [[ "$(uname -s)" == Darwin ]] || { fail 'bundle verification requires macOS'; exit 1; }
+    require_arm64 "$(uname -m)"
     temporary=$(mktemp -d "${TMPDIR:-/tmp}/djinn-candidate-verify.XXXXXX")
     trap 'rm -rf "$temporary"' EXIT
     archive_tool extract "$2" "$3" "$(basename "$2")" "$temporary/stage"
@@ -338,13 +350,13 @@ fi
 
 [[ $# -eq 0 ]] || { fail 'usage: install-from-release.sh [--self-test | --verify-archive ZIP CHECKSUM ARCH]'; exit 1; }
 [[ "$(uname -s)" == Darwin ]] || { fail 'installer supports macOS only (Djinn also supports Linux)'; exit 1; }
+ARCH=$(uname -m)
+require_arm64 "$ARCH"
 command -v python3 >/dev/null || { fail 'Python 3 is required for safe archive validation'; exit 1; }
 TAG="${DJINN_TAG-pre-release}"
 [[ "$TAG" == pre-release || "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+([.-][A-Za-z0-9]+)*)?$ ]] || {
     fail 'invalid or empty DJINN_TAG'; exit 1;
 }
-ARCH=$(uname -m)
-case "$ARCH" in arm64|x86_64) ;; *) fail "unsupported architecture: $ARCH"; exit 1 ;; esac
 ZIP_NAME="Djinn-${TAG}-${ARCH}.zip"
 URL="https://github.com/pders01/djinn/releases/download/${TAG}/${ZIP_NAME}"
 DEST="$HOME/Applications"

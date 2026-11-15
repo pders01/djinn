@@ -70,7 +70,9 @@ installs and relocated tarballs must adjust `ExecStart` to their actual binary
 path before installing a user-local unit. Nix substitutes its store path at
 build time. No additional background application service is required.
 
-macOS still uses the full Ghostty 1.4.0 Metal renderer, macOS 13 deployment
-minimum, SDK 26.5, and a bundle-local `@loader_path` library. Its bundle,
+macOS builds/releases are Apple Silicon (arm64) only; Intel Macs are no longer
+supported. They still use the full Ghostty 1.4.0 Metal renderer, macOS 13
+deployment minimum, SDK 26.5, and a bundle-local `@loader_path` library. Linux
+x86_64 releases and x86_64/aarch64 compile checks are unchanged. The macOS bundle,
 explicit signing/install targets, runtime resources, and bundle verifier are
 separate from Linux packaging.
