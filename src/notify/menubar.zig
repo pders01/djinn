@@ -1,6 +1,7 @@
 const std = @import("std");
 const objc = @import("objc");
 const platform = @import("../io/platform.zig");
+const loginitem = @import("../system/loginitem.zig");
 pub const NSSize = extern struct { width: f64, height: f64 };
 pub const NSPoint = extern struct { x: f64, y: f64 };
 
@@ -64,6 +65,7 @@ pub const Menubar = struct {
     /// session manager at startup. Keep the app import inside the method:
     /// AppState stores a Menubar pointer, so type layout must not need app.g.
     pub fn refresh(self: *Menubar) void {
+        if (self.status_item) |item| refreshLoginItem(item.msgSend(objc.Object, "menu", .{}));
         const mi = self.session_menu_item orelse return;
         const app = @import("../app.zig");
         var label: []const u8 = "No active session";
@@ -88,6 +90,7 @@ pub const Menubar = struct {
         if (self.status_item) |item| {
             const menu = item.msgSend(objc.Object, "menu", .{});
             if (menu.value != null) {
+                menu.msgSend(void, "setDelegate:", .{@as(?*anyopaque, null)});
                 // Clear non-retained targets before releasing the controller,
                 // even if AppKit temporarily keeps the menu/items alive.
                 const count = menu.msgSend(c_long, "numberOfItems", .{});
@@ -199,6 +202,8 @@ fn buildMenu() BuiltMenu {
     menu.msgSend(void, "setAutoenablesItems:", .{@as(c_int, 0)});
 
     const ctrl = Controller.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "init", .{});
+    // The delegate refreshes OS state at menu-open, without polling.
+    menu.msgSend(void, "setDelegate:", .{ctrl});
 
     // Active session label (informational).
     const status = NSMenuItem.msgSend(objc.Object, "alloc", .{}).msgSend(
@@ -235,6 +240,16 @@ fn buildMenu() BuiltMenu {
     menu.msgSend(void, "addItem:", .{settings});
     settings.msgSend(void, "release", .{});
 
+    const login = NSMenuItem.msgSend(objc.Object, "alloc", .{}).msgSend(
+        objc.Object,
+        "initWithTitle:action:keyEquivalent:",
+        .{ ns(NSString, "Launch at Login"), objc.sel("toggleLogin:"), ns(NSString, "") },
+    );
+    login.msgSend(void, "setTarget:", .{ctrl});
+    menu.msgSend(void, "addItem:", .{login});
+    login.msgSend(void, "release", .{});
+    refreshLoginItem(menu);
+
     menu.msgSend(void, "addItem:", .{NSMenuItem.msgSend(objc.Object, "separatorItem", .{})});
 
     // 5. Quit
@@ -267,12 +282,74 @@ fn registerControllerClass() void {
     const cls = objc.allocateClassPair(superclass, "DjinnMenuController") orelse return;
     _ = cls.addMethod("showHide:", showHideImpl);
     _ = cls.addMethod("openSettings:", openSettingsImpl);
+    _ = cls.addMethod("toggleLogin:", toggleLoginImpl);
+    _ = cls.addMethod("menuWillOpen:", menuWillOpenImpl);
     _ = cls.addMethod("quit:", quitImpl);
     objc.registerClassPair(cls);
 }
 
 fn showHideImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
     if (g_show_hide_handler) |h| h();
+}
+
+fn menuWillOpenImpl(_: objc.c.id, _: objc.c.SEL, menu: objc.c.id) callconv(.c) void {
+    refreshLoginItem(objc.Object{ .value = menu });
+}
+
+const LoginView = struct { label: [:0]const u8, enabled: bool, checked: c_long };
+
+fn loginView(actual: loginitem.Status, policy: ?bool) LoginView {
+    return .{
+        .label = switch (actual) {
+            .requires_approval => "Launch at Login — awaiting approval in System Settings",
+            .unknown => "Launch at Login — OS state unknown",
+            .not_found => "Launch at Login — app not found",
+            else => if (policy != null) (if (policy.?) "Launch at Login — config: true" else "Launch at Login — config: false") else "Launch at Login",
+        },
+        .enabled = policy == null and (actual == .enabled or actual == .not_registered),
+        .checked = if (actual == .enabled) 1 else if (actual == .requires_approval or actual == .unknown) -1 else 0,
+    };
+}
+
+fn refreshLoginItem(menu: objc.Object) void {
+    if (menu.value == null) return;
+    const actual = loginitem.status() catch loginitem.Status.unknown;
+    const view = loginView(actual, loginitem.policy());
+    const mi = menu.msgSend(objc.Object, "itemAtIndex:", .{@as(c_long, 4)});
+    const NSString = objc.getClass("NSString") orelse return;
+    var buffer: [256]u8 = undefined;
+    const label = if (loginitem.policyConflict(actual))
+        std.mem.printSentinel(&buffer, "{s} (policy conflict)", .{view.label}, 0) catch view.label
+    else
+        view.label;
+    mi.msgSend(void, "setTitle:", .{ns(NSString, label)});
+    mi.msgSend(void, "setEnabled:", .{@as(c_int, if (view.enabled) 1 else 0)});
+    mi.msgSend(void, "setState:", .{view.checked});
+}
+
+fn toggleLoginImpl(_: objc.c.id, _: objc.c.SEL, sender: objc.c.id) callconv(.c) void {
+    const actual = loginitem.status() catch loginitem.Status.unknown;
+    const view = loginView(actual, loginitem.policy());
+    if (!view.enabled) {
+        std.debug.print("login item: action rejected (explicit config policy, pending approval, or unknown OS state); OS/config unchanged\n", .{});
+        return;
+    }
+    if (actual == .enabled) loginitem.unregister() catch |err| {
+        std.debug.print("login item: disable failed ({})\n", .{err});
+    } else loginitem.register() catch |err| {
+        std.debug.print("login item: enable failed ({})\n", .{err});
+    };
+    const item = objc.Object{ .value = sender };
+    refreshLoginItem(item.msgSend(objc.Object, "menu", .{}));
+}
+
+test "menubar login view reflects OS state and never toggles explicit policy" {
+    try std.testing.expect(loginView(.enabled, null).enabled);
+    try std.testing.expectEqual(@as(c_long, 1), loginView(.enabled, false).checked);
+    try std.testing.expect(!loginView(.enabled, false).enabled);
+    try std.testing.expect(!loginView(.not_registered, true).enabled);
+    try std.testing.expect(!loginView(.unknown, null).enabled);
+    try std.testing.expectEqual(@as(c_long, -1), loginView(.requires_approval, null).checked);
 }
 
 fn openSettingsImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
@@ -337,7 +414,8 @@ const default_config_skeleton =
     \\bell-audible = true
     \\bell-visual = false
     \\bell-sound = Tink
-    \\open-at-login = false
+    \\# Absent leaves OS login state alone; uncomment for enforced policy.
+    \\# open-at-login = false
     \\
     \\# Optional static profiles; changes require an app restart.
     \\# Launch precedence: script > command > default shell.

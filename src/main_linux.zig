@@ -195,8 +195,7 @@ const Dispatch = struct {
         }
         self.panel.setHideOnBlur(candidate.window.hide_on_blur);
         self.panel.setTopmost(candidate.window.topmost);
-        if (old.system.open_at_login != candidate.system.open_at_login)
-            syncAutostart(self.allocator, candidate.system.open_at_login);
+        syncAutostart(self.allocator, candidate.system.open_at_login);
         if (profilesChanged(&old, &candidate))
             std.debug.print("config: profile membership/launch changes require restart; existing sessions retained\n", .{});
         if (keymapChanged(&old, &candidate) or old.scrollback.size != candidate.scrollback.size)
@@ -270,11 +269,10 @@ fn loadColors(allocator: std.mem.Allocator, config: *const Config) ?platform.Gho
         return null;
     };
 }
-fn syncAutostart(allocator: std.mem.Allocator, enabled: bool) void {
-    if (enabled) platform.AutoStart.register(allocator) catch |err| {
-        std.debug.print("autostart: register failed: {}\n", .{err});
-    } else platform.AutoStart.unregister(allocator) catch |err| {
-        std.debug.print("autostart: unregister failed: {}\n", .{err});
+fn syncAutostart(allocator: std.mem.Allocator, policy: ?bool) void {
+    platform.AutoStart.setPolicy(policy);
+    platform.AutoStart.syncPolicy(allocator) catch |err| {
+        std.debug.print("autostart: policy sync failed: {}\n", .{err});
     };
 }
 const ColorField = enum { background, foreground, cursor };
@@ -313,7 +311,7 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
-    _ = args.skip();
+    platform.AutoStart.setLauncherArgv0(args.next());
     var parsed = cli.Args{};
     switch (cli.parse(&args, &parsed)) {
         .run => {},
@@ -334,6 +332,7 @@ pub fn main(init: std.process.Init) !void {
     }
     var config = try Config.loadOrDefault(allocator);
     defer config.deinit();
+    platform.AutoStart.setPolicy(config.system.open_at_login);
     if (parsed.keybinding_override) |binding| config.hotkey.toggle = binding;
     var sm = try SessionManager.init(allocator, &config);
     defer sm.deinit();

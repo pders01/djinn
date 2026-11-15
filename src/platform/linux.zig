@@ -59,4 +59,7 @@ pub const AutoStart = struct {
     pub const register = autostart.register;
     pub const unregister = autostart.unregister;
     pub const status = autostart.status;
+    pub const setPolicy = autostart.setPolicy;
+    pub const syncPolicy = autostart.syncPolicy;
+    pub const setLauncherArgv0 = autostart.setLauncherArgv0;
 };

@@ -32,7 +32,43 @@ pub const Error = error{
     SmAppServiceUnavailable,
     NotABundle,
     OperationFailed,
+    PolicyConflict,
 };
+
+// Central startup/reload code publishes the accepted config before syncing.
+// Absent policy leaves OS registration alone; actions never write config.
+var configured_policy: ?bool = null;
+
+pub fn setPolicy(value: ?bool) void {
+    configured_policy = value;
+}
+
+pub fn policy() ?bool {
+    return configured_policy;
+}
+
+pub fn checkRequest(enabled: bool) Error!void {
+    if (configured_policy) |required| {
+        if (enabled != required) return Error.PolicyConflict;
+    }
+}
+
+pub fn policyConflict(actual: Status) bool {
+    const required = configured_policy orelse return false;
+    return if (required) actual != .enabled else (actual != .not_registered and actual != .not_found);
+}
+
+/// Startup/reload reconciliation only. Never changes OS state when absent.
+/// Pending approval is not retried: it requires the user's System Settings action.
+pub fn syncPolicy() !void {
+    const required = configured_policy orelse return;
+    const actual = try status();
+    if (required) {
+        if (actual != .enabled and actual != .requires_approval) try register();
+    } else if (actual != .not_registered and actual != .not_found) {
+        try unregister();
+    }
+}
 
 fn mainService() !objc.Object {
     const cls = objc.getClass("SMAppService") orelse return Error.SmAppServiceUnavailable;
@@ -41,16 +77,18 @@ fn mainService() !objc.Object {
     return svc;
 }
 
-/// Register the running bundle for launch-at-login. Returns true if the
-/// register call succeeded; user-approval state can still be required —
+/// Register the running bundle for launch-at-login. User approval can
+/// still be required even if the call succeeds —
 /// check via `status()` afterwards.
 pub fn register() !void {
+    try checkRequest(true);
     const svc = try mainService();
     const ok: bool = svc.msgSend(bool, "registerAndReturnError:", .{@as(?*anyopaque, null)});
     if (!ok) return Error.OperationFailed;
 }
 
 pub fn unregister() !void {
+    try checkRequest(false);
     const svc = try mainService();
     const ok: bool = svc.msgSend(bool, "unregisterAndReturnError:", .{@as(?*anyopaque, null)});
     if (!ok) return Error.OperationFailed;
@@ -69,8 +107,26 @@ pub fn status() !Status {
     };
 }
 
-/// Open System Settings → Login Items pane. Useful when the user
-/// revokes consent and we want to point them back at the right place.
+test "login policy checks never invoke SMAppService" {
+    defer setPolicy(null);
+    setPolicy(null);
+    try checkRequest(true);
+    try checkRequest(false);
+    try std.testing.expect(!policyConflict(.unknown));
+    setPolicy(true);
+    try checkRequest(true);
+    try std.testing.expectError(Error.PolicyConflict, checkRequest(false));
+    try std.testing.expect(!policyConflict(.enabled));
+    try std.testing.expect(policyConflict(.requires_approval));
+    try std.testing.expect(policyConflict(.unknown));
+    setPolicy(false);
+    try checkRequest(false);
+    try std.testing.expectError(Error.PolicyConflict, checkRequest(true));
+    try std.testing.expect(!policyConflict(.not_registered));
+    try std.testing.expect(policyConflict(.enabled));
+}
+
+/// Open System Settings → Login Items pane when approval is required.
 pub fn openSystemSettings() void {
     const cls = objc.getClass("SMAppService") orelse return;
     cls.msgSend(void, "openSystemSettingsLoginItems", .{});

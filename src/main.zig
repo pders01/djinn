@@ -43,13 +43,7 @@ fn deferredPostLaunchInit(_: ?*anyopaque) callconv(.c) void {
     const cfg = app.g.config orelse return;
     reapDragDropTemps();
 
-    if (cfg.system.open_at_login) {
-        loginitem.register() catch |err| {
-            std.debug.print("warning: open_at_login register failed ({}); run from Djinn.app\n", .{err});
-        };
-    } else {
-        loginitem.unregister() catch {};
-    }
+    syncLoginPolicy(cfg.system.open_at_login);
 
     var djinn_path_buf: [512]u8 = undefined;
     var ghostty_path_buf: [512]u8 = undefined;
@@ -127,9 +121,7 @@ fn onConfigChanged() void {
         n.rate_limit_ms = new_cfg.notifications.rate_limit_ms;
     }
     if (app.g.menubar) |mb| mb.setEnabled(new_cfg.notifications.menubar_icon);
-    if (new_cfg.system.open_at_login != old.system.open_at_login) {
-        if (new_cfg.system.open_at_login) loginitem.register() catch {} else loginitem.unregister() catch {};
-    }
+    syncLoginPolicy(new_cfg.system.open_at_login);
     if (!std.meta.eql(old.scrollback, new_cfg.scrollback))
         hostWarn("config: scrollback-size change requires restart", .{});
     if (!profilesEqual(old, new_cfg))
@@ -220,6 +212,14 @@ fn loadConfigWithRetry(allocator: std.mem.Allocator) ?Config {
         if (Config.load(allocator)) |cfg| return cfg else |_| {}
     }
     return null;
+}
+
+fn syncLoginPolicy(policy: ?bool) void {
+    loginitem.setPolicy(policy);
+    loginitem.syncPolicy() catch |err| {
+        hostWarn("open-at-login policy sync failed ({}); use an installed signed Djinn.app", .{err});
+    };
+    if (app.g.menubar) |menubar| menubar.refresh();
 }
 
 /// Scan /tmp for `djinn-drop-*.png` files older than 1h and
@@ -385,6 +385,7 @@ pub fn main(init: std.process.Init) !void {
     };
 
     defer config.deinit();
+    loginitem.setPolicy(config.system.open_at_login);
 
     try ghostty_runtime.init();
     app.g.config = &config;

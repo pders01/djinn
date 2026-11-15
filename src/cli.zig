@@ -8,6 +8,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const is_linux = builtin.os.tag == .linux;
 const loginitem = if (is_linux) @import("platform/linux/autostart.zig") else @import("system/loginitem.zig");
+const Config = @import("config.zig").Config;
 pub const WindowAction = enum { toggle, show, hide, quit };
 
 const LoginAction = enum { enable, disable, status };
@@ -159,51 +160,79 @@ fn validateActions(parsed: Args) !void {
 }
 
 fn runLoginAction(action: LoginAction) ParseResult {
-    if (comptime is_linux) {
-        const allocator = std.heap.page_allocator;
-        switch (action) {
-            .enable => loginitem.register(allocator) catch |err| {
-                std.debug.print("error: autostart register failed ({})\n", .{err});
-                return .exit_err;
-            },
-            .disable => loginitem.unregister(allocator) catch |err| {
-                std.debug.print("error: autostart unregister failed ({})\n", .{err});
-                return .exit_err;
-            },
-            .status => {},
+    const allocator = std.heap.page_allocator;
+    // This executes before normal app initialization. Never use a permissive
+    // parse or swallow read failures: an unread policy must not authorize OS
+    // changes. Only a genuinely missing file selects the absent default.
+    var config = Config.loadOrDefault(allocator) catch |err| {
+        std.debug.print("error: cannot read launch-at-login config policy ({}); no OS changes made\n", .{err});
+        if (action == .status) {
+            const actual = queryLoginStatus(allocator) catch loginitem.Status.unknown;
+            std.debug.print("login item OS state: {s}\nconfig policy: unknown (config could not be loaded)\n", .{actual.label()});
         }
-        const status = loginitem.status(allocator) catch |err| {
-            std.debug.print("error: autostart status failed ({})\n", .{err});
+        return .exit_err;
+    };
+    defer config.deinit();
+    loginitem.setPolicy(config.system.open_at_login);
+    if (actionRequest(action)) |requested| {
+        loginitem.checkRequest(requested) catch {
+            std.debug.print("error: launch-at-login policy conflict: open-at-login = {s}; no OS/config changes made\n", .{if (loginitem.policy().?) "true" else "false"});
+            _ = printLoginStatus(allocator);
             return .exit_err;
         };
-        std.debug.print("login item: {s}\n", .{status.label()});
-        return .exit_ok;
-    }
-    switch (action) {
-        .enable => {
-            loginitem.register() catch |err| {
-                std.debug.print("error: register failed ({}). Bundle must be code-signed; run from Djinn.app.\n", .{err});
+        if (comptime is_linux) {
+            if (requested) loginitem.register(allocator) catch |err| {
+                std.debug.print("error: autostart register failed ({})\n", .{err});
+                return .exit_err;
+            } else loginitem.unregister(allocator) catch |err| {
+                std.debug.print("error: autostart unregister failed ({})\n", .{err});
                 return .exit_err;
             };
-            const s = loginitem.status() catch loginitem.Status.unknown;
-            std.debug.print("login item: {s}\n", .{s.label()});
-        },
-        .disable => {
-            loginitem.unregister() catch |err| {
+        } else {
+            if (requested) loginitem.register() catch |err| {
+                std.debug.print("error: register failed ({}). Run from a signed Djinn.app bundle.\n", .{err});
+                return .exit_err;
+            } else loginitem.unregister() catch |err| {
                 std.debug.print("error: unregister failed ({})\n", .{err});
                 return .exit_err;
             };
-            std.debug.print("login item: not registered\n", .{});
-        },
-        .status => {
-            const s = loginitem.status() catch |err| {
-                std.debug.print("error: status query failed ({})\n", .{err});
-                return .exit_err;
-            };
-            std.debug.print("login item: {s}\n", .{s.label()});
-        },
+        }
     }
-    return .exit_ok;
+    return printLoginStatus(allocator);
+}
+
+fn actionRequest(action: LoginAction) ?bool {
+    return switch (action) {
+        .enable => true,
+        .disable => false,
+        .status => null,
+    };
+}
+
+fn queryLoginStatus(allocator: std.mem.Allocator) !loginitem.Status {
+    return if (comptime is_linux) loginitem.status(allocator) else loginitem.status();
+}
+
+fn printLoginStatus(allocator: std.mem.Allocator) ParseResult {
+    const actual = queryLoginStatus(allocator) catch |err| {
+        std.debug.print("login item OS state: unknown (query failed: {})\n", .{err});
+        printLoginPolicy(.unknown);
+        return .exit_err;
+    };
+    std.debug.print("login item OS state: {s}\n", .{actual.label()});
+    printLoginPolicy(actual);
+    return if (actual == .unknown) .exit_err else .exit_ok;
+}
+
+fn printLoginPolicy(actual: loginitem.Status) void {
+    if (loginitem.policy()) |required| {
+        std.debug.print("config policy: open-at-login = {s}{s}\n", .{
+            if (required) "true" else "false",
+            if (loginitem.policyConflict(actual)) " (OS state does not satisfy policy; approval may be required or state unknown)" else " (matches OS state)",
+        });
+    } else {
+        std.debug.print("config policy: absent (OS state is user-controlled)\n", .{});
+    }
 }
 
 pub fn parse(args_iter: *std.process.Args.Iterator, parsed: *Args) ParseResult {
@@ -286,6 +315,37 @@ fn helpCol() usize {
         if (len > max) max = len;
     }
     return max + 2;
+}
+
+test "CLI: login API compiles without running loader or OS actions" {
+    std.testing.refAllDecls(@This());
+}
+
+test "CLI: strict in-memory config distinguishes absent and explicit login policy" {
+    for ([_]struct { text: []const u8, expected: ?bool }{
+        .{ .text = "", .expected = null },
+        .{ .text = "open-at-login = true\n", .expected = true },
+        .{ .text = "open-at-login = false\n", .expected = false },
+    }) |fixture| {
+        var config = try Config.parseStrict(std.testing.allocator, fixture.text);
+        defer config.deinit();
+        try std.testing.expectEqual(fixture.expected, config.system.open_at_login);
+    }
+    try std.testing.expectError(error.NotABool, Config.parseStrict(std.testing.allocator, "open-at-login = invalid\n"));
+}
+
+test "CLI: login actions honor injected policy without config IO or OS calls" {
+    defer loginitem.setPolicy(null);
+    try std.testing.expectEqual(@as(?bool, null), actionRequest(.status));
+    for ([_]?bool{ null, true, false }) |policy| {
+        loginitem.setPolicy(policy);
+        inline for (.{ LoginAction.enable, LoginAction.disable }) |action| {
+            const requested = actionRequest(action).?;
+            if (policy != null and policy.? != requested) {
+                try std.testing.expectError(error.PolicyConflict, loginitem.checkRequest(requested));
+            } else try loginitem.checkRequest(requested);
+        }
+    }
 }
 
 test "CLI: useful flags remain, provider flag is removed" {

@@ -1,5 +1,6 @@
 //! Terminal StatusNotifierItem + dbusmenu. Event driven; no status polling.
 const std = @import("std");
+const autostart = @import("autostart.zig");
 const db = @import("gdbus.zig");
 const V = db.GVariant;
 const B = db.GVariantBuilder;
@@ -63,6 +64,8 @@ pub const Handler = struct {
     on_quit: *const fn (*anyopaque) void,
     on_open_settings: *const fn (*anyopaque) void,
     on_toggle_login: *const fn (*anyopaque) void,
+    // Retained for entry-point source compatibility; tray reads OS status
+    // directly so unknown/conditional state cannot collapse to false.
     login_enabled: *const fn (*anyopaque) bool,
 };
 const Context = struct {
@@ -119,8 +122,7 @@ pub const Tray = struct {
         emit(self.ctx, "/StatusNotifierItem", "org.kde.StatusNotifierItem", "NewToolTip", null);
     }
     pub fn notifyMenuChanged(self: *Tray) void {
-        self.ctx.revision +%= 1;
-        emit(self.ctx, "/MenuBar", "com.canonical.dbusmenu", "LayoutUpdated", tuple(&.{ db.g_variant_new_uint32(self.ctx.revision), db.g_variant_new_int32(0) }));
+        menuChanged(self.ctx);
     }
 };
 const sni_vtable = VTable{ .method_call = sniMethod, .get_property = sniProperty };
@@ -196,7 +198,7 @@ fn menuMethod(_: *Connection, _: ?[*:0]const u8, _: [*:0]const u8, _: [*:0]const
         defer db.g_variant_unref(prop);
         const p = std.mem.span(db.g_variant_get_string(prop, null));
         for (items) |item| if (item.id == id) {
-            const value: *V = if (eq(p, "label")) string(item.label.ptr) else if (eq(p, "enabled") or eq(p, "visible")) boolean(true) else if (eq(p, "toggle-type") and id == 4) string("checkmark") else if (eq(p, "toggle-state") and id == 4) db.g_variant_new_int32(if (ctx.handler.login_enabled(ctx.handler.ctx)) 1 else 0) else string("");
+            const value = itemProperty(ctx, item, p);
             reply = tuple(&.{db.g_variant_new_variant(value)});
             break;
         };
@@ -216,9 +218,14 @@ fn menuMethod(_: *Connection, _: ?[*:0]const u8, _: [*:0]const u8, _: [*:0]const
         }
         reply = tuple(&.{empty("i")});
     } else if (eq(method, "AboutToShow")) {
-        reply = tuple(&.{boolean(false)});
+        // Re-query when opened. Notify caches, rather than polling the OS.
+        menuChanged(ctx);
+        reply = tuple(&.{boolean(true)});
     } else if (eq(method, "AboutToShowGroup")) {
-        reply = tuple(&.{ empty("i"), empty("i") });
+        menuChanged(ctx);
+        const updates = builder("ai");
+        db.g_variant_builder_add_value(updates, db.g_variant_new_int32(0));
+        reply = tuple(&.{ end(updates), empty("i") });
     } else {
         unknown(invocation);
         return;
@@ -241,21 +248,75 @@ fn event(ctx: *Context, ev: *V) void {
         1 => ctx.handler.on_show(ctx.handler.ctx),
         2 => ctx.handler.on_hide(ctx.handler.ctx),
         3 => ctx.handler.on_open_settings(ctx.handler.ctx),
-        4 => ctx.handler.on_toggle_login(ctx.handler.ctx),
+        4 => {
+            const actual = autostart.status(ctx.allocator) catch autostart.Status.unknown;
+            if (!loginView(actual, autostart.policy()).enabled) {
+                std.debug.print("autostart: tray action rejected (explicit config policy or unknown OS state); OS/config unchanged\n", .{});
+                return;
+            }
+            ctx.handler.on_toggle_login(ctx.handler.ctx);
+            menuChanged(ctx);
+        },
         5 => ctx.handler.on_quit(ctx.handler.ctx),
         else => {},
     }
 }
 fn itemProperties(ctx: *Context, item: Item) *V {
     const props = builder("a{sv}");
-    dict(props, "label", string(item.label.ptr));
-    dict(props, "enabled", boolean(true));
+    dict(props, "label", itemProperty(ctx, item, "label"));
+    dict(props, "enabled", itemProperty(ctx, item, "enabled"));
     dict(props, "visible", boolean(true));
     if (item.id == 4) {
         dict(props, "toggle-type", string("checkmark"));
-        dict(props, "toggle-state", db.g_variant_new_int32(if (ctx.handler.login_enabled(ctx.handler.ctx)) 1 else 0));
+        dict(props, "toggle-state", itemProperty(ctx, item, "toggle-state"));
     }
     return end(props);
+}
+const LoginView = struct { label: [:0]const u8, enabled: bool, checked: i32 };
+fn loginView(actual: autostart.Status, policy: ?bool) LoginView {
+    return .{
+        .label = switch (actual) {
+            .enabled, .not_registered => "Launch at Login",
+            .requires_approval => "Launch at Login — awaiting approval",
+            else => "Launch at Login — OS state unknown",
+        },
+        .enabled = policy == null and (actual == .enabled or actual == .not_registered),
+        .checked = switch (actual) {
+            .enabled => 1,
+            .not_registered => 0,
+            else => -1,
+        },
+    };
+}
+fn itemProperty(ctx: *Context, item: Item, name: []const u8) *V {
+    if (eq(name, "visible")) return boolean(true);
+    if (item.id != 4) {
+        if (eq(name, "label")) return string(item.label.ptr);
+        if (eq(name, "enabled")) return boolean(true);
+        return string("");
+    }
+    const actual = autostart.status(ctx.allocator) catch autostart.Status.unknown;
+    const view = loginView(actual, autostart.policy());
+    if (eq(name, "enabled")) return boolean(view.enabled);
+    if (eq(name, "toggle-type")) return string("checkmark");
+    if (eq(name, "toggle-state")) return db.g_variant_new_int32(view.checked);
+    if (eq(name, "label")) {
+        var buffer: [256]u8 = undefined;
+        const label = if (autostart.policy()) |required|
+            std.mem.printSentinel(&buffer, "{s} (config: {s}{s})", .{
+                view.label,
+                if (required) "true" else "false",
+                if (autostart.policyConflict(actual)) "; policy conflict" else "",
+            }, 0) catch view.label
+        else
+            view.label;
+        return string(label.ptr);
+    }
+    return string("");
+}
+fn menuChanged(ctx: *Context) void {
+    ctx.revision +%= 1;
+    emit(ctx, "/MenuBar", "com.canonical.dbusmenu", "LayoutUpdated", tuple(&.{ db.g_variant_new_uint32(ctx.revision), db.g_variant_new_int32(0) }));
 }
 fn layoutItem(ctx: *Context, item: Item) *V {
     return tuple(&.{ db.g_variant_new_int32(item.id), itemProperties(ctx, item), empty("v") });
@@ -328,6 +389,15 @@ fn childInt(v: *V, idx: usize) i32 {
     const child = db.g_variant_get_child_value(v, idx);
     defer db.g_variant_unref(child);
     return db.g_variant_get_int32(child);
+}
+
+test "tray login view uses actual state and disables policy conflicts or unknown" {
+    try std.testing.expect(loginView(.enabled, null).enabled);
+    try std.testing.expectEqual(@as(i32, 1), loginView(.enabled, false).checked);
+    try std.testing.expect(!loginView(.enabled, false).enabled);
+    try std.testing.expect(!loginView(.not_registered, true).enabled);
+    try std.testing.expect(!loginView(.unknown, null).enabled);
+    try std.testing.expectEqual(@as(i32, -1), loginView(.unknown, null).checked);
 }
 
 test "Tray type compiles" {

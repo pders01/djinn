@@ -120,13 +120,10 @@ pub const Config = struct {
     };
 
     pub const SystemConfig = struct {
-        /// When true, djinn ensures launch-at-login is registered on
-        /// every startup (idempotent — SMAppService.register is safe
-        /// to call repeatedly). When false, it unregisters if currently
-        /// enabled. Reading the same value back out is what `--login
-        /// -item-status` already does. No-op if the binary isn't
-        /// running from a signed `.app` bundle.
-        open_at_login: bool = false,
+        /// Absent: leave OS registration alone, including explicit CLI/menu
+        /// actions. Explicit true/false is policy reconciled at startup/reload;
+        /// conflicting actions are rejected, never written back to config.
+        open_at_login: ?bool = null,
     };
 
     pub const BellConfig = struct {
@@ -663,6 +660,15 @@ test "Config: parse bell settings" {
     try std.testing.expectEqualStrings("Glass", config.bell.sound.?);
 }
 
+test "Config: absent login policy leaves OS state alone; explicit false is distinct" {
+    var absent = try Config.parse(std.testing.allocator, "");
+    defer absent.deinit();
+    var disabled = try Config.parse(std.testing.allocator, "open-at-login = false\n");
+    defer disabled.deinit();
+    try std.testing.expectEqual(@as(?bool, null), absent.system.open_at_login);
+    try std.testing.expectEqual(@as(?bool, false), disabled.system.open_at_login);
+}
+
 test "Config: parse scrollback + system" {
     const src =
         \\scrollback-size = 50000
@@ -671,7 +677,7 @@ test "Config: parse scrollback + system" {
     var config = try Config.parse(std.testing.allocator, src);
     defer config.deinit();
     try std.testing.expectEqual(@as(?u32, 50000), config.scrollback.size);
-    try std.testing.expect(config.system.open_at_login);
+    try std.testing.expectEqual(@as(?bool, true), config.system.open_at_login);
 }
 
 test "Config: window-position dash → enum" {
