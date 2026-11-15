@@ -7,31 +7,97 @@ on:
     inputs:
       tag:
         description: 'Tag to publish (e.g. v0.1.0-alpha.1)'
+        type: string
         required: true
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      rolling:
+        type: boolean
+        default: false
 
 permissions:
-  contents: write  # GitHub Releases write access
+  contents: read
 
 jobs:
+  resolve:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      sha: ${{ steps.resolve.outputs.sha }}
+      label: ${{ steps.resolve.outputs.label }}
+    steps:
+      # Resolve BEFORE either platform checkout. Dereference annotated tags
+      # through the API and pin both candidates to the same immutable commit.
+      - name: Validate and resolve existing version tag
+        id: resolve
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+          ROLLING: ${{ inputs.rolling || false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$REQUESTED_TAG"
+          if [[ "$GITHUB_EVENT_NAME" == push ]]; then tag="${GITHUB_REF#refs/tags/}"; fi
+          # Deliberately restricted to URL/asset-safe version tags; never accept
+          # a branch, SHA, path, shell expression, or absent tag.
+          [[ "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+([.-][A-Za-z0-9]+)*)?$ ]] || {
+            echo 'Expected an existing vMAJOR.MINOR.PATCH[-prerelease] tag' >&2; exit 1;
+          }
+          object=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag")
+          type=$(jq -er '.object.type' <<< "$object")
+          sha=$(jq -er '.object.sha' <<< "$object")
+          depth=0
+          while [[ "$type" == tag && "$depth" -lt 16 ]]; do
+            object=$(gh api "repos/$GITHUB_REPOSITORY/git/tags/$sha")
+            type=$(jq -er '.object.type' <<< "$object")
+            sha=$(jq -er '.object.sha' <<< "$object")
+            depth=$((depth + 1))
+          done
+          [[ "$type" == commit && "$sha" =~ ^[0-9a-f]{40}$ ]] || {
+            echo 'Tag must resolve to a commit' >&2; exit 1;
+          }
+          gh api "repos/$GITHUB_REPOSITORY/git/commits/$sha" >/dev/null
+          label="$tag"
+          if [[ "$ROLLING" == true ]]; then label=pre-release; fi
+          printf 'tag=%s\nsha=%s\nlabel=%s\n' "$tag" "$sha" "$label" >> "$GITHUB_OUTPUT"
+
   build-bundle:
     # Apple-silicon runner with Xcode preinstalled. The Metal Toolchain
     # may need a one-time download per runner image — `xcodebuild
     # -downloadComponent` is idempotent.
-    runs-on: macos-15
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    env:
+      TAG: ${{ needs.resolve.outputs.label }}
 
     steps:
-      - name: Checkout
+      - name: Checkout exact resolved commit
         uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
-      - name: Resolve tag
-        id: tag
+      - name: Normalize release architecture (not cache identity)
+        id: architecture
+        env:
+          RUNNER_ARCH: ${{ runner.arch }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          fi
+          case "$RUNNER_ARCH" in
+            ARM64) arch=arm64 ;;
+            X64) arch=x86_64 ;;
+            *) echo "Unsupported runner architecture: $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          echo "name=$arch" >> "$GITHUB_OUTPUT"
 
       # Locked Zig 0.17.1 + SDK 26.5; host Xcode runs Metal tools only.
       - name: Install Nix
@@ -66,15 +132,30 @@ jobs:
           restore-keys: |
             zig-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build signed Djinn.app (ad-hoc)
-        # `bundle-sign` step in build.zig:
-        #   - copies libghostty.dylib into the bundle
-        #   - links with bundle-local @loader_path
-        #   - codesign --force --sign - --deep
-        # ReleaseFast is pinned for the bundle path regardless of
-        # -Doptimize, so the distributed artifact never carries
-        # libghostty's verifyIntegrity overhead.
-        run: nix develop --command ./scripts/build.sh bundle-sign
+      - name: Check macOS host and unit suites
+        run: nix develop --command ./scripts/build.sh check test test-shared
+
+      # Release tooling comes from the reviewed workflow revision, not an
+      # old selected tag whose installer may not support safe fixture mode.
+      - name: Checkout reviewed installer tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          path: .release-tools
+          sparse-checkout: scripts/install-from-release.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Installer fixture tests
+        run: bash .release-tools/scripts/install-from-release.sh --self-test
+
+      - name: Build signed Djinn.app (ad-hoc, no keychain lookup)
+        # Do not use bundle-sign: that helper probes the login keychain.
+        # bundle retains ReleaseFast, macOS 13 and baseline CPU defaults.
+        run: |
+          nix develop --command ./scripts/build.sh bundle
+          codesign --force --sign - zig-out/Djinn.app/Contents/MacOS/libghostty.dylib
+          codesign --force --sign - zig-out/Djinn.app
 
       - name: Verify bundle metadata
         run: |
@@ -86,45 +167,43 @@ jobs:
         run: ./scripts/verify-bundle.sh
 
       - name: Zip bundle for release
+        env:
+          ARCH: ${{ steps.architecture.outputs.name }}
         run: |
           cd zig-out
-          zip -r -y Djinn-${{ steps.tag.outputs.name }}-${{ runner.arch }}.zip Djinn.app
-          shasum -a 256 Djinn-${{ steps.tag.outputs.name }}-${{ runner.arch }}.zip > \
-            Djinn-${{ steps.tag.outputs.name }}-${{ runner.arch }}.zip.sha256
+          zip -r -y "Djinn-${TAG}-${ARCH}.zip" Djinn.app
+          shasum -a 256 "Djinn-${TAG}-${ARCH}.zip" > "Djinn-${TAG}-${ARCH}.zip.sha256"
 
-      - name: Publish release
-        uses: softprops/action-gh-release@v2
+      - name: Validate packaged archive with the staged installer verifier
+        env:
+          ARCH: ${{ steps.architecture.outputs.name }}
+        run: |
+          bash .release-tools/scripts/install-from-release.sh --verify-archive \
+            "zig-out/Djinn-${TAG}-${ARCH}.zip" "zig-out/Djinn-${TAG}-${ARCH}.zip.sha256" "$ARCH"
+
+      - name: Upload validated macOS candidate
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ steps.tag.outputs.name }}
-          name: ${{ steps.tag.outputs.name }}
-          # Mark non-stable tags as prereleases — alpha / beta / rc.
-          prerelease: ${{ contains(steps.tag.outputs.name, '-') }}
-          generate_release_notes: true
-          files: |
-            zig-out/Djinn-${{ steps.tag.outputs.name }}-${{ runner.arch }}.zip
-            zig-out/Djinn-${{ steps.tag.outputs.name }}-${{ runner.arch }}.zip.sha256
+          name: candidate-macos-${{ steps.architecture.outputs.name }}
+          path: |
+            zig-out/Djinn-*.zip
+            zig-out/Djinn-*.zip.sha256
+          if-no-files-found: error
 
   build-linux:
-    # Linux tarball — x86_64 today; aarch64 is a follow-up (the
-    # `ubuntu-24.04-arm` runners exist but the second arch doubles the
-    # cache + queue cost for an alpha audience that's overwhelmingly
-    # amd64). Runs in parallel with build-bundle and publishes to the
-    # same tag via softprops/action-gh-release's UPSERT semantics.
+    # Native x86_64 Linux candidate, independent of macOS publication.
+    needs: resolve
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    env:
+      TAG: ${{ needs.resolve.outputs.label }}
 
     steps:
-      - name: Checkout
+      - name: Checkout exact resolved commit
         uses: actions/checkout@v4
-
-      - name: Resolve tag
-        id: tag
-        run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "name=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
-          else
-            echo "name=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
-          fi
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          persist-credentials: false
 
       - name: Install GTK / VTE dev headers
         run: |
@@ -184,7 +263,7 @@ jobs:
             zig-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Check Linux host and unit suite
-        run: ./scripts/build.sh check test
+        run: ./scripts/build.sh check test test-shared
 
       - name: Build + stage tarball
         # Stage into a top-level `djinn-<tag>-x86_64-linux/` directory
@@ -193,7 +272,6 @@ jobs:
         # --prefix DIR` produces DIR/bin, DIR/share, DIR/lib —
         # standard tarball layout out of the box.
         run: |
-          TAG="${{ steps.tag.outputs.name }}"
           OUT="djinn-${TAG}-x86_64-linux"
           # Stage optional launch files, but never enable/start the user unit.
           ./scripts/build.sh install -Doptimize=ReleaseSafe -Dsystem-install=true --prefix "${OUT}"
@@ -206,20 +284,107 @@ jobs:
           mkdir -p zig-out
           mv "${OUT}.tar.gz" "${OUT}.tar.gz.sha256" zig-out/
 
-      - name: Smoke binary
-        run: ./djinn-${{ steps.tag.outputs.name }}-x86_64-linux/bin/djinn --version
+      - name: Relocated CLI and staged tarball verification
+        run: |
+          set -euo pipefail
+          smoke=$(mktemp -d)
+          trap 'rm -rf "$smoke"' EXIT
+          mkdir "$smoke/home"
+          tar -xzf "zig-out/djinn-${TAG}-x86_64-linux.tar.gz" -C "$smoke"
+          binary="$smoke/djinn-${TAG}-x86_64-linux/bin/djinn"
+          env -i PATH=/usr/bin:/bin HOME="$smoke/home" "$binary" --version
+          env -i PATH=/usr/bin:/bin HOME="$smoke/home" "$binary" --help
+          test ! -e "$smoke/home/.config"
+          (cd zig-out && sha256sum -c "djinn-${TAG}-x86_64-linux.tar.gz.sha256")
 
-      - name: Publish release
-        # softprops/action-gh-release@v2 UPSERTs the release for this
-        # tag, so build-bundle and build-linux can both target the
-        # same tag without coordination. `prerelease` flips the same
-        # way as build-bundle so dash-suffixed tags stay marked.
-        uses: softprops/action-gh-release@v2
+      - name: Upload validated Linux candidate
+        uses: actions/upload-artifact@v4
         with:
-          tag_name: ${{ steps.tag.outputs.name }}
-          name: ${{ steps.tag.outputs.name }}
-          prerelease: ${{ contains(steps.tag.outputs.name, '-') }}
-          generate_release_notes: true
-          files: |
-            zig-out/djinn-${{ steps.tag.outputs.name }}-x86_64-linux.tar.gz
-            zig-out/djinn-${{ steps.tag.outputs.name }}-x86_64-linux.tar.gz.sha256
+          name: candidate-linux-x86_64
+          path: |
+            zig-out/djinn-*.tar.gz
+            zig-out/djinn-*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    # This is the ONLY writer. A failed/skipped platform or matrix leg never
+    # reaches it, so validation failures leave every previous download intact.
+    needs: [resolve, build-bundle, build-linux]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    concurrency:
+      group: djinn-release-publisher
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      TAG: ${{ needs.resolve.outputs.tag }}
+      SHA: ${{ needs.resolve.outputs.sha }}
+      LABEL: ${{ needs.resolve.outputs.label }}
+      ROLLING: ${{ inputs.rolling || false }}
+    steps:
+      - name: Checkout reviewed installer tooling
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          sparse-checkout: scripts/install-from-release.sh
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Download all validated candidates
+        uses: actions/download-artifact@v4
+        with:
+          pattern: candidate-*
+          merge-multiple: true
+          path: release-assets
+
+      - name: Verify complete candidate set before any release mutation
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release-assets
+          for file in "Djinn-${LABEL}-arm64.zip" "Djinn-${LABEL}-x86_64.zip" "djinn-${LABEL}-x86_64-linux.tar.gz"; do
+            test -s "$file"
+            test -s "$file.sha256"
+            sha256sum -c "$file.sha256"
+          done
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 6
+          cp ../scripts/install-from-release.sh install.sh
+          bash -n install.sh
+          bash install.sh --self-test
+          # Reject tags moved while candidates were building (also annotated).
+          current=$(gh api "repos/$GH_REPO/commits/$TAG" --jq .sha)
+          test "$current" = "$SHA"
+
+      - name: Publish complete validated set
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Never delete the previous release/tag. Asset clobber is not an
+          # atomic GitHub transaction: mismatched ZIP/checksum pairs fail
+          # closed, but an old matching pair can still be served briefly under
+          # the moved rolling tag. API/upload failures require operator recovery.
+          if [[ "$ROLLING" == true ]]; then
+            refs=$(gh api "repos/$GH_REPO/git/matching-refs/tags/pre-release")
+            if jq -e 'any(.[]; .ref == "refs/tags/pre-release")' <<< "$refs" >/dev/null; then
+              gh api --method PATCH "repos/$GH_REPO/git/refs/tags/pre-release" -f sha="$SHA" -F force=true
+            else
+              gh api --method POST "repos/$GH_REPO/git/refs" -f ref=refs/tags/pre-release -f sha="$SHA"
+            fi
+          fi
+          releases=$(gh api --paginate "repos/$GH_REPO/releases?per_page=100" --jq '.[].tag_name')
+          if grep -Fxq "$LABEL" <<< "$releases"; then
+            # Versioned releases are immutable: require an explicit new tag.
+            [[ "$ROLLING" == true ]] || { echo 'Release already exists; refusing to overwrite' >&2; exit 1; }
+            gh release upload "$LABEL" release-assets/* --clobber
+          else
+            args=(--verify-tag --title "$LABEL" --draft)
+            if [[ "$ROLLING" == true || "$TAG" == *-* ]]; then args+=(--prerelease); fi
+            gh release create "$LABEL" release-assets/* "${args[@]}"
+          fi
+          printf 'Validated build of tag `%s`, exact commit `%s`.\n\nRolling promotion is manual-only pending approval.\n\nmacOS downloads are ad-hoc signed, not Developer ID signed/notarized.\n' "$TAG" "$SHA" > release-notes.md
+          args=(--draft=false --notes-file release-notes.md)
+          if [[ "$ROLLING" == true || "$TAG" == *-* ]]; then args+=(--prerelease --latest=false); fi
+          gh release edit "$LABEL" "${args[@]}"

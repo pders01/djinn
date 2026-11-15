@@ -42,7 +42,10 @@ jobs:
             zig-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Run unit suite
-        run: nix develop --command ./scripts/build.sh test test-shared
+        run: nix develop --command ./scripts/build.sh test test-shared test-linux-models
+
+      - name: Offline release workflow validation fixtures
+        run: python3 scripts/test-release-workflows.py
 
       - name: Check native host and generate runtime resources
         # Keep this job independent of Metal; the bundle job covers linking.
@@ -50,8 +53,8 @@ jobs:
 
       - name: Compile-check Linux without GTK or pkg-config
         run: |
-          nix develop --command ./scripts/build.sh check -Dtarget=x86_64-linux-gnu
-          nix develop --command ./scripts/build.sh check -Dtarget=aarch64-linux-gnu
+          nix develop --command ./scripts/build.sh check test-compile -Dtarget=x86_64-linux-gnu
+          nix develop --command ./scripts/build.sh check test-compile -Dtarget=aarch64-linux-gnu
 
   linux:
     # Ubuntu 24.04 LTS — matches the runtime targeted by
@@ -130,7 +133,7 @@ jobs:
             zig-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Run unit suite
-        run: ./scripts/build.sh check test test-shared
+        run: ./scripts/build.sh check test test-shared test-linux-models
 
       - name: Build debug exe (smoke)
         # Catches link-time regressions the test suite can't see —
@@ -160,7 +163,11 @@ jobs:
     # xcrun, bundle-local rpaths, runtime resources, plist version
     # interpolation, and ad-hoc codesign. release.yml uses the same build
     # path; publishing still depends on that workflow completing separately.
-    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [macos-15, macos-15-intel]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     needs: test
 
@@ -200,8 +207,11 @@ jobs:
           restore-keys: |
             zig-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build signed Djinn.app (ad-hoc)
-        run: nix develop --command ./scripts/build.sh bundle-sign
+      - name: Build signed Djinn.app (ad-hoc, no keychain lookup)
+        run: |
+          nix develop --command ./scripts/build.sh bundle
+          codesign --force --sign - zig-out/Djinn.app/Contents/MacOS/libghostty.dylib
+          codesign --force --sign - zig-out/Djinn.app
 
       - name: Verify bundle metadata
         run: |
@@ -212,15 +222,32 @@ jobs:
       - name: Verify self-contained signed bundle
         run: ./scripts/verify-bundle.sh
 
+      - name: Normalize release architecture (not cache identity)
+        id: architecture
+        env:
+          RUNNER_ARCH: ${{ runner.arch }}
+        run: |
+          case "$RUNNER_ARCH" in
+            ARM64) arch=arm64 ;;
+            X64) arch=x86_64 ;;
+            *) echo "Unsupported runner architecture: $RUNNER_ARCH" >&2; exit 1 ;;
+          esac
+          echo "name=$arch" >> "$GITHUB_OUTPUT"
+
+      - name: Installer fixture tests
+        run: bash scripts/install-from-release.sh --self-test
+
       - name: Zip bundle
+        env:
+          ARCH: ${{ steps.architecture.outputs.name }}
         run: |
           cd zig-out
-          zip -r -y "Djinn-${GITHUB_SHA::7}-${{ runner.arch }}.zip" Djinn.app
+          zip -r -y "Djinn-${GITHUB_SHA::7}-${ARCH}.zip" Djinn.app
 
       - name: Upload bundle artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Djinn-${{ github.sha }}-${{ runner.arch }}
+          name: Djinn-${{ github.sha }}-${{ steps.architecture.outputs.name }}
           path: zig-out/Djinn-*.zip
           retention-days: 14
           if-no-files-found: error
