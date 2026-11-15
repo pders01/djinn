@@ -151,7 +151,15 @@ nix develop --command ./scripts/build.sh install-app
 open ~/Applications/Djinn.app
 ```
 
-`nix run .#install` is the equivalent runner. The bundle includes
+`nix run .#install` is the equivalent runner. This local development installer
+copies in place using rsync; it does not provide the staged rollback of the
+release installer below. It does not quit or launch running instances. Quit the
+old instance manually before launching the replacement. `just deploy` is a
+separate, destructive restart helper: it terminates **all** processes named
+`djinn` before launching the installed bundle, so do not use it with work you
+need to preserve.
+
+The bundle includes
 `libghostty.dylib`, compiled terminfo, shell integration, and themes from
 the pinned Ghostty sources; an installed Ghostty.app must not be required.
 Verify that with the installed-app acceptance checks below, not just a

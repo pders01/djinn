@@ -32,4 +32,5 @@ rsync -a --delete "$src/" "$dest/"
 
 echo "installed: $dest"
 echo "launch with: open '$dest'"
-echo "first launch needs Accessibility permission for the global hotkey."
+echo "Global hotkeys need no Accessibility/Input Monitoring grants."
+echo "This installer does not quit running instances; quit them manually before launching the new bundle."
