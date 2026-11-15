@@ -125,7 +125,7 @@
             '';
             meta = {
               description = "Quake-style drop-down terminal (GTK4/VTE, Wayland)";
-              homepage = "https://github.com/derscheid/djinn";
+              homepage = "https://github.com/pders01/djinn";
               license = lib.licenses.mit;
               platforms = lib.platforms.linux;
               mainProgram = "djinn";

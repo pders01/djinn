@@ -35,8 +35,8 @@ from source. Debian packaging needs a corresponding local development package.
 
 - `zig build install -Dsystem-install=true --prefix STAGING/usr` stages the
   executable, desktop entry, optional systemd **user** unit, license, README,
-  and these packaging notes. Without that flag, a dev install only installs
-  the executable.
+  third-party notices, and these packaging notes. Without that flag, a dev
+  install only installs the executable.
 - `nix build .#default` on Linux creates a GTK-wrapped package, substituting
   the exact output executable path in the optional user unit. The current
   upstream-style Nix derivation needs a trusted local builder/network access
@@ -44,6 +44,9 @@ from source. Debian packaging needs a corresponding local development package.
 - `arch/PKGBUILD` requires a package providing `zig=0.17.1`. If unavailable in
   the distribution, provide that compiler package locally; do not substitute
   an incompatible Zig version. Build with `makepkg`, including its check phase.
+  Source uses `pders01/djinn`; versions derive only from `v*` version tags,
+  excluding the moving `pre-release` tag. A checkout without a usable version
+  tag falls back to its total commit count and short hash.
 - For local Debian builds, copy `debian/` into the checkout's top level and run
   `ZIG=/path/to/zig-0.17.1/zig dpkg-buildpackage -us -uc`. The recipe fetches
   pinned dependency archives and is not intended for offline Debian buildds.
@@ -69,6 +72,13 @@ it alongside another desktop-autostart entry for djinn. Manual `/usr/local`
 installs and relocated tarballs must adjust `ExecStart` to their actual binary
 path before installing a user-local unit. Nix substitutes its store path at
 build time. No additional background application service is required.
+
+The unit deliberately adds no process sandbox: restrictions also apply to PTY
+children. For example, `NoNewPrivileges` prevents sudo/setuid elevation and
+`MemoryDenyWriteExecute` can break JIT programs. Scope any desired workload
+confinement to that workload's explicit launcher rather than the terminal.
+User/system-wide policies still apply. Native service and package acceptance
+(including ordinary privileged/JIT commands) remains required.
 
 macOS builds/releases are Apple Silicon (arm64) only; Intel Macs are no longer
 supported. They still use the full Ghostty 1.4.0 Metal renderer, macOS 13

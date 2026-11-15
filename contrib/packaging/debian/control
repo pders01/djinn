@@ -10,7 +10,7 @@ Build-Depends:
  libvte-2.91-gtk4-dev,
  libglib2.0-dev,
 Standards-Version: 4.6.0
-Homepage: https://github.com/derscheid/djinn
+Homepage: https://github.com/pders01/djinn
 Rules-Requires-Root: no
 
 # Builders must supply exactly Zig 0.17.1 before dpkg-buildpackage.

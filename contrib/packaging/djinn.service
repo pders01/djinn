@@ -1,6 +1,6 @@
 [Unit]
 Description=djinn drop-down terminal (GTK4/VTE)
-Documentation=https://github.com/derscheid/djinn
+Documentation=https://github.com/pders01/djinn
 
 # Wait for the graphical session to be up before launching — djinn
 # needs WAYLAND_DISPLAY / DBUS_SESSION_BUS_ADDRESS / XDG_RUNTIME_DIR
@@ -16,10 +16,9 @@ Documentation=https://github.com/derscheid/djinn
 After=graphical-session.target
 PartOf=graphical-session.target
 
-# Cap respawn at 5 restarts per 30s. The default Restart=on-failure
-# alone has no start-rate limit, so a panic loop (e.g. portal
-# permanently denying GlobalShortcuts, missing libgtk4-layer-shell)
-# would respawn every 2s indefinitely and flood the journal.
+# Explicitly cap respawn at 5 restarts per 30s rather than relying on
+# the user manager's defaults. A crash loop or missing native library
+# must not restart every 2s indefinitely and flood the journal.
 # StartLimitBurst trips a transient failure state after the cap;
 # `systemctl --user reset-failed djinn` clears it.
 StartLimitBurst=5
@@ -45,37 +44,18 @@ RestartSec=2s
 
 # main_linux.zig wires a SIGTERM handler via g_unix_signal_add that
 # calls panel.quit() for a clean GLib loop teardown. `systemctl
-# --user stop djinn` therefore tears down through the same path as
-# closing the window, without escalating to SIGKILL.
+# --user stop djinn` requests the same GLib teardown as closing the
+# window. The stop timeout can still terminate slow/stuck descendants.
 KillSignal=SIGTERM
 TimeoutStopSec=5s
 
-# Light sandboxing. Conservative settings only — djinn legitimately
-# needs $HOME (config + state), /tmp (dragdrop-staged image files),
-# /proc/self/exe (autostart Exec= resolve), $XDG_RUNTIME_DIR (IPC
-# socket), and the user D-Bus session, so the heavier directives
-# (ProtectHome, PrivateTmp, ProtectSystem=strict, ProtectProc) would
-# break it.
-#   - NoNewPrivileges: disables setuid / file-cap elevation paths.
-#   - ProtectKernelTunables / ProtectKernelModules / ProtectKernelLogs:
-#     no kernel write surface; djinn never touches sysfs / kallsyms.
-#   - ProtectControlGroups: no cgroupfs write.
-#   - LockPersonality: pins the personality bit; rules out non-x86_64
-#     ABI emulation tricks (cheap, no functional cost).
-#   - RestrictSUIDSGID: belt-and-braces with NoNewPrivileges.
-#   - RestrictRealtime: djinn doesn't need SCHED_FIFO / SCHED_RR.
-#   - MemoryDenyWriteExecute: no W^X mappings (Zig binaries don't
-#     JIT). Note: this would break embedded interpreters; revisit if
-#     a future plugin host loads them.
-NoNewPrivileges=yes
-ProtectKernelTunables=yes
-ProtectKernelModules=yes
-ProtectKernelLogs=yes
-ProtectControlGroups=yes
-LockPersonality=yes
-RestrictSUIDSGID=yes
-RestrictRealtime=yes
-MemoryDenyWriteExecute=yes
+# This is a terminal, not an isolated daemon: execution restrictions are
+# inherited by PTY children, not just the Zig parent. NoNewPrivileges
+# would prevent sudo/setuid elevation; MemoryDenyWriteExecute would break
+# JIT programs. Filesystem, namespace, capability, and other syscall
+# restrictions can likewise change legitimate shell commands. This unit
+# adds none of them. User/system-wide policies still apply; confinement
+# of an individual workload belongs in that workload's explicit launcher.
 
 [Install]
 WantedBy=graphical-session.target

@@ -1,7 +1,7 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
 Upstream-Name: djinn
 Upstream-Contact: Paul Derscheid <paulderscheid@gmail.com>
-Source: https://github.com/derscheid/djinn
+Source: https://github.com/pders01/djinn
 
 Files: *
 Copyright: 2026 Paul Derscheid <paulderscheid@gmail.com>

@@ -13,7 +13,7 @@ pkgver=0.1.0_alpha.2.r0.0000000
 pkgrel=1
 pkgdesc="Quake-style drop-down terminal (GTK4/VTE, Wayland) — git/main"
 arch=('x86_64' 'aarch64')
-url="https://github.com/derscheid/djinn"
+url="https://github.com/pders01/djinn"
 license=('MIT')
 
 # `provides` + `conflicts` against the future release package name
@@ -40,10 +40,9 @@ depends=(
   'xdg-desktop-portal'
 )
 
-# A portal backend is required for the hotkey path. Each compositor
-# ships its own; we recommend rather than require because the IPC
-# socket bridge (printf toggle | socat …) keeps djinn useful even
-# without a backend installed.
+# Automatic hotkeys require a backend implementing GlobalShortcuts, not
+# merely an installed portal backend. Support varies by desktop/version;
+# compositor bindings can use `djinn --toggle` without portal registration.
 optdepends=(
   'xdg-desktop-portal-kde: GlobalShortcuts on KDE Plasma'
   'xdg-desktop-portal-hyprland: GlobalShortcuts on Hyprland'
@@ -63,19 +62,25 @@ makedepends=(
 source=("$_pkgname::git+${url}.git")
 sha256sums=('SKIP')
 
-# Derive pkgver from git describe. Output shape:
-#   - tagged commit:   <tag>.r<commit-count>.<short-sha>
-#   - untagged:        r<commit-count>.<short-sha>
-# Underscores replace dashes so the pacman version comparator
-# handles ordering correctly (`-` is reserved as the pkgrel
-# separator).
+# Describe only version tags, never the moving `pre-release` tag. Strip
+# the leading v and replace prerelease dashes with underscores for pacman:
+#   v0.1.0-alpha.2-3-gabcdef0 -> 0.1.0_alpha.2.r3.abcdef0
+# With no usable version tag, use r<total-commit-count>.<short-sha>.
+# Capture Git's status directly: no pipeline may hide a failed describe.
 pkgver() {
-  cd "$_pkgname"
-  ( git describe --long --tags 2>/dev/null \
-      | sed 's/\([^-]*-g\)/r\1/;s/-/./g' ) \
-    || printf "r%s.%s" \
-         "$(git rev-list --count HEAD)" \
-         "$(git rev-parse --short HEAD)"
+  cd "$_pkgname" || return
+  local description version count hash
+  if description=$(git describe --long --tags --match 'v[0-9]*' 2>/dev/null) &&
+      [[ "$description" =~ ^v([0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9]+([.-][A-Za-z0-9]+)*)?)-([0-9]+)-g([0-9a-f]+)$ ]]; then
+    version="${BASH_REMATCH[1]}"
+    count="${BASH_REMATCH[4]}"
+    hash="${BASH_REMATCH[5]}"
+    printf '%s.r%s.%s\n' "${version//-/_}" "$count" "$hash"
+  else
+    count=$(git rev-list --count HEAD) || return
+    hash=$(git rev-parse --short HEAD) || return
+    printf 'r%s.%s\n' "$count" "$hash"
+  fi
 }
 
 prepare() {
