@@ -57,7 +57,9 @@ pub fn load(allocator: std.mem.Allocator) ?State {
 }
 
 fn loadAt(allocator: std.mem.Allocator, path: []const u8) ?State {
-    const contents = std.Io.Dir.cwd().readFileAlloc(platform.io(), path, allocator, .limited(64 * 1024)) catch return null;
+    // Geometry names come from configuration, not a bounded UI label. An
+    // arbitrary file cap would silently lose long names/maps on the next merge.
+    const contents = std.Io.Dir.cwd().readFileAlloc(platform.io(), path, allocator, .unlimited) catch return null;
     defer allocator.free(contents);
 
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, contents, .{}) catch return null;
@@ -109,16 +111,18 @@ fn dimension(value: std.json.Value) ?u32 {
 }
 
 /// Atomically rewrite state.json with the given top-level dims and
-/// per-profile map. The map is the source of truth — callers compose
-/// it via `updateProfile` rather than writing files directly.
+/// per-profile map. The resize worker composes the map from its owned
+/// per-profile batch; native resize producers must use `saveDebounced`.
 pub fn save(allocator: std.mem.Allocator, width: u32, height: u32, profiles: []const ProfileSize) void {
     const path = statePath(allocator) catch return;
     defer allocator.free(path);
 
-    saveAt(allocator, path, width, height, profiles);
+    saveAt(allocator, path, width, height, profiles) catch |err| {
+        std.log.warn("could not save geometry: {s}", .{@errorName(err)});
+    };
 }
 
-fn saveAt(allocator: std.mem.Allocator, path: []const u8, width: u32, height: u32, profiles: []const ProfileSize) void {
+fn saveAt(allocator: std.mem.Allocator, path: []const u8, width: u32, height: u32, profiles: []const ProfileSize) !void {
     if (std.fs.path.dirname(path)) |dir| {
         std.Io.Dir.createDirAbsolute(platform.io(), dir, .default_dir) catch {};
     }
@@ -126,16 +130,16 @@ fn saveAt(allocator: std.mem.Allocator, path: []const u8, width: u32, height: u3
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
 
-    writeJson(&buf, allocator, width, height, profiles) catch return;
+    try writeJson(&buf, allocator, width, height, profiles);
 
     const io = platform.io();
-    const dir_path = std.fs.path.dirname(path) orelse return;
-    const dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{}) catch return;
+    const dir_path = std.fs.path.dirname(path) orelse return error.InvalidPath;
+    const dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{});
     defer dir.close(io);
-    var atomic = dir.createFileAtomic(io, std.fs.path.basename(path), .{ .replace = true }) catch return;
+    var atomic = try dir.createFileAtomic(io, std.fs.path.basename(path), .{ .replace = true });
     defer atomic.deinit(io);
-    atomic.file.writeStreamingAll(io, buf.items) catch return;
-    atomic.replace(io) catch {};
+    try atomic.file.writeStreamingAll(io, buf.items);
+    try atomic.replace(io);
 }
 
 fn writeJson(
@@ -174,62 +178,102 @@ fn writeEscaped(w: anytype, s: []const u8) !void {
     };
 }
 
-/// Coalesce accepted resize updates through one writer, including updates
-/// arriving while it is doing disk IO. Membership/configuration is never saved.
-const PendingSave = struct {
+/// An owned, exact-identity batch. Names never borrow configuration memory.
+const SaveBatch = struct {
     width: u32 = 0,
     height: u32 = 0,
-    profile: [128]u8 = @splat(0),
-    profile_len: usize = 0,
-    has_profile: bool = false,
+    profiles: std.ArrayList(ProfileSize) = .empty,
+
+    fn deinit(self: *SaveBatch, allocator: std.mem.Allocator) void {
+        for (self.profiles.items) |p| allocator.free(p.name);
+        self.profiles.deinit(allocator);
+        self.* = .{};
+    }
+};
+
+/// Periodic coalescing, NOT trailing-edge debounce: the first update starts a
+/// 300 ms window. Continuous input may write once per window (plus disk IO).
+/// This deliberately checkpoints a long drag instead of postponing all writes
+/// indefinitely; it does not promise one write per drag or change host polling.
+/// Each profile retains its latest size, while top-level size is last overall.
+/// take() transfers ownership and keeps the single-writer gate through IO.
+const PendingSave = struct {
+    allocator: std.mem.Allocator,
+    batch: SaveBatch = .{},
     dirty: bool = false,
     running: bool = false,
     stopped: bool = false,
 
-    fn queue(self: *PendingSave, width: u32, height: u32, name: ?[]const u8) bool {
+    fn queue(self: *PendingSave, width: u32, height: u32, name: ?[]const u8) !bool {
         if (self.stopped) return false;
-        self.width = width;
-        self.height = height;
-        self.has_profile = name != null;
-        self.profile_len = 0;
         if (name) |n| {
-            self.profile_len = @min(n.len, self.profile.len);
-            @memcpy(self.profile[0..self.profile_len], n[0..self.profile_len]);
+            var found = false;
+            for (self.batch.profiles.items) |*p| {
+                if (std.mem.eql(u8, p.name, n)) {
+                    p.width = width;
+                    p.height = height;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                const owned = try self.allocator.dupe(u8, n);
+                errdefer self.allocator.free(owned);
+                try self.batch.profiles.append(self.allocator, .{ .name = owned, .width = width, .height = height });
+            }
         }
+        self.batch.width = width;
+        self.batch.height = height;
         self.dirty = true;
         if (self.running) return false;
         self.running = true;
         return true;
     }
 
-    fn take(self: *PendingSave) ?PendingSave {
+    fn take(self: *PendingSave) ?SaveBatch {
         if (!self.dirty) {
             self.running = false;
             return null;
         }
-        const snapshot = self.*;
+        const snapshot = self.batch;
+        self.batch = .{};
         self.dirty = false;
-        // Keep running=true through the complete load/merge/atomic-write.
         return snapshot;
     }
 };
 
 var resize_workers: platform.Workers = .{};
 var g_mutex: std.Io.Mutex = .init;
-var pending: PendingSave = .{};
+// Queue storage has a stable allocator even if callers replace their config.
+var pending: PendingSave = .{ .allocator = std.heap.page_allocator };
 
+/// Historical API name; uses periodic coalescing as documented above.
+/// The caller's allocator must remain valid until shutdown() returns.
 pub fn saveDebounced(allocator: std.mem.Allocator, width: u32, height: u32, profile_name: ?[]const u8) void {
     const io = platform.io();
     g_mutex.lockUncancelable(io);
     defer g_mutex.unlock(io);
-    if (pending.queue(width, height, profile_name)) {
-        resize_workers.spawn(debounceWorker, .{allocator}) catch {
-            pending.running = false;
+    const start = pending.queue(width, height, profile_name) catch |err| {
+        std.log.warn("could not queue geometry: {s}", .{@errorName(err)});
+        return;
+    };
+    if (start) {
+        resize_workers.spawn(coalescingWorker, .{allocator}) catch {
+            // Do not strand accepted work when concurrent execution is unavailable.
+            // Keep the mutex through this exceptional synchronous write so shutdown
+            // cannot outlive it and no second writer can start.
+            var batch = pending.take().?;
+            defer batch.deinit(pending.allocator);
+            flushBatch(allocator, batch);
+            _ = pending.take();
         };
     }
 }
 
-/// Stop accepting saves, then flush accepted updates before IO/allocator teardown.
+/// Main-thread-only, after native resize producers detach. Close acceptance,
+/// then drain before IO/allocator teardown. At most one existing 300 ms sleep
+/// remains; no further coalescing delays occur after the gate closes. Disk IO
+/// itself is not time-bounded, and write/allocation failures are logged.
 pub fn shutdown() void {
     g_mutex.lockUncancelable(platform.io());
     pending.stopped = true;
@@ -239,77 +283,243 @@ pub fn shutdown() void {
 
 pub const joinPendingSave = shutdown;
 
-fn debounceWorker(allocator: std.mem.Allocator) void {
+fn coalescingWorker(allocator: std.mem.Allocator) void {
+    runCoalescing(allocator, &pending, &g_mutex, struct {
+        fn flush(a: std.mem.Allocator, batch: SaveBatch, _: ?*anyopaque) void {
+            flushBatch(a, batch);
+        }
+    }.flush, null);
+}
+
+// Inject the destination for fixture tests, never changing HOME or touching the
+// user's state. The same worker loop is used for real asynchronous drain tests.
+fn runCoalescing(
+    allocator: std.mem.Allocator,
+    state: *PendingSave,
+    mutex: *std.Io.Mutex,
+    flush: *const fn (std.mem.Allocator, SaveBatch, ?*anyopaque) void,
+    context: ?*anyopaque,
+) void {
     while (true) {
-        platform.sleep(300 * std.time.ns_per_ms);
-        g_mutex.lockUncancelable(platform.io());
-        const update = pending.take();
-        g_mutex.unlock(platform.io());
-        const snapshot = update orelse return;
-        flushUpdate(allocator, snapshot.width, snapshot.height, if (snapshot.has_profile) snapshot.profile[0..snapshot.profile_len] else null);
+        mutex.lockUncancelable(platform.io());
+        const delay = !state.stopped and state.dirty;
+        mutex.unlock(platform.io());
+        if (delay) platform.sleep(300 * std.time.ns_per_ms);
+        mutex.lockUncancelable(platform.io());
+        const update = state.take();
+        mutex.unlock(platform.io());
+        var snapshot = update orelse return;
+        defer snapshot.deinit(state.allocator);
+        flush(allocator, snapshot, context);
     }
 }
 
-fn flushUpdate(allocator: std.mem.Allocator, w: u32, h: u32, profile: ?[]const u8) void {
-    // Merge with what's on disk so the per-profile map persists across
-    // saves that target a different profile.
-    var existing = load(allocator);
-    defer if (existing) |*e| e.deinit(allocator);
+fn flushBatch(allocator: std.mem.Allocator, batch: SaveBatch) void {
+    const path = statePath(allocator) catch |err| {
+        std.log.warn("could not locate geometry state: {s}", .{@errorName(err)});
+        return;
+    };
+    defer allocator.free(path);
+    flushBatchAt(allocator, path, batch) catch |err| {
+        std.log.warn("could not flush geometry: {s}", .{@errorName(err)});
+    };
+}
 
+fn flushBatchAt(allocator: std.mem.Allocator, path: []const u8, batch: SaveBatch) !void {
+    var existing = loadAt(allocator, path);
+    defer if (existing) |*e| e.deinit(allocator);
     var merged: std.ArrayList(ProfileSize) = .empty;
     defer merged.deinit(allocator);
-    if (existing) |e| {
-        merged.appendSlice(allocator, e.profiles) catch {};
-    }
-
-    if (profile) |name| {
+    if (existing) |e| try merged.appendSlice(allocator, e.profiles);
+    for (batch.profiles.items) |update| {
         var found = false;
         for (merged.items) |*p| {
-            if (std.mem.eql(u8, p.name, name)) {
-                p.width = w;
-                p.height = h;
+            if (std.mem.eql(u8, p.name, update.name)) {
+                p.* = update;
                 found = true;
                 break;
             }
         }
-        if (!found) {
-            // Dupe the name for the duration of this save call.
-            const owned = allocator.dupe(u8, name) catch return;
-            merged.append(allocator, .{ .name = owned, .width = w, .height = h }) catch {
-                allocator.free(owned);
-                return;
-            };
-            defer allocator.free(owned);
-            save(allocator, w, h, merged.items);
-            return;
-        }
+        if (!found) try merged.append(allocator, update);
     }
-
-    save(allocator, w, h, merged.items);
+    try saveAt(allocator, path, batch.width, batch.height, merged.items);
 }
 
-test "State: pending writes stay serialized during a flush" {
-    var state: PendingSave = .{};
-    try std.testing.expect(state.queue(800, 600, "first"));
-    const first = state.take().?;
-    try std.testing.expectEqualStrings("first", first.profile[0..first.profile_len]);
+test "State: per-profile batches survive updates during flush and shutdown" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(platform.io(), ".", a);
+    defer a.free(dir);
+    const path = try std.fs.path.join(a, &.{ dir, "state.json" });
+    defer a.free(path);
+    var state: PendingSave = .{ .allocator = a };
+    defer state.batch.deinit(a);
+    try std.testing.expect(try state.queue(800, 600, "A"));
+    try std.testing.expect(!try state.queue(900, 650, "B"));
+    try std.testing.expect(!try state.queue(1000, 700, "A"));
+    var first = state.take().?;
+    defer first.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), first.profiles.items.len);
     try std.testing.expect(state.running);
-    try std.testing.expect(!state.queue(1200, 700, "second"));
-    const second = state.take().?;
-    try std.testing.expectEqual(@as(u32, 1200), second.width);
-    try std.testing.expectEqualStrings("second", second.profile[0..second.profile_len]);
+    // Deterministically hold the writer lease while producers queue more work.
+    try std.testing.expect(!try state.queue(1100, 750, "A"));
+    try std.testing.expect(!try state.queue(1200, 800, "C"));
+    state.stopped = true;
+    try std.testing.expect(!try state.queue(1, 1, "late"));
+    try flushBatchAt(a, path, first);
+    var during = loadAt(a, path).?;
+    defer during.deinit(a);
+    try std.testing.expectEqual(@as(u32, 1000), during.profileSize("A").?.w);
+    try std.testing.expectEqual(@as(u32, 900), during.profileSize("B").?.w);
+    var second = state.take().?;
+    defer second.deinit(a);
     try std.testing.expect(state.running);
+    try flushBatchAt(a, path, second);
     try std.testing.expect(state.take() == null);
     try std.testing.expect(!state.running);
+    var saved = loadAt(a, path).?;
+    defer saved.deinit(a);
+    try std.testing.expectEqual(@as(usize, 3), saved.profiles.len);
+    try std.testing.expectEqual(@as(u32, 1100), saved.profileSize("A").?.w);
+    try std.testing.expectEqual(@as(u32, 900), saved.profileSize("B").?.w);
+    try std.testing.expectEqual(@as(u32, 1200), saved.profileSize("C").?.w);
+    try std.testing.expectEqual(@as(u32, 1200), saved.width);
 }
 
-test "State: shutdown gates new updates without dropping accepted state" {
-    var state: PendingSave = .{};
-    try std.testing.expect(state.queue(800, 600, null));
-    state.stopped = true;
-    try std.testing.expect(!state.queue(900, 700, "late"));
-    try std.testing.expectEqual(@as(u32, 800), state.take().?.width);
-    try std.testing.expect(state.take() == null);
+test "State: real worker drains fixture updates accepted while flush is blocked" {
+    const Fixture = struct {
+        allocator: std.mem.Allocator,
+        path: []const u8,
+        state: PendingSave,
+        mutex: std.Io.Mutex = .init,
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        writes: usize = 0,
+        failure: ?anyerror = null,
+
+        fn flush(a: std.mem.Allocator, batch: SaveBatch, context: ?*anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(context.?));
+            if (self.writes == 0) {
+                self.entered.set(platform.io());
+                self.release.waitUncancelable(platform.io());
+            }
+            flushBatchAt(a, self.path, batch) catch |err| {
+                self.failure = err;
+            };
+            self.writes += 1;
+        }
+
+        fn run(self: *@This()) void {
+            runCoalescing(self.allocator, &self.state, &self.mutex, flush, self);
+        }
+    };
+    const a = std.testing.allocator;
+    const io = platform.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(dir);
+    const path = try std.fs.path.join(a, &.{ dir, "state.json" });
+    defer a.free(path);
+    var fixture: Fixture = .{ .allocator = a, .path = path, .state = .{ .allocator = a } };
+    defer fixture.state.batch.deinit(a);
+    var workers: platform.Workers = .{};
+    defer workers.finish(.drain);
+    // Also unblock on assertion failure, before the deferred worker join.
+    defer fixture.release.set(io);
+    try std.testing.expect(try fixture.state.queue(800, 600, "A"));
+    try workers.spawn(Fixture.run, .{&fixture});
+    fixture.entered.waitUncancelable(io);
+    {
+        fixture.mutex.lockUncancelable(io);
+        defer fixture.mutex.unlock(io);
+        try std.testing.expect(!try fixture.state.queue(900, 650, "B"));
+        try std.testing.expect(!try fixture.state.queue(1000, 700, "A"));
+        fixture.state.stopped = true;
+        try std.testing.expect(!try fixture.state.queue(1, 1, "late"));
+        try std.testing.expect(fixture.state.running);
+    }
+    fixture.release.set(io);
+    workers.finish(.drain);
+    if (fixture.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 2), fixture.writes);
+    try std.testing.expect(!fixture.state.running and !fixture.state.dirty);
+    var saved = loadAt(a, path) orelse return error.TestUnexpectedResult;
+    defer saved.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), saved.profiles.len);
+    try std.testing.expectEqual(@as(u32, 1000), saved.profileSize("A").?.w);
+    try std.testing.expectEqual(@as(u32, 900), saved.profileSize("B").?.w);
+    try std.testing.expectEqual(@as(u32, 1000), saved.width);
+}
+
+test "State: null profile preserves queued profiles and allocation failure is transactional" {
+    const a = std.testing.allocator;
+    var state: PendingSave = .{ .allocator = a };
+    defer state.batch.deinit(a);
+    try std.testing.expect(try state.queue(800, 600, "A"));
+    try std.testing.expect(!try state.queue(900, 700, null));
+    try std.testing.expectEqual(@as(usize, 1), state.batch.profiles.items.len);
+    try std.testing.expectEqual(@as(u32, 900), state.batch.width);
+    var failing: PendingSave = .{ .allocator = std.testing.failing_allocator };
+    try std.testing.expectError(error.OutOfMemory, failing.queue(1, 1, "B"));
+    try std.testing.expect(!failing.dirty and !failing.running);
+    failing.stopped = true;
+    try std.testing.expect(!try failing.queue(1, 1, "late"));
+}
+
+test "State: pending name and map allocation failures release ownership" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(a: std.mem.Allocator) !void {
+            var state: PendingSave = .{ .allocator = a };
+            defer state.batch.deinit(a);
+            for ([_][]const u8{ "first", "second", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth" }) |name| {
+                _ = try state.queue(800, 600, name);
+            }
+            var batch = state.take().?;
+            defer batch.deinit(a);
+            _ = try state.queue(900, 700, "during flush");
+        }
+    }.check, .{});
+}
+
+test "State: exact owned long Unicode names round-trip beyond old file limit" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(platform.io(), ".", a);
+    defer a.free(dir);
+    const path = try std.fs.path.join(a, &.{ dir, "state.json" });
+    defer a.free(path);
+    // The first multibyte character straddles the old 128-byte cutoff.
+    const prefix: [127]u8 = @splat('p');
+    const one = try std.fmt.allocPrint(a, "{s}界-one", .{prefix});
+    defer a.free(one);
+    const two = try std.fmt.allocPrint(a, "{s}界-two", .{prefix});
+    defer a.free(two);
+    const long = try a.alloc(u8, 72000);
+    defer a.free(long);
+    for (0..18000) |i| @memcpy(long[i * 4 ..][0..4], "🙂");
+    const names = [_][]const u8{ one, two, "", "quote\"\\\n名", long };
+    var state: PendingSave = .{ .allocator = a };
+    defer state.batch.deinit(a);
+    for (names, 0..) |name, i| {
+        const borrowed = try a.dupe(u8, name);
+        defer a.free(borrowed);
+        _ = try state.queue(@intCast(800 + i), 600, borrowed);
+        // Simulate config destruction/reuse before the writer runs.
+        @memset(borrowed, 'x');
+    }
+    var batch = state.take().?;
+    defer batch.deinit(a);
+    try flushBatchAt(a, path, batch);
+    var saved = loadAt(a, path) orelse return error.TestUnexpectedResult;
+    defer saved.deinit(a);
+    try std.testing.expectEqual(names.len, saved.profiles.len);
+    for (names, 0..) |name, i| {
+        try std.testing.expectEqualStrings(name, saved.profiles[i].name);
+        try std.testing.expectEqual(@as(u32, @intCast(800 + i)), saved.profileSize(name).?.w);
+    }
 }
 
 test "State: saved dimensions reject invalid native geometry" {
@@ -328,7 +538,7 @@ test "State: round-trip via load/save" {
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "state.json" });
     defer std.testing.allocator.free(path);
     try std.testing.expect(loadAt(std.testing.allocator, path) == null);
-    saveAt(std.testing.allocator, path, 1024, 600, &.{.{ .name = "main", .width = 1200, .height = 700 }});
+    try saveAt(std.testing.allocator, path, 1024, 600, &.{.{ .name = "main", .width = 1200, .height = 700 }});
     var state = loadAt(std.testing.allocator, path) orelse return error.TestUnexpectedResult;
     defer state.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 1024), state.width);
@@ -346,8 +556,8 @@ test "State: atomic replacement leaves only the complete state file" {
     defer std.testing.allocator.free(dir);
     const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "state.json" });
     defer std.testing.allocator.free(path);
-    saveAt(std.testing.allocator, path, 800, 600, &.{});
-    saveAt(std.testing.allocator, path, 1200, 700, &.{});
+    try saveAt(std.testing.allocator, path, 800, 600, &.{});
+    try saveAt(std.testing.allocator, path, 1200, 700, &.{});
     var state = loadAt(std.testing.allocator, path) orelse return error.TestUnexpectedResult;
     defer state.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 1200), state.width);
