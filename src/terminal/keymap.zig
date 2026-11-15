@@ -64,10 +64,10 @@ pub fn rebind(actions: []Action, name: []const u8, mods: u64, keycode: u16) bool
 // ─── Tests ──────────────────────────────────────────────────────────
 
 const TestCounter = struct {
-    var hits: [4]u32 = [_]u32{0} ** 4;
+    var hits: [4]u32 = @splat(0);
 
     fn reset() void {
-        hits = [_]u32{0} ** 4;
+        hits = @splat(0);
     }
 
     fn h0() void {

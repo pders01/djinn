@@ -170,6 +170,10 @@ fn onSettingChanged(
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
+test "Appearance native API compiles without contacting the portal" {
+    std.testing.refAllDecls(Listener);
+}
+
 test "Handler is callable with a stable ctx pointer" {
     // Smoke-only: the GDBus connection path needs a session bus and
     // belongs in integration testing, not the unit suite. This test

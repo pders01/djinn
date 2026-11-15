@@ -21,6 +21,7 @@ pub const GtkWidget = opaque {};
 pub const GtkWindow = opaque {};
 pub const GMainLoop = opaque {};
 pub const GMainContext = opaque {};
+pub const GSource = opaque {};
 pub const GObject = opaque {};
 pub const VteTerminal = opaque {};
 pub const GCancellable = opaque {};
@@ -40,6 +41,7 @@ pub const GConnectFlags = c_int;
 
 // ─── GLib / GObject ──────────────────────────────────────────────────
 
+pub extern "c" fn g_object_ref(object: *anyopaque) *anyopaque;
 pub extern "c" fn g_object_unref(object: *anyopaque) void;
 pub extern "c" fn g_free(mem: ?*anyopaque) void;
 
@@ -53,6 +55,7 @@ pub extern "c" fn g_signal_connect_data(
 ) c_ulong;
 
 pub extern "c" fn g_signal_handler_disconnect(instance: *anyopaque, handler_id: c_ulong) void;
+pub extern "c" fn g_signal_handler_is_connected(instance: *anyopaque, handler_id: c_ulong) gboolean;
 
 pub extern "c" fn g_timeout_add(
     interval_ms: c_uint,
@@ -60,13 +63,33 @@ pub extern "c" fn g_timeout_add(
     user_data: gpointer,
 ) c_uint;
 
+pub extern "c" fn g_timeout_source_new(interval_ms: c_uint) *GSource;
+pub extern "c" fn g_source_set_callback(
+    source: *GSource,
+    function: GSourceFunc,
+    user_data: gpointer,
+    notify: *const fn (gpointer) callconv(.c) void,
+) void;
+pub extern "c" fn g_source_attach(source: *GSource, context: *GMainContext) c_uint;
+pub extern "c" fn g_source_destroy(source: *GSource) void;
+pub extern "c" fn g_source_unref(source: *GSource) void;
+
 pub extern "c" fn g_idle_add(function: GSourceFunc, user_data: gpointer) c_uint;
 
 pub extern "c" fn g_source_remove(tag: c_uint) gboolean;
 
+/// GDBus completion callbacks run in the thread-default context captured at
+/// dispatch. Hotkey retirement only detaches/cancels; the entrypoint drains
+/// completions on that context after all native callback owners have stopped.
+pub extern "c" fn g_main_context_ref_thread_default() *GMainContext;
+pub extern "c" fn g_main_context_iteration(context: ?*GMainContext, may_block: gboolean) gboolean;
+pub extern "c" fn g_main_context_unref(context: *GMainContext) void;
+
 // ─── GTK widget basics ───────────────────────────────────────────────
 
 pub extern "c" fn gdk_display_get_default() ?*GdkDisplay;
+/// Ordinary display bell. GTK/GDK calls belong on the GLib main thread.
+pub extern "c" fn gdk_display_beep(display: *GdkDisplay) void;
 pub extern "c" fn gtk_widget_set_visible(widget: *GtkWidget, visible: gboolean) void;
 pub extern "c" fn gtk_widget_get_visible(widget: *GtkWidget) gboolean;
 pub extern "c" fn gtk_widget_add_controller(widget: *GtkWidget, controller: *GtkEventController) void;

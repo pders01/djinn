@@ -26,12 +26,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Zig 0.15.2
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
+      # The locked flake supplies Zig 0.17.1 and SDK 26.5; system Xcode
+      # remains responsible only for executing Metal tools in the bundle job.
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
 
-      # Cache the global zig package cache (ghostty fetch is the slow
+      # Cache the global archive cache (ghostty fetch is the slow
       # part on a cold runner — minutes vs seconds).
       - name: Cache zig packages
         uses: actions/cache@v4
@@ -42,14 +42,16 @@ jobs:
             zig-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Run unit suite
-        run: ./scripts/build.sh test
+        run: nix develop --command ./scripts/build.sh test test-shared
 
-      - name: Build debug exe (smoke)
-        # Catches link-time regressions the test suite can't see.
-        run: ./scripts/build.sh
+      - name: Check native host and generate runtime resources
+        # Keep this job independent of Metal; the bundle job covers linking.
+        run: nix develop --command ./scripts/build.sh check resources
 
-      - name: Run djinn --version
-        run: ./zig-out/bin/djinn --version
+      - name: Compile-check Linux without GTK or pkg-config
+        run: |
+          nix develop --command ./scripts/build.sh check -Dtarget=x86_64-linux-gnu
+          nix develop --command ./scripts/build.sh check -Dtarget=aarch64-linux-gnu
 
   linux:
     # Ubuntu 24.04 LTS — matches the runtime targeted by
@@ -57,9 +59,7 @@ jobs:
     # GitHub's "latest" rollover doesn't surprise the GTK / VTE pin.
     # gtk4-layer-shell wasn't packaged for noble (first appears in
     # 24.10 oracular), so we build it from a pinned tag below.
-    # Bypasses scripts/build.sh because its `PATH=/usr/bin:$PATH`
-    # prefix is darwin-only (Metal Toolchain discovery) and the
-    # ghostty darwin patch the script applies is a no-op here.
+    # The platform-aware wrapper skips Apple environment/patches on Linux.
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -116,10 +116,10 @@ jobs:
           sudo cp -a "$HOME/gtk4-layer-shell-prefix/." /
           sudo ldconfig
 
-      - name: Install Zig 0.15.2
+      - name: Install Zig 0.17.1
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.17.1
 
       - name: Cache zig packages
         uses: actions/cache@v4
@@ -130,30 +130,36 @@ jobs:
             zig-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Run unit suite
-        run: zig build test
+        run: ./scripts/build.sh check test test-shared
 
       - name: Build debug exe (smoke)
         # Catches link-time regressions the test suite can't see —
         # GTK / VTE symbols are only checked at link time, not under
         # the test target's smaller surface.
-        run: zig build
+        run: ./scripts/build.sh
 
       - name: Build ReleaseSafe (distribution path)
         # The optimization level distros + `just install-arch` ship.
         # Catches comptime / safety regressions that only fire under
         # release optimization.
-        run: zig build -Doptimize=ReleaseSafe
+        run: ./scripts/build.sh -Doptimize=ReleaseSafe -Dsystem-install=true
 
-      - name: Run djinn --version
-        # Smoke: the binary loads (no missing symbols, runtime
-        # ld.so resolves all of libgtk-4 / libgtk4-layer-shell / libvte).
-        run: ./zig-out/bin/djinn --version
+      - name: Relocated CLI smoke without desktop or user configuration
+        # Check dynamic linkage and early CLI exit, not GTK interaction.
+        run: |
+          SMOKE_DIR=$(mktemp -d)
+          trap 'rm -rf "$SMOKE_DIR"' EXIT
+          mkdir "$SMOKE_DIR/home"
+          cp zig-out/bin/djinn "$SMOKE_DIR/djinn"
+          env -i PATH=/usr/bin:/bin HOME="$SMOKE_DIR/home" "$SMOKE_DIR/djinn" --version
+          env -i PATH=/usr/bin:/bin HOME="$SMOKE_DIR/home" "$SMOKE_DIR/djinn" --help
+          test ! -e "$SMOKE_DIR/home/.config"
 
   bundle:
     # Exercises the full distributable path: Metal shader compile via
-    # xcrun, install_name_tool rpath rewrite, plist version
-    # interpolation, ad-hoc codesign. release.yml uses the same step,
-    # so a green job here means a tag push will publish.
+    # xcrun, bundle-local rpaths, runtime resources, plist version
+    # interpolation, and ad-hoc codesign. release.yml uses the same build
+    # path; publishing still depends on that workflow completing separately.
     runs-on: macos-15
     timeout-minutes: 45
     needs: test
@@ -162,10 +168,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Zig 0.15.2
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
 
       - name: Ensure Metal Toolchain
         # ghostty's renderer compiles `.metal` shaders via xcrun -> metal.
@@ -176,16 +180,17 @@ jobs:
         # Xcode before probing so the toolchain download path actually
         # works when Metal compiler is missing.
         run: |
-          newest_xcode=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
-          if [ -n "$newest_xcode" ]; then
+          xcode_paths=(/Applications/Xcode_*.app)
+          newest_xcode=$(printf '%s\n' "${xcode_paths[@]}" | sort -V | tail -1)
+          if [ -d "$newest_xcode" ]; then
             echo "Selecting $newest_xcode"
             sudo xcode-select -s "$newest_xcode"
           fi
-          if xcrun --find metal >/dev/null 2>&1; then
-            echo "Metal compiler at $(xcrun --find metal)"
-          else
-            sudo xcodebuild -downloadComponent MetalToolchain
+          if ! xcrun -sdk macosx metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
           fi
+          # Finding the launcher is not enough; confirm the toolchain runs.
+          xcrun -sdk macosx metal --version
 
       - name: Cache zig packages
         uses: actions/cache@v4
@@ -196,7 +201,7 @@ jobs:
             zig-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Build signed Djinn.app (ad-hoc)
-        run: ./scripts/build.sh bundle-sign
+        run: nix develop --command ./scripts/build.sh bundle-sign
 
       - name: Verify bundle metadata
         run: |
@@ -204,19 +209,8 @@ jobs:
             zig-out/Djinn.app/Contents/Info.plist
           codesign --verify --verbose=2 zig-out/Djinn.app
 
-      - name: Verify dylib linkage
-        # otool confirms install_name_tool rewrote LC_LOAD_DYLIB to
-        # @rpath/libghostty.dylib and the LC_RPATH list includes
-        # @loader_path. dyld eagerly loads all LC_LOAD_DYLIB entries
-        # at process start, so `--version` failing here means rpath
-        # is broken even though the path doesn't touch libghostty
-        # symbols directly.
-        run: |
-          otool -L zig-out/Djinn.app/Contents/MacOS/djinn | grep -q '@rpath/libghostty.dylib' \
-            || { echo "::error::libghostty not linked via @rpath"; exit 1; }
-          otool -l zig-out/Djinn.app/Contents/MacOS/djinn | grep -A2 LC_RPATH | grep -q '@loader_path' \
-            || { echo "::error::@loader_path missing from LC_RPATH"; exit 1; }
-          zig-out/Djinn.app/Contents/MacOS/djinn --version
+      - name: Verify self-contained signed bundle
+        run: ./scripts/verify-bundle.sh
 
       - name: Zip bundle
         run: |

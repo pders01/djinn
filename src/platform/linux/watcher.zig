@@ -53,6 +53,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const gtk = @import("gtk.zig");
+const platform = @import("../../io/platform.zig");
 
 const gpointer = gtk.gpointer;
 const gboolean = gtk.gboolean;
@@ -331,9 +332,9 @@ fn buildEntry(
     const parent_slice = path[0..slash];
     const basename_slice = path[slash + 1 ..];
 
-    const parent = try allocator.dupeZ(u8, parent_slice);
+    const parent = try allocator.dupeSentinel(u8, parent_slice, 0);
     errdefer allocator.free(parent);
-    const basename = try allocator.dupeZ(u8, basename_slice);
+    const basename = try allocator.dupeSentinel(u8, basename_slice, 0);
     errdefer allocator.free(basename);
 
     const gfile = g_file_new_for_path(parent.ptr);
@@ -353,8 +354,10 @@ fn buildEntry(
         }
         return error.MonitorFailed;
     };
-    errdefer _ = g_file_monitor_cancel(monitor);
-    errdefer g_object_unref(monitor);
+    errdefer {
+        _ = g_file_monitor_cancel(monitor);
+        g_object_unref(monitor);
+    }
 
     const ctx = try allocator.create(EntryContext);
     errdefer allocator.destroy(ctx);
@@ -392,7 +395,7 @@ fn buildEntry(
 /// sentinel — recheckEntry skips entries whose cached inode is 0
 /// because there's no stable baseline to compare against.
 fn readParentInode(parent: [:0]const u8) u64 {
-    const st = std.fs.cwd().statFile(parent) catch return 0;
+    const st = std.Io.Dir.cwd().statFile(platform.io(), parent, .{}) catch return 0;
     return st.inode;
 }
 
@@ -401,6 +404,10 @@ fn destroyEntry(allocator: std.mem.Allocator, entry: *Watcher.Entry) void {
     // half-freed EntryContext. GLib serializes source dispatches on
     // the main thread, so once cancel returns the callback won't fire
     // again for this monitor.
+    if (entry.signal_id != 0) {
+        gtk.g_signal_handler_disconnect(entry.monitor, entry.signal_id);
+        entry.signal_id = 0;
+    }
     _ = g_file_monitor_cancel(entry.monitor);
     g_object_unref(entry.monitor);
     g_object_unref(entry.gfile);
@@ -423,7 +430,7 @@ fn destroyEntry(allocator: std.mem.Allocator, entry: *Watcher.Entry) void {
 /// the caller's `on_changed` re-reads through the new inode.
 fn recheckEntry(entry: *Watcher.Entry) void {
     if (entry.ctx.parent_ino == 0) return; // init-time stat failed; no baseline
-    const st = std.fs.cwd().statFile(entry.ctx.parent) catch return;
+    const st = std.Io.Dir.cwd().statFile(platform.io(), entry.ctx.parent, .{}) catch return;
     if (st.inode == entry.ctx.parent_ino) return;
 
     rebuildMonitor(entry) catch |err| {
@@ -481,11 +488,13 @@ fn rebuildMonitor(entry: *Watcher.Entry) !void {
     // Success — install the new triple, then tear down the old.
     const old_monitor = entry.monitor;
     const old_gfile = entry.gfile;
+    const old_signal_id = entry.signal_id;
 
     entry.gfile = new_gfile;
     entry.monitor = new_monitor;
     entry.signal_id = new_signal_id;
 
+    if (old_signal_id != 0) gtk.g_signal_handler_disconnect(old_monitor, old_signal_id);
     _ = g_file_monitor_cancel(old_monitor);
     g_object_unref(old_monitor);
     g_object_unref(old_gfile);
@@ -496,7 +505,7 @@ fn rebuildMonitor(entry: *Watcher.Entry) !void {
 fn onChanged(
     _: *GFileMonitor,
     file: ?*GFile,
-    _: ?*GFile,
+    other_file: ?*GFile,
     event_type: GFileMonitorEvent,
     user_data: gpointer,
 ) callconv(.c) void {
@@ -505,6 +514,7 @@ fn onChanged(
     const interesting = switch (event_type) {
         G_FILE_MONITOR_EVENT_CHANGED,
         G_FILE_MONITOR_EVENT_CHANGES_DONE_HINT,
+        G_FILE_MONITOR_EVENT_DELETED,
         G_FILE_MONITOR_EVENT_CREATED,
         G_FILE_MONITOR_EVENT_RENAMED,
         G_FILE_MONITOR_EVENT_MOVED_IN,
@@ -513,17 +523,94 @@ fn onChanged(
     };
     if (!interesting) return;
 
-    const f = file orelse return;
-    const basename_z = g_file_get_basename(f) orelse return;
-    defer g_free(@ptrCast(basename_z));
-
-    const basename = std.mem.span(basename_z);
-    if (!std.mem.eql(u8, basename, ctx.basename)) return;
-
-    ctx.coalesce.schedule();
+    // RENAMED carries the destination in other_file. An editor saving
+    // .config.tmp -> config must match that side as well as the source.
+    for ([_]?*GFile{ file, other_file }) |candidate| {
+        const f = candidate orelse continue;
+        const basename_z = g_file_get_basename(f) orelse continue;
+        defer g_free(@ptrCast(basename_z));
+        if (std.mem.eql(u8, std.mem.span(basename_z), ctx.basename)) {
+            ctx.coalesce.schedule();
+            return;
+        }
+    }
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
+
+test "Watcher native API compiles without starting a monitor" {
+    std.testing.refAllDecls(Watcher);
+}
+
+test "Watcher owns signal subscriptions across rebuild and deinit" {
+    if (builtin.os.tag != .linux) return;
+    const a = std.testing.allocator;
+    const io = platform.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "watched", .default_dir);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "watched/config" });
+    defer a.free(path);
+    var fired: usize = 0;
+    var watcher = try Watcher.init(a, &.{path}, .{
+        .ctx = &fired,
+        .on_changed = struct {
+            fn cb(ctx: *anyopaque) void {
+                const count: *usize = @ptrCast(@alignCast(ctx));
+                count.* += 1;
+            }
+        }.cb,
+    });
+    var live = true;
+    defer if (live) watcher.deinit();
+    const entry = &watcher.entries[0];
+    const original_ctx = entry.ctx;
+    const old_monitor = entry.monitor;
+    const old_signal = entry.signal_id;
+    _ = gtk.g_object_ref(old_monitor);
+    defer g_object_unref(old_monitor);
+    try std.testing.expect(gtk.g_signal_handler_is_connected(old_monitor, old_signal) != 0);
+    const old_inode = entry.ctx.parent_ino;
+    try std.testing.expect(old_inode != 0);
+
+    // Keep the old inode alive under a different name so filesystems
+    // cannot immediately recycle it for the replacement directory.
+    try tmp.dir.rename("watched", tmp.dir, "retired", io);
+    try tmp.dir.createDir(io, "watched", .default_dir);
+    recheckEntry(entry);
+    try std.testing.expect(entry.ctx == original_ctx);
+    try std.testing.expect(entry.ctx.parent_ino != old_inode);
+    try std.testing.expectEqual(readParentInode(entry.ctx.parent), entry.ctx.parent_ino);
+    try std.testing.expect(entry.monitor != old_monitor);
+    try std.testing.expect(gtk.g_signal_handler_is_connected(old_monitor, old_signal) == 0);
+    try std.testing.expect(gtk.g_signal_handler_is_connected(entry.monitor, entry.signal_id) != 0);
+    try std.testing.expect(watcher.coalesce.timeout_id != 0);
+
+    // An atomic rename matches its destination, and multiple events
+    // preserve a single pending debounce source.
+    const scheduled = watcher.coalesce.timeout_id;
+    const target_z = try a.dupeSentinel(u8, path, 0);
+    defer a.free(target_z);
+    const target = g_file_new_for_path(target_z.ptr);
+    defer g_object_unref(target);
+    onChanged(entry.monitor, null, target, G_FILE_MONITOR_EVENT_RENAMED, entry.ctx);
+    try std.testing.expectEqual(scheduled, watcher.coalesce.timeout_id);
+    _ = g_source_remove(scheduled);
+    watcher.coalesce.timeout_id = 0;
+    onChanged(entry.monitor, null, target, G_FILE_MONITOR_EVENT_RENAMED, entry.ctx);
+    try std.testing.expect(watcher.coalesce.timeout_id != 0);
+    try std.testing.expectEqual(@as(usize, 0), fired);
+
+    const monitor = entry.monitor;
+    const signal_id = entry.signal_id;
+    _ = gtk.g_object_ref(monitor);
+    defer g_object_unref(monitor);
+    watcher.deinit();
+    live = false;
+    try std.testing.expect(gtk.g_signal_handler_is_connected(monitor, signal_id) == 0);
+}
 
 test "Watcher rejects malformed paths" {
     if (builtin.os.tag != .linux) return;
@@ -543,7 +630,6 @@ test "Watcher rejects malformed paths" {
 }
 
 test "readParentInode reports stable inode and 0 for missing path" {
-    if (builtin.os.tag != .linux) return;
     const a = std.testing.allocator;
 
     // Stage a unique tmpdir for this test so concurrent runs don't
@@ -552,12 +638,13 @@ test "readParentInode reports stable inode and 0 for missing path" {
     defer tmp.cleanup();
 
     const sub_name = "djinn-watcher-recheck";
-    try tmp.dir.makeDir(sub_name);
+    const io = platform.io();
+    try tmp.dir.createDir(io, sub_name, .default_dir);
 
-    const sub_path = try tmp.dir.realpathAlloc(a, sub_name);
+    const sub_path = try tmp.dir.realPathFileAlloc(io, sub_name, a);
     defer a.free(sub_path);
 
-    const sub_path_z = try a.dupeZ(u8, sub_path);
+    const sub_path_z = try a.dupeSentinel(u8, sub_path, 0);
     defer a.free(sub_path_z);
 
     const ino_before = readParentInode(sub_path_z);
@@ -566,8 +653,8 @@ test "readParentInode reports stable inode and 0 for missing path" {
     // Same-FS rename keeps the inode invariant. The recheck relies on
     // this so mv-round-trip flows don't trigger a spurious rebuild.
     const renamed_name = "djinn-watcher-recheck.bak";
-    try tmp.dir.rename(sub_name, renamed_name);
-    try tmp.dir.rename(renamed_name, sub_name);
+    try tmp.dir.rename(sub_name, tmp.dir, renamed_name, io);
+    try tmp.dir.rename(renamed_name, tmp.dir, sub_name, io);
     const ino_after_rename = readParentInode(sub_path_z);
     try std.testing.expectEqual(ino_before, ino_after_rename);
 
@@ -577,14 +664,14 @@ test "readParentInode reports stable inode and 0 for missing path" {
     // (Azure's CI tmpfs reuses inodes immediately, ext4 typically
     // doesn't); the recheck path treats either outcome correctly,
     // so the test only asserts the non-zero post-condition.
-    try tmp.dir.deleteDir(sub_name);
-    try tmp.dir.makeDir(sub_name);
+    try tmp.dir.deleteDir(io, sub_name);
+    try tmp.dir.createDir(io, sub_name, .default_dir);
     const ino_after_recreate = readParentInode(sub_path_z);
     try std.testing.expect(ino_after_recreate != 0);
 
     // Missing path returns 0 — the recheck treats this as "wait
     // for parent to reappear" and skips this tick.
-    try tmp.dir.deleteDir(sub_name);
+    try tmp.dir.deleteDir(io, sub_name);
     const ino_missing = readParentInode(sub_path_z);
     try std.testing.expectEqual(@as(u64, 0), ino_missing);
 }

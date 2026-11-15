@@ -1,8 +1,6 @@
 const std = @import("std");
 
-const c = @cImport({
-    @cInclude("dispatch/dispatch.h");
-});
+const c = @import("darwin-c");
 
 // ─── FSEventStream — config file watcher ─────────────────────────────
 //
@@ -13,9 +11,7 @@ const c = @cImport({
 // path changed, we just re-apply the whole config; that keeps the
 // surface tiny and avoids per-flag plumbing.
 
-const cf = @cImport({
-    @cInclude("CoreFoundation/CoreFoundation.h");
-});
+const cf = c;
 
 extern "c" fn FSEventStreamCreate(
     allocator: ?*anyopaque,
@@ -95,7 +91,7 @@ pub fn watchPaths(paths: []const []const u8, handler: *const fn () void) ?*anyop
         parent_count += 1;
     }
 
-    var cf_strs: [8]?*anyopaque = .{null} ** 8;
+    var cf_strs: [8]?*anyopaque = @splat(null);
     var path_buf: [1024]u8 = undefined;
     for (parents[0..parent_count], 0..) |p, i| {
         if (p.len >= path_buf.len) {

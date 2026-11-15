@@ -86,12 +86,60 @@ const PORTAL_CALL_TIMEOUT_MS: c_int = 30_000;
 
 /// Caller-supplied dispatch hook. Invoked on the GLib main thread when
 /// the portal reports that the bound shortcut fired.
+pub const Outcome = enum { bound, failed };
+
 pub const Handler = struct {
     ctx: *anyopaque,
     on_activated: *const fn (ctx: *anyopaque) void,
+    /// Single-shot, asynchronous; the attempt id identifies the source even
+    /// when a reload supersedes an outstanding registration.
+    on_registration: ?*const fn (ctx: *anyopaque, attempt: u64, outcome: Outcome) void = null,
 };
 
-/// Owns the portal-side session for the entire djinn process lifetime.
+// GLib-main-thread only. Never reuse an attempt within a process, even when
+// an older portal session or Request is still live.
+var next_attempt: u64 = 0;
+var contexts: ?*Context = null;
+
+fn allocateAttempt() !u64 {
+    next_attempt = std.math.add(u64, next_attempt, 1) catch return error.AttemptsExhausted;
+    return next_attempt;
+}
+
+const References = struct {
+    count: usize = 1,
+
+    fn retain(self: *References) void {
+        std.debug.assert(self.count != 0);
+        self.count += 1;
+    }
+
+    /// True only when the last owner/completion/frame releases its lease.
+    fn release(self: *References) bool {
+        std.debug.assert(self.count != 0);
+        self.count -= 1;
+        return self.count == 0;
+    }
+};
+
+const TokenKind = enum { session, create, bind };
+
+fn makeToken(allocator: std.mem.Allocator, kind: TokenKind, pid: u64, attempt: u64) ![:0]u8 {
+    return std.fmt.allocPrintSentinel(allocator, "djinn_{s}_{d}_{d}", .{ @tagName(kind), pid, attempt }, 0);
+}
+
+const Registration = struct {
+    outcome: ?Outcome = null,
+    retired: bool = false,
+
+    fn finish(self: *Registration, outcome: Outcome) bool {
+        if (self.retired or self.outcome != null) return false;
+        self.outcome = outcome;
+        return true;
+    }
+};
+
+/// Owns one portal registration attempt/session; reloads may overlap.
 /// `init` kicks off async D-Bus traffic and returns immediately — the
 /// shortcut isn't bound yet when this returns. The handler starts
 /// receiving callbacks once BindShortcuts succeeds; on first launch
@@ -126,29 +174,15 @@ pub const Hotkey = struct {
         errdefer allocator.free(trigger);
 
         const pid = std.os.linux.getpid();
+        const attempt = try allocateAttempt();
 
-        const session_handle_token = try std.fmt.allocPrintSentinel(
-            allocator,
-            "djinn_session_{d}",
-            .{pid},
-            0,
-        );
+        const session_handle_token = try makeToken(allocator, .session, @intCast(pid), attempt);
         errdefer allocator.free(session_handle_token);
 
-        const handle_token_create = try std.fmt.allocPrintSentinel(
-            allocator,
-            "djinn_create_{d}",
-            .{pid},
-            0,
-        );
+        const handle_token_create = try makeToken(allocator, .create, @intCast(pid), attempt);
         errdefer allocator.free(handle_token_create);
 
-        const handle_token_bind = try std.fmt.allocPrintSentinel(
-            allocator,
-            "djinn_bind_{d}",
-            .{pid},
-            0,
-        );
+        const handle_token_bind = try makeToken(allocator, .bind, @intCast(pid), attempt);
         errdefer allocator.free(handle_token_bind);
 
         const create_request_path = try computeRequestPath(
@@ -157,6 +191,11 @@ pub const Hotkey = struct {
             handle_token_create,
         );
         errdefer allocator.free(create_request_path);
+
+        // Predict the session too, so cancellation before Create's Response
+        // still closes a session the portal may already have created.
+        const predicted_session = try computeObjectPath(allocator, "session", unique_name, session_handle_token);
+        errdefer allocator.free(predicted_session);
 
         const ctx = try allocator.create(Context);
         errdefer allocator.destroy(ctx);
@@ -171,12 +210,24 @@ pub const Hotkey = struct {
             .handle_token_bind = handle_token_bind,
             .create_request_path = create_request_path,
             .bind_request_path = null,
-            .session_handle = null,
+            .session_handle = predicted_session,
             .activated_sub_id = 0,
             .create_response_sub_id = 0,
             .bind_response_sub_id = 0,
-            .outcome_reported = false,
+            .attempt = attempt,
+            .cancellable = gdbus.g_cancellable_new(),
+            .main_context = gtk.g_main_context_ref_thread_default(),
         };
+
+        ctx.next = contexts;
+        if (contexts) |head| head.previous = ctx;
+        contexts = ctx;
+        // Bound the whole handshake, not just the method acknowledgements:
+        // the portal may acknowledge a request and never send its Response.
+        const timeout = gtk.g_timeout_source_new(PORTAL_CALL_TIMEOUT_MS);
+        ctx.timeout_source = timeout;
+        gtk.g_source_set_callback(timeout, onTimeout, ctx.retain(), releaseData);
+        _ = gtk.g_source_attach(timeout, ctx.main_context);
 
         // Activated catches every shortcut firing for the lifetime of
         // the connection. We registered just one id ("toggle"), so we
@@ -190,8 +241,8 @@ pub const Hotkey = struct {
             null,
             0,
             &onActivated,
-            ctx,
-            null,
+            ctx.retain(),
+            @ptrCast(&releaseData),
         );
         errdefer if (ctx.activated_sub_id != 0)
             gdbus.g_dbus_connection_signal_unsubscribe(ctx.connection, ctx.activated_sub_id);
@@ -211,8 +262,8 @@ pub const Hotkey = struct {
             null,
             0,
             &onCreateSessionResponse,
-            ctx,
-            null,
+            ctx.retain(),
+            @ptrCast(&releaseData),
         );
         errdefer if (ctx.create_response_sub_id != 0)
             gdbus.g_dbus_connection_signal_unsubscribe(ctx.connection, ctx.create_response_sub_id);
@@ -221,6 +272,7 @@ pub const Hotkey = struct {
             handle_token_create,
             session_handle_token,
         );
+        _ = ctx.retain();
         gdbus.g_dbus_connection_call(
             connection,
             "org.freedesktop.portal.Desktop",
@@ -231,7 +283,7 @@ pub const Hotkey = struct {
             vt("(o)"),
             0,
             PORTAL_CALL_TIMEOUT_MS,
-            null,
+            ctx.cancellable,
             &onCreateSessionReply,
             ctx,
         );
@@ -244,8 +296,29 @@ pub const Hotkey = struct {
         return .{ .ctx = ctx };
     }
 
+    pub fn attemptId(self: Hotkey) u64 {
+        return self.ctx.attempt;
+    }
+
+    /// Called only by the entrypoint's final native teardown defer, after
+    /// every callback producer/owner (including shortcut controllers) detached.
+    /// No application handlers can run here. Keep allocator and IO alive.
+    pub fn shutdown() void {
+        while (contexts) |ctx| {
+            std.debug.assert(ctx.registration.retired);
+            // Hold the context across iteration: its last completion may free it.
+            const main_context = ctx.main_context;
+            _ = ctx.retain();
+            _ = gtk.g_main_context_iteration(main_context, 1);
+            ctx.release();
+        }
+    }
+
+    /// GLib-main-thread only. Retirement NEVER pumps the shared main context.
     pub fn deinit(self: *Hotkey) void {
         const ctx = self.ctx;
+        ctx.registration.retired = true;
+        ctx.stopTimeout();
         // Order matters: unsubscribe signals first so no callback can
         // observe a half-freed context if a queued event sneaks through
         // before we tear down the connection ref.
@@ -256,16 +329,23 @@ pub const Hotkey = struct {
         if (ctx.bind_response_sub_id != 0)
             gdbus.g_dbus_connection_signal_unsubscribe(ctx.connection, ctx.bind_response_sub_id);
 
-        gdbus.g_object_unref(ctx.connection);
-
-        if (ctx.session_handle) |h| ctx.allocator.free(h);
-        if (ctx.bind_request_path) |p| ctx.allocator.free(p);
-        ctx.allocator.free(ctx.create_request_path);
-        ctx.allocator.free(ctx.handle_token_bind);
-        ctx.allocator.free(ctx.handle_token_create);
-        ctx.allocator.free(ctx.session_handle_token);
-        ctx.allocator.free(ctx.trigger);
-        ctx.allocator.destroy(ctx);
+        // The shared GLib session-bus cache can outlive this Hotkey.
+        // Explicitly close our portal objects rather than relying on the
+        // bus connection's final unref to release the registered binding.
+        if (ctx.create_response_sub_id != 0)
+            closePortalObject(ctx, ctx.create_request_path, "org.freedesktop.portal.Request");
+        if (ctx.bind_response_sub_id != 0) {
+            if (ctx.bind_request_path) |path|
+                closePortalObject(ctx, path, "org.freedesktop.portal.Request");
+        }
+        if (ctx.session_handle) |path|
+            closePortalObject(ctx, path, "org.freedesktop.portal.Session");
+        ctx.activated_sub_id = 0;
+        ctx.create_response_sub_id = 0;
+        ctx.bind_response_sub_id = 0;
+        gdbus.g_cancellable_cancel(ctx.cancellable);
+        ctx.release(); // owner; subscriptions, calls and callback frames retain
+        self.* = undefined;
     }
 };
 
@@ -282,8 +362,8 @@ const Context = struct {
     /// re-called from `bindShortcut` — the value is connection-stable
     /// for the connection's lifetime, so caching is safe. The backing
     /// string is owned by the connection (per glib docs); the slice
-    /// stays valid until `g_object_unref(connection)` in deinit, which
-    /// runs strictly after every site that reads it.
+    /// stays valid until the final context release, strictly after every
+    /// callback, signal destroy notify and method completion that reads it.
     unique_name: []const u8,
     /// Caller-chosen tokens. Portal echoes them into request/session
     /// path computation so we can predict the Request object paths.
@@ -293,23 +373,78 @@ const Context = struct {
     /// Predicted request paths. The Response signal fires on these.
     create_request_path: [:0]u8,
     bind_request_path: ?[:0]u8,
-    /// Portal-returned session_handle. Set when CreateSession's Response
-    /// arrives. Used as the first arg to BindShortcuts.
+    /// Predicted session path until CreateSession's Response replaces it
+    /// with the canonical handle. Used as the first arg to BindShortcuts.
     session_handle: ?[:0]u8,
     /// GDBus subscription ids. Zero means "not subscribed" (the typical
     /// state after a one-shot Response handler unsubscribes itself).
     activated_sub_id: c_uint,
     create_response_sub_id: c_uint,
     bind_response_sub_id: c_uint,
-    /// Single-shot latch for the aggregate "portal active / portal
-    /// unavailable" outcome log. The portal flow has several places it
-    /// can succeed or fail (sync init, CreateSession reply, CreateSession
-    /// Response status, BindShortcuts reply, BindShortcuts Response
-    /// status). Without a latch, transient handlers fire multiple log
-    /// lines for the same logical attempt; with it, the user sees one
-    /// definitive outcome per `Hotkey.init` call.
-    outcome_reported: bool,
+    /// Single-shot outcome and retirement gate for both logging and handlers.
+    registration: Registration = .{},
+    attempt: u64,
+    cancellable: *gdbus.GCancellable,
+    main_context: *gtk.GMainContext,
+    timeout_source: ?*gtk.GSource = null,
+    references: References = .{}, // public owner
+    next: ?*Context = null,
+    previous: ?*Context = null,
+
+    fn retain(self: *Context) *Context {
+        self.references.retain();
+        return self;
+    }
+
+    fn stopTimeout(self: *Context) void {
+        if (self.timeout_source) |source| {
+            self.timeout_source = null;
+            gtk.g_source_destroy(source);
+            gtk.g_source_unref(source);
+        }
+    }
+
+    fn release(self: *Context) void {
+        if (!self.references.release()) return;
+        std.debug.assert(self.registration.retired);
+        if (self.previous) |p| p.next = self.next else contexts = self.next;
+        if (self.next) |n| n.previous = self.previous;
+        gtk.g_main_context_unref(self.main_context);
+        gdbus.g_object_unref(self.cancellable);
+        gdbus.g_object_unref(self.connection);
+        if (self.session_handle) |h| self.allocator.free(h);
+        if (self.bind_request_path) |p| self.allocator.free(p);
+        self.allocator.free(self.create_request_path);
+        self.allocator.free(self.handle_token_bind);
+        self.allocator.free(self.handle_token_create);
+        self.allocator.free(self.session_handle_token);
+        self.allocator.free(self.trigger);
+        self.allocator.destroy(self);
+    }
 };
+
+fn releaseData(data: gpointer) callconv(.c) void {
+    const ctx: *Context = @ptrCast(@alignCast(data orelse return));
+    ctx.release();
+}
+
+fn onTimeout(data: gpointer) callconv(.c) c_int {
+    const ctx: *Context = @ptrCast(@alignCast(data orelse return 0));
+    _ = ctx.retain();
+    defer ctx.release();
+    if (ctx.timeout_source) |source| {
+        ctx.timeout_source = null;
+        gtk.g_source_unref(source); // main context owns it through dispatch
+    }
+    reportFailure(ctx, "registration timed out", .{});
+    return 0;
+}
+
+fn closePortalObject(ctx: *Context, path: [:0]const u8, interface: [*:0]const u8) void {
+    // Track even cleanup IO until call_finish: process IO/allocator must not
+    // disappear while GDBus still owns a completion.
+    gdbus.g_dbus_connection_call(ctx.connection, "org.freedesktop.portal.Desktop", path.ptr, interface, "Close", null, null, 0, PORTAL_CALL_TIMEOUT_MS, null, onCloseReply, ctx.retain());
+}
 
 // ─── Outcome reporters ───────────────────────────────────────────────
 //
@@ -317,21 +452,32 @@ const Context = struct {
 // these. The pre-Context sync failures (session-bus / unique-name /
 // trigger parse) use `reportSyncFailure`; once Context exists, async
 // callbacks use `reportSuccess` / `reportFailure` which dedupe against
-// `ctx.outcome_reported`.
+// `ctx.registration`.
+
+fn onCloseReply(_: ?*anyopaque, res: *GAsyncResult, data: gpointer) callconv(.c) void {
+    const ctx: *Context = @ptrCast(@alignCast(data orelse return));
+    defer ctx.release();
+    var err: ?*GError = null;
+    if (gdbus.g_dbus_connection_call_finish(ctx.connection, res, &err)) |reply|
+        gdbus.g_variant_unref(reply);
+    if (err) |e| gdbus.g_error_free(e);
+}
 
 fn reportSuccess(ctx: *Context) void {
-    if (ctx.outcome_reported) return;
-    ctx.outcome_reported = true;
+    if (!ctx.registration.finish(.bound)) return;
+    ctx.stopTimeout();
     std.debug.print(
-        "hotkey: portal active — trigger \"{s}\"\n",
-        .{ctx.trigger},
+        "hotkey: portal active (attempt {d}) — trigger \"{s}\"\n",
+        .{ ctx.attempt, ctx.trigger },
     );
+    if (ctx.handler.on_registration) |callback| callback(ctx.handler.ctx, ctx.attempt, .bound);
 }
 
 fn reportFailure(ctx: *Context, comptime fmt: []const u8, args: anytype) void {
-    if (ctx.outcome_reported) return;
-    ctx.outcome_reported = true;
-    std.debug.print("hotkey: portal unavailable — " ++ fmt ++ "\n", args);
+    if (!ctx.registration.finish(.failed)) return;
+    ctx.stopTimeout();
+    std.debug.print("hotkey: portal unavailable (attempt {d}) — " ++ fmt ++ "\n", .{ctx.attempt} ++ args);
+    if (ctx.handler.on_registration) |callback| callback(ctx.handler.ctx, ctx.attempt, .failed);
 }
 
 fn reportSyncFailure(comptime fmt: []const u8, args: anytype) void {
@@ -354,8 +500,14 @@ fn onCreateSessionReply(
     user_data: gpointer,
 ) callconv(.c) void {
     const ctx: *Context = @ptrCast(@alignCast(user_data orelse return));
+    defer ctx.release();
     var err: ?*GError = null;
     const reply = gdbus.g_dbus_connection_call_finish(ctx.connection, res, &err);
+    if (ctx.registration.retired or ctx.registration.outcome != null) {
+        if (reply) |r| gdbus.g_variant_unref(r);
+        if (err) |e| gdbus.g_error_free(e);
+        return;
+    }
     if (reply) |r| {
         defer gdbus.g_variant_unref(r);
         reconcileRequestPath(
@@ -369,17 +521,8 @@ fn onCreateSessionReply(
         return;
     }
     if (err) |e| {
+        defer gdbus.g_error_free(e);
         reportFailure(ctx, "CreateSession method failed: {s}", .{gerrorMessage(e)});
-        gdbus.g_error_free(e);
-        // No portal backend present (or GlobalShortcuts not implemented
-        // in this compositor's portal). Drop the create-Response watch
-        // so it doesn't leak — Activated stays subscribed harmlessly
-        // (it'll never fire without a session) and gets cleaned up in
-        // deinit.
-        if (ctx.create_response_sub_id != 0) {
-            gdbus.g_dbus_connection_signal_unsubscribe(ctx.connection, ctx.create_response_sub_id);
-            ctx.create_response_sub_id = 0;
-        }
     }
 }
 
@@ -395,6 +538,9 @@ fn onCreateSessionResponse(
     user_data: gpointer,
 ) callconv(.c) void {
     const ctx: *Context = @ptrCast(@alignCast(user_data orelse return));
+    _ = ctx.retain(); // the handler may retire its owner and subscriptions
+    defer ctx.release();
+    if (ctx.registration.retired or ctx.registration.outcome != null or ctx.create_response_sub_id == 0) return;
 
     // Response signal signature: (u status, a{sv} results).
     const status_v = gdbus.g_variant_get_child_value(parameters, 0);
@@ -424,10 +570,12 @@ fn onCreateSessionResponse(
     defer gdbus.g_variant_unref(session_handle_v);
 
     const session_str = std.mem.span(gdbus.g_variant_get_string(session_handle_v, null));
-    ctx.session_handle = ctx.allocator.dupeZ(u8, session_str) catch |e| {
+    const owned_session = ctx.allocator.dupeSentinel(u8, session_str, 0) catch |e| {
         reportFailure(ctx, "dup session_handle failed: {}", .{e});
         return;
     };
+    if (ctx.session_handle) |old| ctx.allocator.free(old);
+    ctx.session_handle = owned_session;
 
     bindShortcut(ctx) catch |e| {
         reportFailure(ctx, "BindShortcuts dispatch failed: {}", .{e});
@@ -443,8 +591,14 @@ fn onBindShortcutsReply(
     user_data: gpointer,
 ) callconv(.c) void {
     const ctx: *Context = @ptrCast(@alignCast(user_data orelse return));
+    defer ctx.release();
     var err: ?*GError = null;
     const reply = gdbus.g_dbus_connection_call_finish(ctx.connection, res, &err);
+    if (ctx.registration.retired or ctx.registration.outcome != null) {
+        if (reply) |r| gdbus.g_variant_unref(r);
+        if (err) |e| gdbus.g_error_free(e);
+        return;
+    }
     if (reply) |r| {
         defer gdbus.g_variant_unref(r);
         if (ctx.bind_request_path) |*bind_path| {
@@ -481,6 +635,7 @@ fn reconcileRequestPath(
     sub_id_slot: *c_uint,
     callback: gdbus.GDBusSignalCallback,
 ) void {
+    if (sub_id_slot.* == 0) return; // Response already consumed before ack
     const path_v = gdbus.g_variant_get_child_value(reply, 0);
     defer gdbus.g_variant_unref(path_v);
     const canonical_z = gdbus.g_variant_get_string(path_v, null);
@@ -498,8 +653,8 @@ fn reconcileRequestPath(
         sub_id_slot.* = 0;
     }
 
-    const owned = ctx.allocator.dupeZ(u8, canonical) catch |e| {
-        std.debug.print("hotkey: failed to dup canonical {s} path: {} — Response signal will be missed\n", .{ label, e });
+    const owned = ctx.allocator.dupeSentinel(u8, canonical, 0) catch |e| {
+        reportFailure(ctx, "failed to dup canonical {s} path: {}", .{ label, e });
         return;
     };
     ctx.allocator.free(path_slot.*);
@@ -514,8 +669,8 @@ fn reconcileRequestPath(
         null,
         0,
         callback,
-        ctx,
-        null,
+        ctx.retain(),
+        @ptrCast(&releaseData),
     );
 }
 
@@ -531,6 +686,9 @@ fn onBindShortcutsResponse(
     user_data: gpointer,
 ) callconv(.c) void {
     const ctx: *Context = @ptrCast(@alignCast(user_data orelse return));
+    _ = ctx.retain();
+    defer ctx.release();
+    if (ctx.registration.retired or ctx.registration.outcome != null or ctx.bind_response_sub_id == 0) return;
 
     if (ctx.bind_response_sub_id != 0) {
         gdbus.g_dbus_connection_signal_unsubscribe(ctx.connection, ctx.bind_response_sub_id);
@@ -552,18 +710,29 @@ fn onBindShortcutsResponse(
     }
 }
 
-/// Activated signal handler. Single shortcut id, so we don't bother
-/// extracting `shortcut_id` from the parameters tuple.
+/// The session bus connection is shared. Only dispatch our session's
+/// "toggle" signal, never another application's or a stale session's.
 fn onActivated(
     _: *GDBusConnection,
     _: ?[*:0]const u8,
     _: [*:0]const u8,
     _: [*:0]const u8,
     _: [*:0]const u8,
-    _: *GVariant,
+    parameters: *GVariant,
     user_data: gpointer,
 ) callconv(.c) void {
     const ctx: *Context = @ptrCast(@alignCast(user_data orelse return));
+    _ = ctx.retain();
+    defer ctx.release();
+    if (ctx.registration.retired or ctx.registration.outcome != .bound) return;
+    const session = ctx.session_handle orelse return;
+    if (gdbus.g_variant_is_of_type(parameters, vt("(osta{sv})")) == 0) return;
+    const session_v = gdbus.g_variant_get_child_value(parameters, 0);
+    defer gdbus.g_variant_unref(session_v);
+    const shortcut_v = gdbus.g_variant_get_child_value(parameters, 1);
+    defer gdbus.g_variant_unref(shortcut_v);
+    if (!std.mem.eql(u8, std.mem.span(gdbus.g_variant_get_string(session_v, null)), session)) return;
+    if (!std.mem.eql(u8, std.mem.span(gdbus.g_variant_get_string(shortcut_v, null)), "toggle")) return;
     ctx.handler.on_activated(ctx.handler.ctx);
 }
 
@@ -586,8 +755,8 @@ fn bindShortcut(ctx: *Context) !void {
         null,
         0,
         &onBindShortcutsResponse,
-        ctx,
-        null,
+        ctx.retain(),
+        @ptrCast(&releaseData),
     );
 
     const session_handle = ctx.session_handle orelse return error.NoSessionHandle;
@@ -597,6 +766,7 @@ fn bindShortcut(ctx: *Context) !void {
         ctx.handle_token_bind,
     );
 
+    _ = ctx.retain();
     gdbus.g_dbus_connection_call(
         ctx.connection,
         "org.freedesktop.portal.Desktop",
@@ -607,7 +777,7 @@ fn bindShortcut(ctx: *Context) !void {
         vt("(o)"),
         0,
         PORTAL_CALL_TIMEOUT_MS,
-        null,
+        ctx.cancellable,
         &onBindShortcutsReply,
         ctx,
     );
@@ -708,6 +878,15 @@ fn computeRequestPath(
     unique_name: []const u8,
     handle_token: []const u8,
 ) ![:0]u8 {
+    return computeObjectPath(allocator, "request", unique_name, handle_token);
+}
+
+fn computeObjectPath(
+    allocator: std.mem.Allocator,
+    kind: []const u8,
+    unique_name: []const u8,
+    handle_token: []const u8,
+) ![:0]u8 {
     const start: usize = if (unique_name.len > 0 and unique_name[0] == ':') 1 else 0;
     const trimmed = unique_name[start..];
 
@@ -719,8 +898,8 @@ fn computeRequestPath(
 
     return try std.fmt.allocPrintSentinel(
         allocator,
-        "/org/freedesktop/portal/desktop/request/{s}/{s}",
-        .{ underscored, handle_token },
+        "/org/freedesktop/portal/desktop/{s}/{s}/{s}",
+        .{ kind, underscored, handle_token },
         0,
     );
 }
@@ -786,7 +965,7 @@ fn translateTrigger(allocator: std.mem.Allocator, djinn_trigger: []const u8) ![:
         }
     }
 
-    return try allocator.dupeZ(u8, buf[0..len]);
+    return try allocator.dupeSentinel(u8, buf[0..len], 0);
 }
 
 /// Case-insensitive modifier name → portal canonical form. Returns null
@@ -806,13 +985,65 @@ fn mapModifier(name: []const u8) ?[]const u8 {
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
+test "registration delivers only one outcome and nothing after retirement" {
+    var success = Registration{};
+    try std.testing.expect(success.finish(.bound));
+    try std.testing.expect(!success.finish(.failed));
+    var failure = Registration{};
+    try std.testing.expect(failure.finish(.failed));
+    try std.testing.expect(!failure.finish(.bound));
+    var retired = Registration{ .retired = true };
+    try std.testing.expect(!retired.finish(.bound));
+    try std.testing.expect(!retired.finish(.failed));
+}
+
+test "callback frame keeps retired context alive after owner and subscriptions detach" {
+    var refs = References{}; // owner
+    refs.retain(); // async method completion
+    refs.retain(); // signal subscription
+    refs.retain(); // active callback frame
+    var registration = Registration{};
+    registration.retired = true; // handler deinitializes its own Hotkey
+    try std.testing.expect(!refs.release()); // owner
+    try std.testing.expect(!refs.release()); // subscription destroy notify
+    try std.testing.expect(!refs.release()); // cancelled method completion
+    try std.testing.expect(!registration.finish(.bound));
+    try std.testing.expectEqual(@as(usize, 1), refs.count);
+    try std.testing.expect(refs.release()); // only callback return can free
+}
+
+test "portal tokens differ for live attempts and request roles" {
+    const a = std.testing.allocator;
+    const first = try allocateAttempt();
+    const second = try allocateAttempt();
+    try std.testing.expect(second > first);
+    var tokens: [6][:0]u8 = undefined;
+    var used: usize = 0;
+    defer for (tokens[0..used]) |token| a.free(token);
+    for ([_]u64{ first, second }) |attempt| {
+        for ([_]TokenKind{ .session, .create, .bind }) |kind| {
+            const token = try makeToken(a, kind, 42, attempt);
+            tokens[used] = token;
+            for (tokens[0..used]) |previous| try std.testing.expect(!std.mem.eql(u8, previous, token));
+            used += 1;
+            for (token) |ch| try std.testing.expect(std.ascii.isAlphanumeric(ch) or ch == '_');
+        }
+    }
+    const session = try computeObjectPath(a, "session", ":1.42", tokens[0]);
+    defer a.free(session);
+    try std.testing.expect(std.mem.startsWith(u8, session, "/org/freedesktop/portal/desktop/session/1_42/djinn_session_42_"));
+}
+
+test "Hotkey native API compiles without requesting a shortcut" {
+    if (builtin.os.tag == .linux) std.testing.refAllDecls(Hotkey);
+}
+
 test "translateTrigger maps modifiers and lowercases key" {
-    if (builtin.os.tag != .linux) return;
     const a = std.testing.allocator;
 
-    const t1 = try translateTrigger(a, "ctrl+space");
+    const t1 = try translateTrigger(a, "ctrl+shift+space");
     defer a.free(t1);
-    try std.testing.expectEqualStrings("CTRL+space", t1);
+    try std.testing.expectEqualStrings("CTRL+SHIFT+space", t1);
 
     const t2 = try translateTrigger(a, "Alt+Grave");
     defer a.free(t2);
@@ -829,7 +1060,6 @@ test "translateTrigger maps modifiers and lowercases key" {
 }
 
 test "translateTrigger rejects empty tokens" {
-    if (builtin.os.tag != .linux) return;
     const a = std.testing.allocator;
     try std.testing.expectError(error.EmptyToken, translateTrigger(a, "ctrl++space"));
     try std.testing.expectError(error.EmptyToken, translateTrigger(a, "+space"));
@@ -837,7 +1067,6 @@ test "translateTrigger rejects empty tokens" {
 }
 
 test "computeRequestPath strips colon and rewrites dots" {
-    if (builtin.os.tag != .linux) return;
     const a = std.testing.allocator;
     const path = try computeRequestPath(a, ":1.234", "tok42");
     defer a.free(path);
@@ -848,7 +1077,6 @@ test "computeRequestPath strips colon and rewrites dots" {
 }
 
 test "computeRequestPath tolerates a name without leading colon" {
-    if (builtin.os.tag != .linux) return;
     const a = std.testing.allocator;
     const path = try computeRequestPath(a, "org.example.Foo", "x");
     defer a.free(path);

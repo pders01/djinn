@@ -1,7 +1,7 @@
 [Desktop Entry]
 Type=Application
 Name=djinn
-Comment=Drop-down terminal panel + MCP agent surface
+Comment=Quake-style drop-down terminal (GTK4/VTE)
 # Exec is intentionally bare, not absolute. The same .desktop ships
 # from `zig build install --prefix /usr -Dsystem-install=true` (Arch /
 # Debian land it at /usr/share/applications/djinn.desktop with
@@ -17,7 +17,7 @@ Terminal=false
 # TerminalEmulator surfaces djinn in "Open in Terminal" menus on
 # file managers that key off this category. djinn isn't a general-
 # purpose terminal MIME handler (no `MimeType=` line) — the
-# drop-down + agent-surface use case is launcher-driven, not
+# drop-down terminal use case is launcher-driven, not
 # file-manager-driven, so we deliberately omit it.
 Categories=Utility;TerminalEmulator;
 # StartupNotify=true: GTK4 emits the startup notification ID

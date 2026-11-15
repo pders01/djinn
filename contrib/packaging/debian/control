@@ -5,7 +5,7 @@ Maintainer: Paul Derscheid <paulderscheid@gmail.com>
 Build-Depends:
  debhelper-compat (= 13),
  pkg-config,
- libgtk-4-dev,
+ libgtk-4-dev (>= 4.12),
  libgtk4-layer-shell-dev,
  libvte-2.91-gtk4-dev,
  libglib2.0-dev,
@@ -13,12 +13,11 @@ Standards-Version: 4.6.0
 Homepage: https://github.com/derscheid/djinn
 Rules-Requires-Root: no
 
-# zig 0.15+ isn't in any Debian / Ubuntu release archive yet, so we
-# can't list it as a Build-Depends — the resolver would reject the
-# source. Builders need a zig binary on PATH before `dpkg-buildpackage`
-# runs (asdf, snap, or a manual download from ziglang.org). The
-# `debian/rules` invocation uses `$(ZIG)` so a custom path can be
-# threaded in with e.g. `DEB_BUILD_OPTIONS=… ZIG=/opt/zig/zig`.
+# Builders must supply exactly Zig 0.17.1 before dpkg-buildpackage.
+# This local packaging recipe does not assume the distribution archive
+# carries that compiler. debian/rules validates $(ZIG); override with
+# ZIG=/opt/zig-0.17.1/zig if necessary. Ubuntu 24.04 also needs a local
+# libgtk4-layer-shell-dev package (or use the CI source-build recipe).
 
 Package: djinn
 Architecture: any
@@ -32,12 +31,11 @@ Depends:
 Recommends:
  xdg-desktop-portal-kde | xdg-desktop-portal-hyprland | xdg-desktop-portal-wlr,
 Suggests:
- libnotify-bin,
  socat,
-Description: Drop-down terminal panel + MCP agent surface (Wayland)
- djinn is a Quake-style drop-down terminal that doubles as an
- agent-host surface. The MCP server exposes notification + log tools
- to Claude / Codex sessions running in the embedded shell.
- GlobalShortcuts via xdg-desktop-portal; falls back to a Unix socket
- bridge for compositors without a portal backend (KDE Plasma,
- Hyprland, sway / wlroots-likes are the tested matrix).
+Description: Quake-style drop-down terminal (GTK4/VTE, Wayland)
+ djinn uses GTK4 and VTE with optional layer-shell positioning on
+ compatible Wayland compositors. It reads Ghostty-compatible terminal
+ configuration and themes; it does not link libghostty on Linux.
+ GlobalShortcuts uses xdg-desktop-portal, with a Unix socket bridge
+ for compositor hotkey bindings. Desktop launch and the systemd user
+ unit are optional; the package does not enable autostart.

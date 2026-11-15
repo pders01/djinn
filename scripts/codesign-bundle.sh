@@ -2,14 +2,13 @@
 #
 # Sign Djinn.app with a stable identity if one's available, else fall
 # back to ad-hoc. A stable identity keeps the bundle's designated
-# requirement constant across rebuilds, so macOS's TCC database
-# preserves Accessibility / Input Monitoring grants instead of treating
-# every new cdhash as a new app.
+# requirement constant across rebuilds. This is optional packaging setup,
+# not a permission requirement for the native global hotkey.
 #
 # Identity is `DjinnLocalDev` (created by `scripts/dev-cert-create.sh`)
 # unless `DJINN_SIGN_IDENTITY` overrides. Falls back to ad-hoc when
-# neither is found — local builds still launch, but every install-app
-# burns TCC grants as before.
+# neither is found. To sign without keychain access, use a direct
+# `codesign --sign -` instead of this helper.
 
 set -euo pipefail
 

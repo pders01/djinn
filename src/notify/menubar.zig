@@ -1,33 +1,28 @@
 const std = @import("std");
 const objc = @import("objc");
-const app_state = @import("../app.zig");
-
+const platform = @import("../io/platform.zig");
 pub const NSSize = extern struct { width: f64, height: f64 };
 pub const NSPoint = extern struct { x: f64, y: f64 };
-
-pub const AgentState = enum {
-    idle,
-    working,
-    attention,
-    done,
-    @"error",
-};
 
 /// Action handlers wired by main after the Panel is created. Cocoa method
 /// callbacks can't capture Zig context; we route via globals.
 var g_show_hide_handler: ?*const fn () void = null;
 
-/// Idle-state brand mark: Arabic letters jīm + nūn (= "djinn"). CoreText
+/// Brand mark: Arabic letters jīm + nūn (= "djinn"). CoreText
 /// shapes the contextual joining via NSAttributedString → drawAtPoint, so
 /// no HarfBuzz dependency required. setTemplate:1 makes AppKit re-tint to
 /// the menubar foreground color (light/dark-mode aware).
 const brand_text: [:0]const u8 = "جن";
 
-/// Menu bar status item showing djinn agent state with a dropdown menu:
-/// status line, show/hide, copy MCP config, quit.
+/// Main-thread-only status item: brand, active session, show/hide,
+/// settings, and quit. No process- or application-specific status policy.
 pub const Menubar = struct {
+    /// Explicit +1 reference, independent of NSStatusBar/autorelease lifetime.
     status_item: ?objc.Object = null,
-    state_menu_item: ?objc.Object = null,
+    /// Borrowed from the menu retained by status_item.
+    session_menu_item: ?objc.Object = null,
+    /// Owned +1: NSMenuItem targets are not retained by AppKit.
+    controller: ?objc.Object = null,
 
     pub fn init() Menubar {
         registerControllerClass();
@@ -41,18 +36,23 @@ pub const Menubar = struct {
             .{@as(f64, -1)},
         );
 
-        // Idle = Arabic brand mark; non-idle states swap to SF Symbols for
-        // status semantics (spinner, warning, check, X). Both render as
-        // template images so menubar tinting Just Works.
+        if (status_item.value == null) return .{};
+        _ = status_item.msgSend(objc.Object, "retain", .{});
+
+        // A static template image lets AppKit handle light/dark tinting.
         const button = status_item.msgSend(objc.Object, "button", .{});
         setBrandImage(button);
 
-        const menu = buildMenu();
-        const state_item = menu.msgSend(objc.Object, "itemAtIndex:", .{@as(c_long, 0)});
+        const built = buildMenu();
+        // setMenu: retains the menu; transfer the controller's +1 to Menubar.
+        defer built.menu.msgSend(void, "release", .{});
+        const session_item = built.menu.msgSend(objc.Object, "itemAtIndex:", .{@as(c_long, 0)});
 
-        status_item.msgSend(void, "setMenu:", .{menu});
+        status_item.msgSend(void, "setMenu:", .{built.menu});
 
-        return .{ .status_item = status_item, .state_menu_item = state_item };
+        var result = Menubar{ .status_item = status_item, .session_menu_item = session_item, .controller = built.controller };
+        result.refresh();
+        return result;
     }
 
     pub fn setShowHideHandler(self: *Menubar, handler: *const fn () void) void {
@@ -60,68 +60,52 @@ pub const Menubar = struct {
         g_show_hide_handler = handler;
     }
 
-    pub fn updateState(self: *Menubar, state: AgentState, message: []const u8) void {
-        const item = self.status_item orelse return;
-        const button = item.msgSend(objc.Object, "button", .{});
-        if (state == .idle) {
-            setBrandImage(button);
-        } else {
-            setSymbolImage(button, stateSymbol(state));
+    /// Refresh after session activation/removal and after publishing the
+    /// session manager at startup. Keep the app import inside the method:
+    /// AppState stores a Menubar pointer, so type layout must not need app.g.
+    pub fn refresh(self: *Menubar) void {
+        const mi = self.session_menu_item orelse return;
+        const app = @import("../app.zig");
+        var label: []const u8 = "No active session";
+        if (app.g.session_manager) |sm| {
+            if (sm.sessions.items.len > 0) label = sm.active().label();
         }
-
-        if (self.state_menu_item) |mi| {
-            const NSString = objc.getClass("NSString") orelse return;
-            // Suffix the active profile label only when more than one
-            // profile is configured — the indicator is the only
-            // visual feedback for which session is up front, so it
-            // matters under multi-profile and is noise otherwise.
-            var profile_label: []const u8 = "";
-            if (app_state.g.session_manager) |sm| {
-                if (sm.sessions.items.len > 1) profile_label = sm.active().profile.label();
-            }
-            var buf: [256]u8 = undefined;
-            const txt = std.fmt.bufPrintZ(&buf, "{s}{s}{s}{s}{s}", .{
-                stateLabel(state),
-                if (message.len > 0) " — " else "",
-                message,
-                if (profile_label.len > 0) " · " else "",
-                profile_label,
-            }) catch return;
-            const title = NSString.msgSend(
-                objc.Object,
-                "stringWithUTF8String:",
-                .{@as([*c]const u8, txt.ptr)},
-            );
-            mi.msgSend(void, "setTitle:", .{title});
-        }
-    }
-
-    fn stateSymbol(state: AgentState) [:0]const u8 {
-        return switch (state) {
-            .idle => "terminal",
-            .working => "arrow.triangle.2.circlepath",
-            .attention => "exclamationmark.triangle.fill",
-            .done => "checkmark.circle.fill",
-            .@"error" => "xmark.octagon.fill",
-        };
-    }
-
-    fn stateLabel(state: AgentState) [:0]const u8 {
-        return switch (state) {
-            .idle => "Idle",
-            .working => "Working",
-            .attention => "Needs attention",
-            .done => "Done",
-            .@"error" => "Error",
-        };
+        const NSString = objc.getClass("NSString") orelse return;
+        // Length-aware conversion copies the label without a temporary
+        // sentinel buffer or splitting a UTF-8 codepoint at a byte cap.
+        const title = NSString.msgSend(objc.Object, "alloc", .{}).msgSend(
+            objc.Object,
+            "initWithBytes:length:encoding:",
+            .{ label.ptr, @as(c_ulong, @intCast(label.len)), @as(c_ulong, 4) }, // NSUTF8StringEncoding
+        );
+        if (title.value == null) return;
+        defer title.msgSend(void, "release", .{});
+        mi.msgSend(void, "setTitle:", .{title});
     }
 
     pub fn deinit(self: *Menubar) void {
+        self.session_menu_item = null;
         if (self.status_item) |item| {
-            const NSStatusBar = objc.getClass("NSStatusBar") orelse return;
-            const status_bar = NSStatusBar.msgSend(objc.Object, "systemStatusBar", .{});
-            status_bar.msgSend(void, "removeStatusItem:", .{item});
+            const menu = item.msgSend(objc.Object, "menu", .{});
+            if (menu.value != null) {
+                // Clear non-retained targets before releasing the controller,
+                // even if AppKit temporarily keeps the menu/items alive.
+                const count = menu.msgSend(c_long, "numberOfItems", .{});
+                var i: c_long = 0;
+                while (i < count) : (i += 1) {
+                    const mi = menu.msgSend(objc.Object, "itemAtIndex:", .{i});
+                    mi.msgSend(void, "setTarget:", .{@as(?*anyopaque, null)});
+                }
+            }
+            item.msgSend(void, "setMenu:", .{@as(?*anyopaque, null)});
+            if (objc.getClass("NSStatusBar")) |NSStatusBar| {
+                const status_bar = NSStatusBar.msgSend(objc.Object, "systemStatusBar", .{});
+                status_bar.msgSend(void, "removeStatusItem:", .{item});
+            }
+            item.msgSend(void, "release", .{});
         }
+        if (self.controller) |ctrl| ctrl.msgSend(void, "release", .{});
+        self.* = .{};
     }
 
     /// Toggle status-item presence at runtime. Used by config-reload
@@ -134,19 +118,13 @@ pub const Menubar = struct {
         if (on) {
             self.* = Menubar.init();
         } else {
-            const NSStatusBar = objc.getClass("NSStatusBar") orelse return;
-            const status_bar = NSStatusBar.msgSend(objc.Object, "systemStatusBar", .{});
-            if (self.status_item) |item|
-                status_bar.msgSend(void, "removeStatusItem:", .{item});
-            self.status_item = null;
-            self.state_menu_item = null;
+            self.deinit();
         }
     }
 };
 
 /// Render brand_text as a template NSImage using NSAttributedString. Uses
-/// the system font at the menubar's icon point size so the glyphs match
-/// height with sibling SF Symbols when a state flip swaps the image.
+/// the system font at the menubar's icon point size.
 fn setBrandImage(button: objc.Object) void {
     const NSString = objc.getClass("NSString") orelse return;
     const NSImage = objc.getClass("NSImage") orelse return;
@@ -186,12 +164,16 @@ fn setBrandImage(button: objc.Object) void {
         .{ text, attrs },
     );
 
+    defer attr.msgSend(void, "release", .{});
+
     var size = attr.msgSend(NSSize, "size", .{});
     size.width = @ceil(size.width);
     size.height = @ceil(size.height);
 
     const img_alloc = NSImage.msgSend(objc.Object, "alloc", .{});
     const img = img_alloc.msgSend(objc.Object, "initWithSize:", .{size});
+    // The button retains its image; release our alloc/init reference.
+    defer img.msgSend(void, "release", .{});
 
     img.msgSend(void, "lockFocus", .{});
     attr.msgSend(void, "drawAtPoint:", .{NSPoint{ .x = 0, .y = 0 }});
@@ -201,36 +183,12 @@ fn setBrandImage(button: objc.Object) void {
     button.msgSend(void, "setImage:", .{img});
 }
 
-fn setSymbolImage(button: objc.Object, symbol: [:0]const u8) void {
-    const NSString = objc.getClass("NSString") orelse return;
-    const NSImage = objc.getClass("NSImage") orelse return;
-    const name = NSString.msgSend(
-        objc.Object,
-        "stringWithUTF8String:",
-        .{@as([*c]const u8, symbol.ptr)},
-    );
-    const img = NSImage.msgSend(
-        objc.Object,
-        "imageWithSystemSymbolName:accessibilityDescription:",
-        .{ name, @as(?*anyopaque, null) },
-    );
-    if (img.value == null) {
-        // SF Symbols missing on older macOS: fall back to a literal title.
-        button.msgSend(void, "setTitle:", .{name});
-        return;
-    }
-    img.msgSend(void, "setTemplate:", .{@as(c_int, 1)});
-    button.msgSend(void, "setImage:", .{img});
-}
+/// Both fields carry +1 references; the caller transfers controller to
+/// Menubar and releases menu after the status item retains it.
+const BuiltMenu = struct { menu: objc.Object, controller: objc.Object };
 
-/// Build the dropdown NSMenu. Items in order:
-///   0. Status line (disabled, updated by updateState)
-///   1. Separator
-///   2. Show / Hide djinn  (Cmd-toggle hint shown via key equivalent)
-///   3. Copy MCP config
-///   4. Separator
-///   5. Quit
-fn buildMenu() objc.Object {
+/// Build the dropdown: active session, show/hide, settings, and quit.
+fn buildMenu() BuiltMenu {
     const NSMenu = objc.getClass("NSMenu") orelse unreachable;
     const NSMenuItem = objc.getClass("NSMenuItem") orelse unreachable;
     const NSString = objc.getClass("NSString") orelse unreachable;
@@ -242,14 +200,15 @@ fn buildMenu() objc.Object {
 
     const ctrl = Controller.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "init", .{});
 
-    // 0. Status line (disabled)
+    // Active session label (informational).
     const status = NSMenuItem.msgSend(objc.Object, "alloc", .{}).msgSend(
         objc.Object,
         "initWithTitle:action:keyEquivalent:",
-        .{ ns(NSString, "Idle"), @as(?*anyopaque, null), ns(NSString, "") },
+        .{ ns(NSString, "No active session"), @as(?*anyopaque, null), ns(NSString, "") },
     );
     status.msgSend(void, "setEnabled:", .{@as(c_int, 0)});
     menu.msgSend(void, "addItem:", .{status});
+    status.msgSend(void, "release", .{}); // NSMenu retains its items.
 
     menu.msgSend(void, "addItem:", .{NSMenuItem.msgSend(objc.Object, "separatorItem", .{})});
 
@@ -261,15 +220,7 @@ fn buildMenu() objc.Object {
     );
     showhide.msgSend(void, "setTarget:", .{ctrl});
     menu.msgSend(void, "addItem:", .{showhide});
-
-    // 3. Copy MCP config
-    const copy = NSMenuItem.msgSend(objc.Object, "alloc", .{}).msgSend(
-        objc.Object,
-        "initWithTitle:action:keyEquivalent:",
-        .{ ns(NSString, "Copy MCP config to clipboard"), objc.sel("copyMcpConfig:"), ns(NSString, "") },
-    );
-    copy.msgSend(void, "setTarget:", .{ctrl});
-    menu.msgSend(void, "addItem:", .{copy});
+    showhide.msgSend(void, "release", .{});
 
     // 4. Settings… (Cmd+,) — keyEquivalent string + default modifier mask
     // (Cmd) means the menu shows the standard shortcut hint and AppKit
@@ -282,6 +233,7 @@ fn buildMenu() objc.Object {
     );
     settings.msgSend(void, "setTarget:", .{ctrl});
     menu.msgSend(void, "addItem:", .{settings});
+    settings.msgSend(void, "release", .{});
 
     menu.msgSend(void, "addItem:", .{NSMenuItem.msgSend(objc.Object, "separatorItem", .{})});
 
@@ -293,8 +245,9 @@ fn buildMenu() objc.Object {
     );
     quit.msgSend(void, "setTarget:", .{ctrl});
     menu.msgSend(void, "addItem:", .{quit});
+    quit.msgSend(void, "release", .{});
 
-    return menu;
+    return .{ .menu = menu, .controller = ctrl };
 }
 
 fn ns(NSString: objc.Class, str: [:0]const u8) objc.Object {
@@ -313,7 +266,6 @@ fn registerControllerClass() void {
     const superclass = objc.getClass("NSObject") orelse return;
     const cls = objc.allocateClassPair(superclass, "DjinnMenuController") orelse return;
     _ = cls.addMethod("showHide:", showHideImpl);
-    _ = cls.addMethod("copyMcpConfig:", copyMcpConfigImpl);
     _ = cls.addMethod("openSettings:", openSettingsImpl);
     _ = cls.addMethod("quit:", quitImpl);
     objc.registerClassPair(cls);
@@ -321,35 +273,6 @@ fn registerControllerClass() void {
 
 fn showHideImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
     if (g_show_hide_handler) |h| h();
-}
-
-fn copyMcpConfigImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
-    const home = std.posix.getenv("HOME") orelse return;
-    const allocator = std.heap.page_allocator;
-    const path = std.mem.concat(allocator, u8, &.{ home, "/.config/djinn/mcp.json" }) catch return;
-    defer allocator.free(path);
-
-    const file = std.fs.openFileAbsolute(path, .{}) catch return;
-    defer file.close();
-    const contents = file.readToEndAllocOptions(allocator, 64 * 1024, null, .of(u8), 0) catch return;
-    defer allocator.free(contents);
-
-    const NSPasteboard = objc.getClass("NSPasteboard") orelse return;
-    const pb = NSPasteboard.msgSend(objc.Object, "generalPasteboard", .{});
-    _ = pb.msgSend(c_long, "clearContents", .{});
-
-    const NSString = objc.getClass("NSString") orelse return;
-    const ns_str = NSString.msgSend(
-        objc.Object,
-        "stringWithUTF8String:",
-        .{@as([*c]const u8, contents.ptr)},
-    );
-    const type_name = NSString.msgSend(
-        objc.Object,
-        "stringWithUTF8String:",
-        .{@as([*c]const u8, "public.utf8-plain-text")},
-    );
-    _ = pb.msgSend(c_int, "setString:forType:", .{ ns_str, type_name });
 }
 
 fn openSettingsImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
@@ -363,100 +286,66 @@ fn openSettingsImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void
 /// Plain `[NSWorkspace openURL:]` defers to LaunchServices' default for
 /// the file's UTI; the `-t` flag forces the system default text editor.
 pub fn openSettings() void {
-    const home = std.posix.getenv("HOME") orelse return;
+    const home = platform.getenv("HOME") orelse return;
+    const io = platform.io();
     const allocator = std.heap.page_allocator;
     const dir = std.mem.concat(allocator, u8, &.{ home, "/.config/djinn" }) catch return;
     defer allocator.free(dir);
     const path = std.mem.concat(allocator, u8, &.{ dir, "/config" }) catch return;
     defer allocator.free(path);
 
-    std.fs.makeDirAbsolute(dir) catch {};
-    if (std.fs.accessAbsolute(path, .{})) {} else |_| {
-        if (std.fs.createFileAbsolute(path, .{})) |f| {
-            defer f.close();
-            f.writeAll(default_config_skeleton) catch {};
-        } else |_| {}
+    std.Io.Dir.cwd().createDirPath(io, dir) catch |err| {
+        std.debug.print("warning: cannot create settings directory: {}\n", .{err});
+        return;
+    };
+    if (std.Io.Dir.accessAbsolute(io, path, .{})) {} else |err| {
+        if (err != error.FileNotFound) {
+            std.debug.print("warning: cannot access settings: {}\n", .{err});
+            return;
+        }
+        const f = std.Io.Dir.createFileAbsolute(io, path, .{ .exclusive = true }) catch |create_err| {
+            std.debug.print("warning: cannot create settings: {}\n", .{create_err});
+            return;
+        };
+        defer f.close(io);
+        f.writeStreamingAll(io, default_config_skeleton) catch |write_err| {
+            std.debug.print("warning: cannot write settings: {}\n", .{write_err});
+            return;
+        };
     }
 
-    var child = std.process.Child.init(
-        &.{ "/usr/bin/open", "-t", path },
-        allocator,
-    );
-    child.spawn() catch return;
-    _ = child.wait() catch {};
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "/usr/bin/open", "-t", path },
+    }) catch return;
+    _ = child.wait(io) catch {};
 }
 
-/// ghostty-style key=value config. Comments start with `#` at column 0
-/// (inline `#` reserved for hex). Unknown keys log a warning.
+/// Mirrored in config/default.conf. The module root is src/, so embedding
+/// ../../config/default.conf would escape the Zig package. Keep this small.
 const default_config_skeleton =
-    \\# djinn config
-    \\#
-    \\# Format mirrors ghostty's: `key = value` per line, `#` line comments.
-    \\# Settings menu (Cmd+,) reopens this file.
-    \\
-    \\# ─── Window ──────────────────────────────────────────────────
-    \\window-width = 800                  # pixels
-    \\window-height = 400                 # pixels
-    \\window-position = top_center        # 9-grid: {top,center,bottom}_{left,center,right}
-    \\#                                   # or `X,Y` in NSScreen coords (origin bottom-left, +Y up)
-    \\# window-position-x = 100           # manual override; takes effect when window-position is unset
-    \\# window-position-y = 200           # or specifies the named anchor only (X,Y form clears these)
-    \\window-toggle-style = instant       # instant | minimize
-    \\window-topmost = true               # bool — float above other windows
-    \\hide-on-blur = false                # bool — auto-hide on losing key focus
-    \\
-    \\# ─── Toggle hotkey ───────────────────────────────────────────
-    \\# Mods: cmd, ctrl, alt/option, shift. Key: any char or named key
-    \\# (grave, space, escape, return, tab, f1..f12, up/down/left/right).
-    \\hotkey = ctrl+space
-    \\
-    \\# ─── Provider (claude / codex / aider / gemini / opencode / crush / pi / generic) ───
-    \\provider = generic
-    \\# provider-command = /usr/local/bin/claude
-    \\
-    \\# ─── Terminal ────────────────────────────────────────────────
-    \\# font-family = IosevkaTerm Nerd Font Mono
-    \\# font-size = 13
-    \\# padding-x = 8
-    \\# padding-y = 8
-    \\# scrollback-size = 100000            # rows; unset → ghostty's 10M default
-    \\
-    \\# ─── Theme (overrides the values inherited from ghostty) ────
+    \\# djinn: key = value; Settings (Cmd+,) opens this file.
+    \\# No profiles required: start an ordinary default shell.
+    \\# Avoid macOS shortcut conflicts; change this if needed.
+    \\hotkey = ctrl+shift+space
+    \\window-width = 800
+    \\window-height = 400
+    \\window-position = top_center
     \\inherit-ghostty = true
-    \\# opacity = 0.95                    # 0.0 – 1.0
-    \\# background = #1e1e2e              # hex
-    \\# foreground = #cdd6f4              # hex
-    \\# cursor-color = #f5e0dc            # hex
-    \\
-    \\# ─── Log pane (toggle: Cmd+/) ───────────────────────────────
-    \\log-pane-enabled = false
-    \\log-pane-width-fraction = 0.28      # share of panel width
-    \\log-pane-width-min = 220            # pixel floor
-    \\log-pane-width-max = 360            # pixel ceiling
-    \\
-    \\# ─── System ──────────────────────────────────────────────────
-    \\open-at-login = false               # only effective from a signed .app bundle
-    \\
-    \\# ─── Bell ────────────────────────────────────────────────────
-    \\bell-audible = true                 # play sound on BEL (0x07)
-    \\bell-visual = false                 # brief alpha flash on the panel
-    \\bell-sound = Tink                   # name in /System/Library/Sounds or absolute path
-    \\
-    \\# ─── MCP server ──────────────────────────────────────────────
-    \\mcp-enabled = true                  # bool — listen on 127.0.0.1 for MCP clients
-    \\
-    \\# ─── Notifications ──────────────────────────────────────────
     \\system-notifications = true
+    \\notify-rate-limit-ms = 30000
     \\menubar-icon = true
-    \\attention-sound = Glass             # system sound name, "default", or absolute path
+    \\bell-audible = true
+    \\bell-visual = false
+    \\bell-sound = Tink
+    \\open-at-login = false
     \\
-    \\# ─── Keybinds ────────────────────────────────────────────────
-    \\# Format: keybind = action=trigger
-    \\# Actions: copy, paste, scroll_page_up, scroll_page_down,
-    \\#          font_inc, font_dec, font_reset, clear_scrollback,
-    \\#          open_settings, toggle_log_pane, palette_open,
-    \\#          tab_1..tab_9, next_tab, prev_tab
-    \\# keybind = clear_scrollback=cmd+l
+    \\# Optional static profiles; changes require an app restart.
+    \\# Launch precedence: script > command > default shell.
+    \\# Explicit invalid launch settings are errors, not shell fallbacks.
+    \\# default-profile = work
+    \\# profile.work.script = ~/.config/djinn/profiles/work.sh
+    \\# profile.work.cwd = ~/projects/work
+    \\# profile.work.title = Work
     \\
 ;
 
@@ -464,12 +353,4 @@ fn quitImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
     const NSApplication = objc.getClass("NSApplication") orelse return;
     const app = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
     app.msgSend(void, "terminate:", .{@as(?*anyopaque, null)});
-}
-
-test "stateSymbol: all states map" {
-    const states = [_]AgentState{ .idle, .working, .attention, .done, .@"error" };
-    for (states) |s| {
-        const sym = Menubar.stateSymbol(s);
-        try std.testing.expect(sym.len > 0);
-    }
 }

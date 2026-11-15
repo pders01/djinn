@@ -1,22 +1,7 @@
-# djinn — common dev tasks. Build recipes prefer the host's zig if it's
-# 0.15.2+; otherwise they fall through to `nix develop` so the bundled
-# flake can supply a compatible toolchain. scripts/build.sh applies the
-# ghostty darwin patch + unsets nix's Apple SDK overrides so xcrun
-# finds the system Metal toolchain.
-
-# Detect a compatible host zig at parse time. `sort -V -C` exits 0 when
-# its stdin is already in version-sorted order — so feeding it
-# `0.15.2\n<host>` succeeds iff host >= 0.15.2. When the check fails
-# (no zig, old zig, or version probe failed), wrap recipes with
-# `nix develop` so the flake's pinned zig_0_15 takes over.
-nix := if `command -v zig >/dev/null 2>&1 && printf '0.15.2\n%s\n' "$(zig version 2>/dev/null)" | sort -V -C 2>/dev/null && echo yes || echo no` == "yes" { "bash -c" } else { "nix develop --command bash -c" }
-
-# Arch-native zig: prefer the AUR `zig0.15` binary at /usr/bin/zig-0.15
-# (matches contrib/packaging/arch/PKGBUILD's makedepend), fall back to
-# the nix dev shell when AUR isn't installed. The plain `zig` binary
-# on Arch is the stock 0.16 package, which ghostty's `requireZig`
-# rejects with a @compileError — never use it directly.
-arch_zig := if `command -v zig-0.15 >/dev/null 2>&1 && echo yes || echo no` == "yes" { "zig-0.15" } else { "nix develop --command zig" }
+# djinn — common dev tasks. Build recipes use the locked Nix environment
+# and Zig 0.17.1 rather than accepting an incompatible host compiler.
+# scripts/build.sh applies the Ghostty patch and preserves SDK discovery.
+nix := "nix develop --command bash -c"
 
 default:
     @just --list
@@ -25,7 +10,7 @@ default:
 build *args:
     {{nix}} './scripts/build.sh {{args}}'
 
-# Run unit suite (config, theme, MCP dispatch+tools, hotkey, …).
+# Run unit suite (config, theme, hotkey, …).
 test *args:
     {{nix}} './scripts/build.sh test {{args}}'
 
@@ -41,7 +26,7 @@ release:
 bundle:
     {{nix}} './scripts/build.sh bundle'
 
-# Build + ad-hoc codesign Djinn.app for Gatekeeper.
+# Build and locally sign Djinn.app.
 sign:
     {{nix}} './scripts/build.sh bundle-sign'
 
@@ -53,15 +38,13 @@ install-app:
 # .desktop entry, and systemd user unit under /usr/local. Pacman does
 # not track these; for a tracked install use the PKGBUILD at
 # contrib/packaging/arch/ (slower — makepkg clones from GitHub).
-# Bypasses scripts/build.sh because its `PATH=/usr/bin:$PATH` prefix
-# is darwin-specific (Metal Toolchain discovery) and would shadow the
-# AUR zig0.15 with Arch's stock zig 0.16 on linux. The ghostty patch
-# is also darwin-only, so we skip it here.
+# Uses the same pinned Zig 0.17.1 dev shell and platform-aware wrapper.
+# Neither desktop launch nor the user unit is automatically enabled.
 # After install, run `systemctl --user daemon-reload` to pick up the
 # user unit, and ensure `/usr/local/bin` is on $PATH.
 # Arch (and Arch-likes): build ReleaseSafe + sudo-install under /usr/local.
 install-arch:
-    {{arch_zig}} build -Doptimize=ReleaseSafe
+    {{nix}} './scripts/build.sh -Doptimize=ReleaseSafe'
     sudo install -Dm755 zig-out/bin/djinn /usr/local/bin/djinn
     sudo install -Dm644 contrib/packaging/djinn.desktop /usr/local/share/applications/djinn.desktop
     # The packaged unit has ExecStart=/usr/bin/djinn (the AUR install
@@ -91,34 +74,34 @@ clean:
 profile duration="10":
     ./scripts/profile.sh {{duration}}
 
-# Reset TCC grants so next launch re-prompts for Accessibility + PostEvent.
-tcc-reset:
-    tccutil reset All com.pders01.djinn
-
 # One-shot install of a stable self-signed code-signing identity in the
-# user's login keychain. Re-running is safe; a present + valid identity
-# short-circuits. After this, every `install-app` rebuilds with a stable
-# designated requirement so TCC grants persist instead of burning on
-# each cdhash change.
+# user's login keychain. Review the helper first: it changes keychain and
+# trust settings and may remove a prior certificate with the same name.
+# Native shortcut registration does not require this identity.
+# Create an optional local signing identity (mutates the keychain).
 dev-cert:
     ./scripts/dev-cert-create.sh
 
-# Smoke loop: build + test in one shot.
-check: build test
+# Compile-check the platform host without linking Ghostty/GTK or invoking Metal.
+# Cross-check Linux on Mac: just compile-check -Dtarget=x86_64-linux-gnu.
+compile-check *args:
+    {{nix}} './scripts/build.sh check {{args}}'
+
+# Fast validation loop; use bundle separately for full linkage/Metal checks.
+check: compile-check test
 
 # One-shot deploy: build + sign + rsync the bundle, kill any running
 # instance, relaunch via `open`. The killall step is the important
 # bit: `open` brings an already-running djinn to front instead of
 # launching the freshly-installed bundle, so without it the on-disk
 # binary updates but the in-memory process keeps serving stale code.
-# When `dev-cert` has been run, the bundle's designated requirement
-# stays stable across rebuilds — so this no longer needs to reset TCC
-# every time. First launch still prompts for Accessibility; subsequent
-# launches skip the prompt.
+# Native shortcut registration does not require Accessibility grants or
+# privacy resets; any other running instance can still own the shortcut.
+# Build, sign, install, and relaunch the app.
 deploy: install-app
     killall djinn 2>/dev/null || true
     open ~/Applications/Djinn.app
 
-# Print the active toolchain wrapper (`bash -c` vs `nix develop ... bash -c`).
+# Print the pinned toolchain wrapper.
 which-toolchain:
     @echo "{{nix}}"

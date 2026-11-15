@@ -28,12 +28,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-const c = if (builtin.os.tag == .linux)
-    @cImport({
-        @cInclude("dlfcn.h");
-    })
-else
-    struct {};
+const platform = @import("../../io/platform.zig");
+
+// Stable POSIX C ABI; no translate-c dependency on Zig 0.17.
+extern "c" fn dlopen(name: [*:0]const u8, flags: c_int) ?*anyopaque;
+extern "c" fn dlclose(handle: *anyopaque) c_int;
 
 const gtk = @import("gtk.zig");
 
@@ -51,10 +50,8 @@ const GObject = gtk.GObject;
 const gboolean = gtk.gboolean;
 const gpointer = gtk.gpointer;
 
-// Clipboard surface — same shape as `log_pane.zig` / `keymap.zig`'s
-// mcp-endpoint copy. We declare it here so Panel itself can expose a
-// `copyTextToClipboard` helper that Dispatch hooks (tray "Copy MCP
-// config") can reuse without each caller re-deriving the display.
+// Generic clipboard surface for terminal/host actions. Panel exposes
+// copyTextToClipboard so callers can reuse the window's display.
 const GdkDisplay = opaque {};
 const GdkClipboard = opaque {};
 extern "c" fn gtk_widget_get_display(widget: *GtkWidget) ?*GdkDisplay;
@@ -106,7 +103,7 @@ extern "c" fn g_main_loop_unref(loop: *GMainLoop) void;
 // the source alive across ticks; G_SOURCE_REMOVE (0) drops it.
 // `g_timeout_add`, `g_source_remove`, `g_signal_connect_data`,
 // `g_signal_handler_disconnect` all live in `gtk.zig` now — shared
-// across panel / terminal / log_pane / tray / watcher.
+// across panel / terminal / tray / watcher.
 const G_SOURCE_CONTINUE: c_int = 1;
 const G_SOURCE_REMOVE: c_int = 0;
 const g_timeout_add = gtk.g_timeout_add;
@@ -191,7 +188,7 @@ pub const Panel = struct {
     /// `setHideOnBlur(true)` is called multiple times.
     blur_handler_id: c_ulong = 0,
     /// Count of currently-open `autohide=true` popovers owned by
-    /// djinn (find overlay, palette). Bumped via `pushPopoverGrab`
+    /// djinn (the find overlay). Bumped via `pushPopoverGrab`
     /// on popup and decremented via `popPopoverGrab` on dismiss.
     /// `onActiveChanged` short-circuits while non-zero so the
     /// popover's input grab doesn't trip hide-on-blur on KWin
@@ -238,9 +235,9 @@ pub const Panel = struct {
         const gtk4 = canDlopen("libgtk-4.so.1");
         const layer_shell = canDlopen("libgtk4-layer-shell.so.0");
 
-        const wayland = std.posix.getenv("WAYLAND_DISPLAY") != null;
+        const wayland = platform.getenv("WAYLAND_DISPLAY") != null;
 
-        const desktop_src = std.posix.getenv("XDG_CURRENT_DESKTOP") orelse "";
+        const desktop_src = platform.getenv("XDG_CURRENT_DESKTOP") orelse "";
         // OOM here used to swallow the failure and substitute "" —
         // a downstream caller reading `caps.desktop` couldn't tell
         // "real unknown desktop" from "allocator was out of memory
@@ -290,7 +287,7 @@ pub const Panel = struct {
         // transparency / interaction quirks specific to layer surfaces.
         const layer_shell_supported = gtk_layer_is_supported() != 0;
         const layer_shell_disabled = blk: {
-            const v = std.posix.getenv("DJINN_NO_LAYER_SHELL") orelse break :blk false;
+            const v = platform.getenv("DJINN_NO_LAYER_SHELL") orelse break :blk false;
             break :blk v.len > 0 and v[0] != '0';
         };
         const layer_shell_active = layer_shell_supported and !layer_shell_disabled;
@@ -506,8 +503,7 @@ pub const Panel = struct {
     /// stay on the dropped widget AND the new widget would also
     /// need its own trackPopoverGrabs call. Add an explicit
     /// `untrackPopoverGrabs(popover)` (signal_handler_disconnect_by_func)
-    /// when that pattern shows up. find_overlay + palette are both
-    /// init-once today.
+    /// when that pattern shows up. The find overlay is init-once today.
     pub fn trackPopoverGrabs(self: *Panel, popover: *GtkWidget) void {
         _ = g_signal_connect_data(
             @ptrCast(popover),
@@ -586,6 +582,10 @@ pub const Panel = struct {
     /// One-call Quake-drop toggle. Whatever state the panel is in,
     /// flip it. Cheap; safe to call from any GLib main-loop context
     /// (signal callbacks, GIO source dispatches, idle handlers).
+    pub fn isActive(self: *Panel) bool {
+        return gtk_widget_get_visible(@ptrCast(self.window)) != 0 and gtk_window_is_active(self.window) != 0;
+    }
+
     pub fn toggle(self: *Panel) void {
         const widget: *GtkWidget = @ptrCast(self.window);
         if (gtk_widget_get_visible(widget) != 0) {
@@ -629,15 +629,19 @@ pub const Panel = struct {
 };
 
 /// Close-request handler. GTK calls this when the user dismisses the
-/// window; returning FALSE lets the default handler proceed with the
-/// destroy. We quit the main loop here so `runLoop` returns to the
-/// caller for normal cleanup.
-fn onCloseRequest(_: *GtkWindow, user_data: gpointer) callconv(.c) gboolean {
+/// window. Consume it after quitting: shortcut/child wrappers must detach
+/// before Panel.deinit destroys the window. GTK's default destroy handler
+/// would otherwise invalidate those borrowed objects before runLoop returns.
+fn onCloseRequest(_: ?*GtkWindow, user_data: gpointer) callconv(.c) gboolean {
     if (user_data) |p| {
         const loop: *GMainLoop = @ptrCast(@alignCast(p));
         g_main_loop_quit(loop);
     }
-    return 0;
+    return 1;
+}
+
+test "close request consumes default destruction before owner cleanup" {
+    try std.testing.expectEqual(@as(gboolean, 1), onCloseRequest(null, null));
 }
 
 /// `map` handler — fires once on first show and again on every
@@ -658,11 +662,10 @@ fn onMapped(window: *GtkWidget, _: gpointer) callconv(.c) void {
 /// user-flow matches Raycast / Spotlight semantics: lose focus → tuck
 /// away. Re-focus comes via the hotkey or IPC toggle.
 ///
-/// Popover-popup guard: GTK4's `autohide=true` popovers (find overlay,
-/// palette) grab input on popup; on KWin Wayland the grab flips the
+/// Popover-popup guard: GTK4's `autohide=true` find popover grabs input; on KWin Wayland the grab flips the
 /// parent toplevel's `is-active` to false even though focus has just
 /// landed on the popover's GtkSearchEntry. Without a guard, Ctrl+Shift+F
-/// and Ctrl+Shift+P appeared as "popover flashes, panel hides" because
+/// appeared as "popover flashes, panel hides" because
 /// hide-on-blur fired the instant the popover popped up. The popover
 /// modules increment `popover_grab_count` on popup and decrement on
 /// dismiss via `pushPopoverGrab` / `popPopoverGrab`; while >0 we
@@ -744,15 +747,26 @@ fn bellRestoreTick(user_data: gpointer) callconv(.c) c_int {
 /// statically (see build.zig).
 fn canDlopen(name: [*:0]const u8) bool {
     if (builtin.os.tag != .linux) return false;
-    const handle = c.dlopen(name, 1); // RTLD_LAZY
-    if (handle == null) return false;
-    _ = c.dlclose(handle);
+    const handle = dlopen(name, 1) orelse return false; // RTLD_LAZY
+    _ = dlclose(handle);
     return true;
 }
 
-test "Panel.detect doesn't crash without env vars" {
-    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
-    defer arena.deinit();
-    const caps = try Panel.detect(arena.allocator());
-    _ = caps;
+test "Panel native API compiles without opening a display" {
+    std.testing.refAllDecls(Panel);
+}
+
+test "Capabilities require GTK4, layer-shell and Wayland for quake drop" {
+    // Pure policy test: never load native libraries or contact a display.
+    const ready = Capabilities{ .gtk4 = true, .layer_shell = true, .wayland = true, .desktop = "test" };
+    try std.testing.expect(ready.quakeDropAvailable());
+    var missing = ready;
+    missing.gtk4 = false;
+    try std.testing.expect(!missing.quakeDropAvailable());
+    missing = ready;
+    missing.layer_shell = false;
+    try std.testing.expect(!missing.quakeDropAvailable());
+    missing = ready;
+    missing.wayland = false;
+    try std.testing.expect(!missing.quakeDropAvailable());
 }

@@ -1,38 +1,16 @@
-//! Tier-5 runtime — bridges the full libghostty surface API into djinn.
-//!
-//! Sits parallel to `terminal.zig`, which wraps the bare `vt-static`
-//! parser. This module wraps the higher-level surface API exposed by
-//! `ghostty.h` (the embedding API): global init, app lifecycle,
-//! surface lifecycle, runtime callbacks. None of it is wired into the
-//! view yet — initial scope is just standing up the global state so
-//! we know dynamic symbol resolution works at runtime, not just at
-//! link time.
-//!
-//! cImport is in its own scope on purpose. ghostty's `vt.h` and
-//! `ghostty.h` both define some of the same opaque handle types (e.g.
-//! `ghostty_app_t`, surface state); Zig synthesizes a unique opaque
-//! type per `@cImport` block, so cross-module passing of those handles
-//! between this file and `terminal.zig` would require pointer casts.
-//! For the surface API we don't need the vt types, so the boundary
-//! stays clean.
+//! Native host bridge for the pinned libghostty embedding API.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const app_mod = @import("../app.zig");
+const Session = @import("../session/manager.zig").Session;
+const platform = @import("../io/platform.zig");
 
-pub const c = @cImport({
-    @cInclude("ghostty.h");
-});
+pub const c = @import("darwin-c");
 
-/// What ghostty surface/app callbacks recover when they need to talk
-/// back to the host. Reachable via `ghostty_app_userdata(app)` (set on
-/// `runtime_config_s.userdata`) and `ghostty_surface_userdata(surf)`
-/// (set on `surface_config_s.userdata`). Same pointer for both today —
-/// when tabs/splits land, each surface gets its own slot but the type
-/// stays the same.
+/// App callbacks use HostContext; surface callbacks use a stable Session pointer.
 pub const HostContext = struct {
     /// Backreference to the global AppState (`&app.g`). Action handlers
-    /// pull terminals, panels, agent state, config from here.
+    /// pull terminal, panel, and configuration state from here.
     app_state: *app_mod.AppState,
     /// ghostty_app_t handle. Stashed so the wakeup callback (which only
     /// receives userdata) can call ghostty_app_tick. Set by App.init
@@ -44,6 +22,108 @@ pub const HostContext = struct {
 /// `setHost` before `App.init`; outlives the App + surfaces.
 pub var host_storage: HostContext = undefined;
 var host_inited: bool = false;
+
+/// Host-owned references only. Never infer ownership from process-global OS
+/// state: another component may also hold Secure Input or a cursor hide.
+const HostInputState = struct {
+    secure: bool = false,
+    cursor_hidden: bool = false,
+    cursor_selector: ?[:0]const u8 = null,
+};
+var host_input: HostInputState = .{};
+
+fn inputStateForSession(source: ?*const Session) HostInputState {
+    const session = source orelse return .{};
+    if (session.surface == null or !session.surface_focused or !session.surface_visible) return .{};
+    return .{
+        .secure = session.requested_secure_input,
+        .cursor_hidden = session.requested_cursor_hidden,
+        .cursor_selector = if (session.mouse_over_link) "pointingHandCursor" else session.requested_cursor_shape,
+    };
+}
+
+fn sameCursor(a: ?[:0]const u8, b: ?[:0]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+const HostInputChanges = struct {
+    secure: ?bool,
+    cursor_hidden: ?bool,
+    cursor_shape: bool,
+};
+
+fn inputChanges(current: HostInputState, next: HostInputState) HostInputChanges {
+    return .{
+        .secure = if (current.secure != next.secure) next.secure else null,
+        .cursor_hidden = if (current.cursor_hidden != next.cursor_hidden) next.cursor_hidden else null,
+        .cursor_shape = !sameCursor(current.cursor_selector, next.cursor_selector),
+    };
+}
+
+fn applyHostInput(next: HostInputState) void {
+    const changes = inputChanges(host_input, next);
+    if (changes.secure) |enabled| {
+        const status = if (enabled) EnableSecureEventInput() else DisableSecureEventInput();
+        if (status == 0) {
+            host_input.secure = enabled;
+        } else {
+            std.debug.print("warning: cannot {s} Secure Event Input (OSStatus {d})\n", .{ if (enabled) "enable" else "disable", status });
+        }
+    }
+    if (changes.cursor_hidden) |hidden| {
+        const objc = @import("objc");
+        if (objc.getClass("NSCursor")) |cursor| {
+            if (hidden) cursor.msgSend(void, "hide", .{}) else cursor.msgSend(void, "unhide", .{});
+            host_input.cursor_hidden = hidden;
+        }
+    }
+    if (changes.cursor_shape) {
+        setNSCursor(next.cursor_selector orelse "arrowCursor");
+        host_input.cursor_selector = next.cursor_selector;
+    }
+}
+
+fn reconcileHostInput() void {
+    if (!host_inited) return;
+    const sm = host_storage.app_state.session_manager orelse {
+        applyHostInput(.{});
+        return;
+    };
+    applyHostInput(inputStateForSession(sm.active()));
+}
+
+/// Release this incarnation's requests BEFORE clearing its source pointer.
+/// Later destruction callbacks cannot acquire a new host-owned reference.
+pub fn releaseSessionInput(session: *Session) void {
+    clearSessionInput(session);
+    reconcileHostInput();
+}
+
+fn clearSessionInput(session: *Session) void {
+    session.surface_focused = false;
+    session.surface_visible = false;
+    session.requested_secure_input = false;
+    session.requested_cursor_hidden = false;
+    session.requested_cursor_shape = "IBeamCursor";
+    session.mouse_over_link = false;
+}
+
+/// Only synchronous construction-time title callbacks may use this fallback.
+/// Pinned embedded.Surface.init installs userdata before core_surface.init.
+const PendingConstruction = struct {
+    session: *Session,
+    generation: u64,
+
+    fn matches(self: PendingConstruction, sessions: []Session, userdata: ?*anyopaque) ?*Session {
+        for (sessions) |*session| {
+            if (session == self.session and userdata == @as(*anyopaque, @ptrCast(session)) and
+                session.surface == null and session.surface_generation == self.generation) return session;
+        }
+        return null;
+    }
+};
+var pending_construction: ?PendingConstruction = null;
 
 /// Wire the global `&app.g` into ghostty's userdata channel. Call once
 /// before `App.init`. Idempotent.
@@ -58,8 +138,8 @@ pub fn setHost(state: *app_mod.AppState) void {
 pub fn hostFromApp(handle: c.ghostty_app_t) ?*HostContext {
     if (!host_inited) return null;
     const ud = c.ghostty_app_userdata(handle);
-    if (ud == null) return null;
-    return @ptrCast(@alignCast(ud));
+    if (ud != @as(*anyopaque, @ptrCast(&host_storage))) return null;
+    return &host_storage;
 }
 
 /// Re-read ~/.config/ghostty/config from disk and push the resulting
@@ -79,30 +159,23 @@ pub fn reloadConfigFromDisk() void {
     if (!host_inited) return;
     const app_handle = host_storage.app_handle orelse return;
     const new_cfg = c.ghostty_config_new() orelse return;
-    c.ghostty_config_load_default_files(new_cfg);
-    // Re-apply the dual-theme appearance override before finalize.
-    // Same rationale as App.init: ghostty's `loadTheme` picks the
-    // LIGHT variant of `theme = light:X,dark:Y` at finalize, so on
-    // reload we'd revert to LIGHT regardless of the system
-    // appearance unless we layer the override on top.
-    if (writeAppearanceThemeOverride()) |tmp_path| {
-        defer std.heap.page_allocator.free(tmp_path);
-        if (std.heap.page_allocator.allocSentinel(u8, tmp_path.len, 0)) |z| {
-            defer std.heap.page_allocator.free(z);
-            @memcpy(z[0..tmp_path.len], tmp_path);
-            c.ghostty_config_load_file(new_cfg, z.ptr);
-        } else |_| {}
-    }
+    const scrollback = if (host_storage.app_state.config) |cfg| cfg.scrollback.size else null;
+    loadConfigFiles(new_cfg, scrollback) catch {
+        c.ghostty_config_free(new_cfg);
+        return;
+    };
     c.ghostty_config_finalize(new_cfg);
     c.ghostty_app_update_config(app_handle, new_cfg);
-    if (host_storage.app_state.ghostty.surface) |surf_ptr| {
-        const surf: c.ghostty_surface_t = @ptrCast(surf_ptr);
-        c.ghostty_surface_update_config(surf, new_cfg);
+    if (host_storage.app_state.session_manager) |sm| {
+        for (sm.sessions.items) |session| {
+            if (session.surface) |sp| c.ghostty_surface_update_config(@ptrCast(sp), new_cfg);
+        }
     }
     if (host_storage.app_state.ghostty.config) |old| {
         c.ghostty_config_free(@ptrCast(old));
     }
     host_storage.app_state.ghostty.config = @ptrCast(new_cfg);
+    if (host_storage.app_state.ghostty.app) |app| app.config = new_cfg;
 }
 
 /// Peek the user's `~/.config/ghostty/config`, find the `theme = ...`
@@ -114,13 +187,14 @@ pub fn reloadConfigFromDisk() void {
 /// theme that ghostty handles correctly already).
 fn writeAppearanceThemeOverride() ?[]const u8 {
     const allocator = std.heap.page_allocator;
-    const home = std.posix.getenv("HOME") orelse return null;
+    const home = platform.getenv("HOME") orelse return null;
     const cfg_path = std.fmt.allocPrint(allocator, "{s}/.config/ghostty/config", .{home}) catch return null;
     defer allocator.free(cfg_path);
 
-    const file = std.fs.openFileAbsolute(cfg_path, .{}) catch return null;
-    defer file.close();
-    const contents = file.readToEndAlloc(allocator, 256 * 1024) catch return null;
+    const file = std.Io.Dir.openFileAbsolute(platform.io(), cfg_path, .{}) catch return null;
+    defer file.close(platform.io());
+    var reader = file.reader(platform.io(), &.{});
+    const contents = reader.interface.allocRemaining(allocator, .limited(256 * 1024)) catch return null;
     defer allocator.free(contents);
 
     // Find the last `theme = ...` line (last-one-wins matches ghostty's
@@ -158,22 +232,19 @@ fn writeAppearanceThemeOverride() ?[]const u8 {
     // Write the override to a tmp file. Path is process-lifetime; the
     // file persists until exit (small text file, ~30 bytes — not worth
     // a cleanup hook).
-    const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
-    // Fixed filename + truncate-write; no pid suffix needed (and
-    // `std.os.linux.getpid` is the wrong namespace for darwin — its
-    // value isn't a real macOS pid). Each launch overwrites.
-    const tmp_path = std.fmt.allocPrint(allocator, "{s}/djinn-theme-override.conf", .{tmpdir}) catch return null;
-    const out = std.fs.createFileAbsolute(tmp_path, .{ .truncate = true }) catch {
+    const tmpdir = platform.getenv("TMPDIR") orelse "/tmp";
+    const tmp_path = std.fmt.allocPrint(allocator, "{s}/djinn-theme-{x}.conf", .{ tmpdir, temporaryFileNonce() }) catch return null;
+    const out = std.Io.Dir.createFileAbsolute(platform.io(), tmp_path, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch {
         allocator.free(tmp_path);
         return null;
     };
-    defer out.close();
+    defer out.close(platform.io());
     var buf: [256]u8 = undefined;
     const line = std.fmt.bufPrint(&buf, "theme = {s}\n", .{picked}) catch {
         allocator.free(tmp_path);
         return null;
     };
-    out.writeAll(line) catch {
+    out.writeStreamingAll(platform.io(), line) catch {
         allocator.free(tmp_path);
         return null;
     };
@@ -198,28 +269,80 @@ fn pickThemeVariant(spec: []const u8, dark: bool) ?[]const u8 {
 /// Returns the tmp path (owned, free with page_allocator) or null when
 /// there's nothing to write.
 fn writeDjinnGhosttyOverride(scrollback_limit: ?u32) ?[]const u8 {
-    if (scrollback_limit == null) return null;
-
     const allocator = std.heap.page_allocator;
-    const tmpdir = std.posix.getenv("TMPDIR") orelse "/tmp";
-    const tmp_path = std.fmt.allocPrint(allocator, "{s}/djinn-ghostty-override.conf", .{tmpdir}) catch return null;
-    const out = std.fs.createFileAbsolute(tmp_path, .{ .truncate = true }) catch {
-        allocator.free(tmp_path);
+    const config = if (host_inited) host_storage.app_state.config else null;
+    const tmpdir = platform.getenv("TMPDIR") orelse "/tmp";
+    const path = std.fmt.allocPrint(allocator, "{s}/djinn-ghostty-{x}.conf", .{ tmpdir, temporaryFileNonce() }) catch return null;
+    const file = std.Io.Dir.createFileAbsolute(platform.io(), path, .{ .exclusive = true, .permissions = .fromMode(0o600) }) catch {
+        allocator.free(path);
         return null;
     };
-    defer out.close();
-    var buf: [128]u8 = undefined;
-    if (scrollback_limit) |n| {
-        const line = std.fmt.bufPrint(&buf, "scrollback-limit = {d}\n", .{n}) catch {
-            allocator.free(tmp_path);
-            return null;
-        };
-        out.writeAll(line) catch {
-            allocator.free(tmp_path);
-            return null;
-        };
+    defer file.close(platform.io());
+    var success = false;
+    defer if (!success) {
+        std.Io.Dir.deleteFileAbsolute(platform.io(), path) catch {};
+        allocator.free(path);
+    };
+    if (scrollback_limit) |limit| writeNumericOverride(file, "scrollback-limit", limit) catch return null;
+    if (config) |cfg| {
+        const Entry = struct { key: []const u8, value: ?[]const u8 };
+        for ([_]Entry{
+            .{ .key = "font-family", .value = cfg.terminal.font_family },
+            .{ .key = "background", .value = cfg.theme.background },
+            .{ .key = "foreground", .value = cfg.theme.foreground },
+            .{ .key = "cursor-color", .value = cfg.theme.cursor },
+        }) |entry| {
+            if (entry.value) |value| {
+                file.writeStreamingAll(platform.io(), entry.key) catch return null;
+                file.writeStreamingAll(platform.io(), " = ") catch return null;
+                file.writeStreamingAll(platform.io(), value) catch return null;
+                file.writeStreamingAll(platform.io(), "\n") catch return null;
+            }
+        }
+        if (cfg.terminal.font_size) |value| writeNumericOverride(file, "font-size", value) catch return null;
+        if (cfg.terminal.padding_x) |value| writeNumericOverride(file, "window-padding-x", value) catch return null;
+        if (cfg.terminal.padding_y) |value| writeNumericOverride(file, "window-padding-y", value) catch return null;
+        if (cfg.theme.opacity) |value| writeNumericOverride(file, "background-opacity", value) catch return null;
     }
-    return tmp_path;
+    success = true;
+    return path;
+}
+
+fn loadConfigFiles(cfg: c.ghostty_config_t, scrollback: ?u32) !void {
+    const allocator = std.heap.page_allocator;
+    const inherit = if (host_inited) blk: {
+        const host_cfg = host_storage.app_state.config orelse break :blk true;
+        break :blk host_cfg.theme.inherit_ghostty;
+    } else true;
+    if (inherit) {
+        c.ghostty_config_load_default_files(cfg);
+        if (writeAppearanceThemeOverride()) |path| {
+            defer allocator.free(path);
+            defer std.Io.Dir.deleteFileAbsolute(platform.io(), path) catch {};
+            const z = try allocator.dupeSentinel(u8, path, 0);
+            defer allocator.free(z);
+            c.ghostty_config_load_file(cfg, z.ptr);
+        }
+    }
+    if (writeDjinnGhosttyOverride(scrollback)) |path| {
+        defer allocator.free(path);
+        defer std.Io.Dir.deleteFileAbsolute(platform.io(), path) catch {};
+        const z = try allocator.dupeSentinel(u8, path, 0);
+        defer allocator.free(z);
+        c.ghostty_config_load_file(cfg, z.ptr);
+    }
+}
+
+fn temporaryFileNonce() u64 {
+    var nonce: u64 = undefined;
+    platform.io().random(std.mem.asBytes(&nonce));
+    return nonce;
+}
+
+fn writeNumericOverride(file: std.Io.File, key: []const u8, value: anytype) !void {
+    var buffer: [128]u8 = undefined;
+    const text = try std.fmt.bufPrint(&buffer, "{s} = {d}\n", .{ key, value });
+    try file.writeStreamingAll(platform.io(), text);
 }
 
 fn detectDarkAppearance() bool {
@@ -241,21 +364,16 @@ fn detectDarkAppearance() bool {
 }
 
 /// Initialize ghostty's global state. Must be called before any
-/// `ghostty_app_new` / `ghostty_surface_new` call. Sets `std.os.argv`
-/// inside ghostty + spins up its allocator/logging/state.
-///
-/// argv is built from `std.os.argv`; we copy the per-arg pointers
-/// into a heap slice so the C signature `[*][*:0]u8` is satisfied
-/// without depending on Zig slice-header layout. The slice is owned
-/// by the caller — free after this returns (ghostty stores raw
-/// pointers, not the outer slice).
+/// `ghostty_app_new` / `ghostty_surface_new` call. Spins up Ghostty's
+/// allocator/logging/state with the process-lifetime Darwin argument vector.
+/// Zig no longer exposes std.os.argv; these libc accessors borrow the same
+/// original arguments without allocating or transferring their ownership.
+extern "c" fn _NSGetArgc() *c_int;
+extern "c" fn _NSGetArgv() *[*:null]?[*:0]u8;
+
 pub fn init() !void {
-    // Zig 0.15: std.os.argv is `[][*:0]u8` — slice of C-string
-    // pointers, not slice of slices. Each element already is the
-    // `[*:0]u8` we need. Pass `.ptr` of the slice directly. No
-    // allocator needed — ghostty stores its own copy of the
-    // pointers, doesn't take ownership.
-    const rc = c.ghostty_init(@intCast(std.os.argv.len), @ptrCast(std.os.argv.ptr));
+    configureResources();
+    const rc = c.ghostty_init(@intCast(_NSGetArgc().*), @ptrCast(_NSGetArgv().*));
     if (rc != 0) {
         std.debug.print("ghostty_init failed (rc={d})\n", .{rc});
         return error.GhosttyInitFailed;
@@ -263,58 +381,46 @@ pub fn init() !void {
     std.debug.print("ghostty_init OK (libghostty surface API ready)\n", .{});
 }
 
-/// Owns a `ghostty_app_t` plus its config + the runtime config struct
-/// kept alive for the lifetime of the app (ghostty stores a pointer
-/// to it, so the storage must outlive the app).
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
+/// Prefer our own resources over a GHOSTTY_RESOURCES_DIR inherited from the
+/// launching terminal. This works for both .app and zig-out/bin layouts.
+fn configureResources() void {
+    const allocator = std.heap.page_allocator;
+    const exe = platform.executablePathAlloc(allocator) catch return;
+    defer allocator.free(exe);
+    const directory = std.fs.path.dirname(exe) orelse return;
+    for ([_][]const u8{ "../Resources", "../share" }) |relative| {
+        const root = std.fs.path.resolve(allocator, &.{ directory, relative }) catch continue;
+        defer allocator.free(root);
+        const sentinel = std.fs.path.join(allocator, &.{ root, "terminfo", "78", "xterm-ghostty" }) catch continue;
+        defer allocator.free(sentinel);
+        std.Io.Dir.accessAbsolute(platform.io(), sentinel, .{}) catch continue;
+        const resources = std.fs.path.joinZ(allocator, &.{ root, "ghostty" }) catch continue;
+        defer allocator.free(resources);
+        _ = setenv("GHOSTTY_RESOURCES_DIR", resources.ptr, 1);
+        return;
+    }
+}
+
+/// Owns a `ghostty_app_t` plus its config. The pinned embedded App copies
+/// runtime options by value; callback userdata (not this struct) must outlive it.
 pub const App = struct {
     handle: c.ghostty_app_t,
     config: c.ghostty_config_t,
-    /// Keep alive — ghostty stores `*const` of this struct.
+    /// Retained for introspection; Ghostty copies these options by value.
     runtime_cfg: c.ghostty_runtime_config_s,
 
-    /// Allocate + finalize a default ghostty config and instantiate the
-    /// app with stub callbacks. Returns null if any of the C calls
-    /// fails — none of the failure modes have rich error messages
-    /// (the C API just returns null), so callers should treat null
-    /// as "Tier-5 surface unavailable, fall back to vt-static path."
+    /// Load terminal configuration and instantiate the embedded app.
     pub fn init(scrollback_limit: ?u32) ?App {
         const cfg = c.ghostty_config_new() orelse {
             std.debug.print("ghostty_app: config_new returned null\n", .{});
             return null;
         };
-        // Pull in defaults from ~/.config/ghostty/config so font /
-        // theme / palette match what user already configured for
-        // ghostty proper. Failure here is non-fatal in upstream's C
-        // API (returns void) — config stays at built-in defaults.
-        c.ghostty_config_load_default_files(cfg);
-
-        // ghostty's `loadTheme` picks the LIGHT variant of a
-        // `theme = light:X,dark:Y` pair as the default conditional
-        // state during finalize. There's no public C API to set the
-        // conditional state on a config object before finalize, so
-        // peek the user's config ourselves, pick the right variant
-        // for the system appearance, and write `theme = <picked>` as
-        // a tmp file that overrides the original line. Loaded BEFORE
-        // finalize so the right theme file gets merged in.
-        if (writeAppearanceThemeOverride()) |tmp_path| {
-            defer std.heap.page_allocator.free(tmp_path);
-            const z = std.heap.page_allocator.allocSentinel(u8, tmp_path.len, 0) catch return null;
-            defer std.heap.page_allocator.free(z);
-            @memcpy(z[0..tmp_path.len], tmp_path);
-            c.ghostty_config_load_file(cfg, z.ptr);
-        }
-
-        // djinn-side overrides for ghostty config keys we surface in
-        // djinn's own config file. Currently just `scrollback-size →
-        // scrollback-limit`; loaded after the appearance override so
-        // either can be patched independently.
-        if (writeDjinnGhosttyOverride(scrollback_limit)) |tmp_path| {
-            defer std.heap.page_allocator.free(tmp_path);
-            const z = std.heap.page_allocator.allocSentinel(u8, tmp_path.len, 0) catch return null;
-            defer std.heap.page_allocator.free(z);
-            @memcpy(z[0..tmp_path.len], tmp_path);
-            c.ghostty_config_load_file(cfg, z.ptr);
-        }
+        loadConfigFiles(cfg, scrollback_limit) catch {
+            c.ghostty_config_free(cfg);
+            return null;
+        };
 
         c.ghostty_config_finalize(cfg);
 
@@ -341,7 +447,7 @@ pub const App = struct {
         };
         if (host_inited) host_storage.app_handle = app_handle;
 
-        std.debug.print("ghostty_app_new OK (app + config + stub callbacks)\n", .{});
+        std.debug.print("ghostty_app_new OK\n", .{});
 
         return .{
             .handle = app_handle,
@@ -351,6 +457,10 @@ pub const App = struct {
     }
 
     pub fn deinit(self: *App) void {
+        // Queued wakeups resolve the live handle on main, never a captured
+        // pointer that may outlive this owner. Clear it before native teardown.
+        if (host_inited and host_storage.app_handle == self.handle) host_storage.app_handle = null;
+        applyHostInput(.{});
         c.ghostty_app_free(self.handle);
         // Per upstream: app_free does NOT free the config — caller
         // owns it (ghostty's app keeps a clone for itself).
@@ -378,27 +488,28 @@ pub const App = struct {
         scale: f64,
         command: ?[*:0]const u8,
         working_directory: ?[*:0]const u8,
+        session: *Session,
     ) ?c.ghostty_surface_t {
         var opts = c.ghostty_surface_config_new();
         opts.platform_tag = c.GHOSTTY_PLATFORM_MACOS;
         opts.platform.macos = .{ .nsview = nsview };
         opts.scale_factor = scale;
         opts.context = c.GHOSTTY_SURFACE_CONTEXT_WINDOW;
-        // wait_after_command=false: when shell exits (Ctrl+D, `exit`)
-        // surface closes immediately and fires close_surface_cb. The
-        // default true makes the surface print "Process exited. Press
-        // any key to close" and wait — wrong UX for a Quake-drop that
-        // the user just dropped. Our close_surface_cb hides the panel.
-        opts.wait_after_command = false;
-        // Same HostContext pointer the app uses across every surface;
-        // each session shares the host event channel + action dispatch.
-        if (host_inited) opts.userdata = @ptrCast(&host_storage);
-        // Provider command (claude, codex, …). Null → ghostty spawns
-        // user's default shell. Working directory null → ghostty's
-        // own fallback ($HOME).
+        // The pinned API forces wait-after-command for every explicit
+        // command (false cannot override it). Keep its exit/error output and
+        // native press-any-key-to-close semantics; never force-close it here.
+        // A null command inherits Ghostty's ordinary shell/config policy.
+        opts.wait_after_command = command != null;
+        // The static session array never reallocates. Userdata remains valid
+        // until all its surfaces have been destroyed at shutdown.
+        opts.userdata = session;
+        // Null command delegates to Ghostty; explicit commands are unchanged.
         if (command) |cmd| opts.command = cmd;
         if (working_directory) |wd| opts.working_directory = wd;
 
+        std.debug.assert(pending_construction == null);
+        pending_construction = .{ .session = session, .generation = session.surface_generation };
+        defer pending_construction = null;
         const surf = c.ghostty_surface_new(self.handle, &opts) orelse {
             std.debug.print("ghostty_surface: surface_new returned null\n", .{});
             return null;
@@ -465,7 +576,7 @@ pub fn configString(cfg: c.ghostty_config_t, key: []const u8) ?[]const u8 {
     return std.mem.sliceTo(out, 0);
 }
 
-// ─── Surface lifecycle (step 5) ───────────────────────────────────
+// ─── Surface lifecycle ───────────────────────────────────
 //
 // Free functions — these only need the surface handle. Callers (view.zig
 // resize hooks, panel.zig focus events) shouldn't have to reach for the
@@ -486,6 +597,12 @@ pub fn surfaceSetContentScale(surface: c.ghostty_surface_t, scale: f64) void {
 }
 
 pub fn surfaceSetFocus(surface: c.ghostty_surface_t, focused: bool) void {
+    if (host_inited) {
+        if (host_storage.app_state.session_manager) |sm| {
+            if (sessionForSurface(sm.sessions.items, @ptrCast(surface))) |session| session.surface_focused = focused;
+        }
+    }
+    reconcileHostInput();
     c.ghostty_surface_set_focus(surface, focused);
 }
 
@@ -493,6 +610,12 @@ pub fn surfaceSetFocus(surface: c.ghostty_surface_t, focused: bool) void {
 /// to throttle CADisplayLink + skip cursor blink work when the surface
 /// is fully occluded — e.g. while the Quake panel is slid offscreen.
 pub fn surfaceSetOcclusion(surface: c.ghostty_surface_t, visible: bool) void {
+    if (host_inited) {
+        if (host_storage.app_state.session_manager) |sm| {
+            if (sessionForSurface(sm.sessions.items, @ptrCast(surface))) |session| session.surface_visible = visible;
+        }
+    }
+    reconcileHostInput();
     c.ghostty_surface_set_occlusion(surface, visible);
 }
 
@@ -515,18 +638,36 @@ pub fn appSetColorScheme(dark: bool) void {
     c.ghostty_app_set_color_scheme(handle, scheme);
 }
 
-// Stub callbacks. None of these do anything yet; ghostty calls them
-// when the surface wants to talk to the host runtime. Surface API
-// isn't wired in step 2, so the only invocations would be from
-// app-level events (none expected during pure init+free). Real
-// implementations land alongside surface wiring.
+/// Validate callback userdata before dereferencing it. Profile membership is
+/// fixed for the application's lifetime, including during config reload.
+fn sessionFromUserdata(ud: ?*anyopaque) ?*Session {
+    const raw = ud orelse return null;
+    if (!host_inited) return null;
+    const sm = host_storage.app_state.session_manager orelse return null;
+    for (sm.sessions.items) |*session| {
+        if (@as(*anyopaque, @ptrCast(session)) == raw and session.surface != null) return session;
+    }
+    return null;
+}
 
-/// Recover the HostContext from a callback's userdata pointer. Returns
-/// null if userdata wasn't set (init order) — callers should treat that
-/// as a no-op + log.
-fn hostFromUserdata(ud: ?*anyopaque) ?*HostContext {
-    if (ud == null) return null;
-    return @ptrCast(@alignCast(ud));
+fn sessionFromTarget(host: *HostContext, target: c.ghostty_target_s) ?*Session {
+    if (target.tag != c.GHOSTTY_TARGET_SURFACE) return null;
+    const sm = host.app_state.session_manager orelse return null;
+    return sessionForSurface(sm.sessions.items, @ptrCast(target.target.surface));
+}
+
+fn sessionForSurface(sessions: []Session, surface: ?*anyopaque) ?*Session {
+    const handle = surface orelse return null;
+    for (sessions) |*session| {
+        if (session.surface == handle) return session;
+    }
+    return null;
+}
+
+fn isActiveTarget(host: *HostContext, target: c.ghostty_target_s) bool {
+    const session = sessionFromTarget(host, target) orelse return false;
+    const sm = host.app_state.session_manager orelse return false;
+    return sm.active().id == session.id;
 }
 
 /// ghostty's IO thread pokes us via wakeup_cb whenever it has work for
@@ -535,17 +676,15 @@ fn hostFromUserdata(ud: ?*anyopaque) ?*HostContext {
 /// to call ghostty_app_tick on main to drain. Without this the surface
 /// never fires actions or close callbacks.
 fn wakeupStub(_: ?*anyopaque) callconv(.c) void {
-    if (!host_inited) return;
-    if (host_storage.app_handle) |h| {
-        dispatch_async_f(@ptrCast(c_dispatch.dispatch_get_main_queue()), h, &tickAppMain);
-    }
+    // This callback may run on an IO thread. Do not read mutable host state
+    // here or retain a raw app handle across the asynchronous boundary.
+    dispatch_async_f(@ptrCast(c_dispatch.dispatch_get_main_queue()), null, &tickAppMain);
 }
 
-fn tickAppMain(ctx: ?*anyopaque) callconv(.c) void {
-    if (ctx) |raw| {
-        const handle: c.ghostty_app_t = @ptrCast(raw);
-        c.ghostty_app_tick(handle);
-    }
+fn tickAppMain(_: ?*anyopaque) callconv(.c) void {
+    if (!host_inited) return;
+    const handle = host_storage.app_handle orelse return;
+    c.ghostty_app_tick(handle);
 }
 
 fn actionDispatch(
@@ -563,16 +702,12 @@ fn actionDispatch(
     inline for (action_table) |entry| {
         if (action.tag == entry.tag) return entry.handler(host, app, target, action);
     }
-    // Unknown tag — surface to logs and treat as not-handled. Future
-    // ghostty versions adding new tags will hit this branch.
-    std.debug.print("ghostty action: unknown tag {d}\n", .{action.tag});
+    // Window managers, splits, progress UI, and other unsupported
+    // embedding actions are intentionally outside this host's scope.
     return false;
 }
 
-/// Per-tag handler. Returns true if djinn handled the action, false to
-/// let ghostty fall back to its default. Step-8 scope: every handler
-/// is a no-op stub returning false — wiring lives here so callers
-/// don't need to grow a 40-arm switch later.
+/// Supported embedding actions; everything else is left unhandled.
 const ActionHandler = *const fn (
     host: *HostContext,
     app: c.ghostty_app_t,
@@ -582,113 +717,75 @@ const ActionHandler = *const fn (
 
 const ActionEntry = struct {
     tag: c.ghostty_action_tag_e,
-    name: []const u8,
     handler: ActionHandler,
 };
 
-/// Stub handler factory. The `name` is unused at runtime (action.tag
-/// already carries the identity) but kept for `comptime`-side debug
-/// printing if we want to log unhandled actions later.
-fn stub(comptime _: []const u8) ActionHandler {
-    return struct {
-        fn h(_: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, _: c.ghostty_action_s) bool {
-            return false;
-        }
-    }.h;
-}
-
 // ─── Real action handlers ───────────────────────────────────────────
 
-/// dispatch a function onto the main queue. ghostty surface callbacks
-/// can fire from its IO thread; AppKit calls require main.
+/// Dispatch known IO-thread wakeups and deferred lifecycle work onto main.
+/// All other native surface callbacks run on main.
 extern "c" fn dispatch_async_f(
     queue: ?*anyopaque,
     ctx: ?*anyopaque,
     work: *const fn (?*anyopaque) callconv(.c) void,
 ) void;
-const c_dispatch = @cImport({
-    @cInclude("dispatch/dispatch.h");
-});
+const c_dispatch = c;
 
-/// child_exited: shell exited (Ctrl+D EOF, `exit`, kill, etc).
-/// Mark the owning session so the tab strip can reflect the dead-child
-/// state, then return true to prevent ghostty from auto-closing the
-/// surface. The host handles restart via Cmd+R / Cmd+Shift+R actions.
+/// Record the source session's exit without pretending to show a native dialog.
 fn handleChildExited(host: *HostContext, _: c.ghostty_app_t, target: c.ghostty_target_s, _: c.ghostty_action_s) bool {
-    if (host.app_state.session_manager) |sm| {
-        if (target.tag == c.GHOSTTY_TARGET_SURFACE) {
-            for (sm.sessions.items) |*sess| {
-                if (sess.surface) |sp| {
-                    const surf: c.ghostty_surface_t = @ptrCast(sp);
-                    if (surf == target.target.surface) {
-                        sess.exited = true;
-                        break;
-                    }
-                }
-            }
+    const session = sessionFromTarget(host, target) orelse return false;
+    session.exited = true;
+    @import("../session/tab_strip.zig").refresh();
+    // We did not show a native exit dialog. Let Ghostty paint its exit/error
+    // message, and request close according to its command policy. The close
+    // callback is source-attributed; an inactive child cannot hide this panel.
+    return false;
+}
+
+/// ring_bell: audible side via afplay, visual side as a brief alpha
+/// dim on the panel. Both are gated independently by config.
+fn handleRingBell(host: *HostContext, _: c.ghostty_app_t, target: c.ghostty_target_s, _: c.ghostty_action_s) bool {
+    const cfg = host.app_state.config orelse return false;
+    const session = sessionFromTarget(host, target) orelse return false;
+    const profile = session.profile;
+    if (profile.bell_audible orelse cfg.bell.audible) {
+        if (host.app_state.notifier) |notifier| notifier.playSound(profile.bell_sound orelse cfg.bell.sound);
+    }
+    if (profile.bell_visual orelse cfg.bell.visual) {
+        const sm = host.app_state.session_manager orelse return true;
+        if (sm.active().id == session.id) {
+            if (host.app_state.window.panel) |p| p.flashBell();
         }
     }
     return true;
 }
 
-fn closePanelMain(ctx: ?*anyopaque) callconv(.c) void {
-    if (ctx) |raw| {
-        const panel_mod = @import("../window/panel.zig");
-        const p: *panel_mod.Panel = @ptrCast(@alignCast(raw));
-        if (p.visible) p.hide();
-    }
-}
-
-/// ring_bell: audible side via afplay, visual side as a brief alpha
-/// dim on the panel. Both are gated independently by config.
-fn handleRingBell(host: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, _: c.ghostty_action_s) bool {
-    const cfg = host.app_state.config orelse return false;
-
-    // Active profile overrides override the global bell config so a
-    // chatter profile (working Claude session) can stay silent while
-    // an interactive shell still rings. Each field falls through
-    // independently — a profile can mute audible but keep visual.
-    const active_profile: ?@import("../session/manager.zig").Profile = blk: {
-        const sm = host.app_state.session_manager orelse break :blk null;
-        if (sm.sessions.items.len == 0) break :blk null;
-        break :blk sm.active().profile;
-    };
-
-    const audible = if (active_profile) |p| p.bell_audible orelse cfg.bell.audible else cfg.bell.audible;
-    const visual = if (active_profile) |p| p.bell_visual orelse cfg.bell.visual else cfg.bell.visual;
-    const sound = if (active_profile) |p| (p.bell_sound orelse cfg.bell.sound) else cfg.bell.sound;
-
-    if (audible) {
-        const notify = @import("../notify/darwin.zig");
-        const notifier = notify.Notifier{ .enabled = true };
-        notifier.playSound(sound);
-    }
-    if (visual) {
-        if (host.app_state.window.panel) |p| p.flashBell();
-    }
-    return true;
-}
-
-fn handleSearchTotal(host: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, action: c.ghostty_action_s) bool {
+fn handleSearchTotal(host: *HostContext, _: c.ghostty_app_t, target: c.ghostty_target_s, action: c.ghostty_action_s) bool {
+    if (!isActiveTarget(host, target)) return false;
     const total = action.action.search_total.total;
     host.app_state.find.total = if (total < 0) null else @intCast(total);
     @import("../terminal/find.zig").updateCountLabel();
     return true;
 }
 
-fn handleSearchSelected(host: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, action: c.ghostty_action_s) bool {
+fn handleSearchSelected(host: *HostContext, _: c.ghostty_app_t, target: c.ghostty_target_s, action: c.ghostty_action_s) bool {
+    if (!isActiveTarget(host, target)) return false;
     const sel = action.action.search_selected.selected;
     host.app_state.find.selected = if (sel < 0) null else @intCast(sel);
     @import("../terminal/find.zig").updateCountLabel();
     return true;
 }
 
-fn handleStartSearch(_: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, _: c.ghostty_action_s) bool {
-    @import("../terminal/find.zig").openOverlayUiOnly();
+fn handleStartSearch(host: *HostContext, _: c.ghostty_app_t, target: c.ghostty_target_s, action: c.ghostty_action_s) bool {
+    if (!isActiveTarget(host, target)) return false;
+    // Ghostty frees search_selection's temporary needle after this callback.
+    const needle = if (action.action.start_search.needle) |p| std.mem.span(p) else null;
+    @import("../terminal/find.zig").startSearchFromGhostty(needle);
     return true;
 }
 
-fn handleEndSearch(_: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, _: c.ghostty_action_s) bool {
+fn handleEndSearch(host: *HostContext, _: c.ghostty_app_t, target: c.ghostty_target_s, _: c.ghostty_action_s) bool {
+    if (!isActiveTarget(host, target)) return false;
     @import("../terminal/find.zig").closeOverlayUiOnly();
     return true;
 }
@@ -726,13 +823,17 @@ fn openUrlInWorkspace(url: []const u8) !void {
 /// title + body pair when the shell or a TUI requests an OS-level
 /// notification. Route through Notifier.send (NSUserNotification).
 /// Notifier already marshals onto main queue.
-fn handleDesktopNotification(host: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, action: c.ghostty_action_s) bool {
+fn handleDesktopNotification(host: *HostContext, _: c.ghostty_app_t, target: c.ghostty_target_s, action: c.ghostty_action_s) bool {
     const n = action.action.desktop_notification;
     const notifier = host.app_state.notifier orelse return false;
     const title = if (n.title) |t| std.mem.span(t) else "";
     const body = if (n.body) |b| std.mem.span(b) else "";
     if (title.len == 0 and body.len == 0) return false;
-    notifier.send(title, body);
+    const session = sessionFromTarget(host, target) orelse return false;
+    if (host.app_state.window.panel) |panel| {
+        if (isActiveTarget(host, target) and panel.visible and panel.ns_app.msgSend(bool, "isActive", .{})) return true;
+    }
+    notifier.send(session.id, title, body);
     return true;
 }
 
@@ -758,7 +859,8 @@ fn setNSCursor(selector: [:0]const u8) void {
 /// hand on link hover, resize cursors for splits, …). Map to the AppKit
 /// equivalent via the NSCursor class methods. Unhandled shapes fall
 /// back to the arrow cursor inside setNSCursor.
-fn handleMouseShape(_: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, action: c.ghostty_action_s) bool {
+fn handleMouseShape(host: *HostContext, _: c.ghostty_app_t, target: c.ghostty_target_s, action: c.ghostty_action_s) bool {
+    const session = sessionFromTarget(host, target) orelse return false;
     const shape = action.action.mouse_shape;
     const sel: [:0]const u8 = switch (shape) {
         c.GHOSTTY_MOUSE_SHAPE_TEXT, c.GHOSTTY_MOUSE_SHAPE_VERTICAL_TEXT => "IBeamCursor",
@@ -774,55 +876,55 @@ fn handleMouseShape(_: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, 
         c.GHOSTTY_MOUSE_SHAPE_ALIAS => "dragLinkCursor",
         else => "arrowCursor",
     };
-    setNSCursor(sel);
+    session.requested_cursor_shape = sel;
+    reconcileHostInput();
     return true;
 }
 
 /// mouse_visibility: TUI requested cursor hide / unhide (e.g. video
 /// playback inside terminal). NSCursor's hide/unhide stack is
 /// reference-counted; pair calls one-for-one.
-fn handleMouseVisibility(_: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, action: c.ghostty_action_s) bool {
-    const objc = @import("objc");
-    const NSCursor = objc.getClass("NSCursor") orelse return false;
-    switch (action.action.mouse_visibility) {
-        c.GHOSTTY_MOUSE_HIDDEN => NSCursor.msgSend(void, "hide", .{}),
-        c.GHOSTTY_MOUSE_VISIBLE => NSCursor.msgSend(void, "unhide", .{}),
+fn handleMouseVisibility(host: *HostContext, _: c.ghostty_app_t, target: c.ghostty_target_s, action: c.ghostty_action_s) bool {
+    const session = sessionFromTarget(host, target) orelse return false;
+    session.requested_cursor_hidden = switch (action.action.mouse_visibility) {
+        c.GHOSTTY_MOUSE_HIDDEN => true,
+        c.GHOSTTY_MOUSE_VISIBLE => false,
         else => return false,
-    }
+    };
+    reconcileHostInput();
     return true;
 }
 
 /// mouse_over_link: surface tells us the cursor sits on (or left) an
 /// OSC 8 hyperlink. Show a pointing hand on enter, restore the I-beam
-/// on leave. Existing CG/Metal backend has its own Cmd-hover path —
-/// that one stays live for non-surface backends.
-fn handleMouseOverLink(_: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, action: c.ghostty_action_s) bool {
+/// on leave. Store this per source so an inactive session's link events
+/// cannot overwrite the active session's cursor.
+fn handleMouseOverLink(host: *HostContext, _: c.ghostty_app_t, target: c.ghostty_target_s, action: c.ghostty_action_s) bool {
+    const session = sessionFromTarget(host, target) orelse return false;
     const link = action.action.mouse_over_link;
-    if (link.url != null and link.len > 0) {
-        setNSCursor("pointingHandCursor");
-    } else {
-        setNSCursor("IBeamCursor");
-    }
+    session.mouse_over_link = link.url != null and link.len > 0;
+    reconcileHostInput();
     return true;
 }
 
 /// secure_input: lock keystrokes against keyloggers / screen readers.
-/// EnableSecureEventInput is reference-counted (pair Enable/Disable) —
-/// ghostty's three-state enum maps cleanly because it never re-asserts
-/// the same state.
-extern "c" fn EnableSecureEventInput() void;
-extern "c" fn DisableSecureEventInput() void;
-extern "c" fn IsSecureEventInputEnabled() bool;
+/// Pair only our own successful Enable/Disable calls, never global OS state.
+extern "c" fn EnableSecureEventInput() i32;
+extern "c" fn DisableSecureEventInput() i32;
 
-fn handleSecureInput(_: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, action: c.ghostty_action_s) bool {
-    switch (action.action.secure_input) {
-        c.GHOSTTY_SECURE_INPUT_ON => EnableSecureEventInput(),
-        c.GHOSTTY_SECURE_INPUT_OFF => DisableSecureEventInput(),
-        c.GHOSTTY_SECURE_INPUT_TOGGLE => {
-            if (IsSecureEventInputEnabled()) DisableSecureEventInput() else EnableSecureEventInput();
-        },
-        else => return false,
-    }
+fn secureInputRequest(previous: bool, request: c.ghostty_action_secure_input_e) ?bool {
+    return switch (request) {
+        c.GHOSTTY_SECURE_INPUT_ON => true,
+        c.GHOSTTY_SECURE_INPUT_OFF => false,
+        c.GHOSTTY_SECURE_INPUT_TOGGLE => !previous,
+        else => null,
+    };
+}
+
+fn handleSecureInput(host: *HostContext, _: c.ghostty_app_t, target: c.ghostty_target_s, action: c.ghostty_action_s) bool {
+    const session = sessionFromTarget(host, target) orelse return false;
+    session.requested_secure_input = secureInputRequest(session.requested_secure_input, action.action.secure_input) orelse return false;
+    reconcileHostInput();
     return true;
 }
 
@@ -839,141 +941,159 @@ fn handlePwd(_: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, action:
 }
 
 /// set_title: surface emitted OSC 0 / OSC 2. Our panel is borderless
-/// (LSUIElement, no titlebar) so there's no NSWindow title surface to
-/// paint. Logged + acknowledged so ghostty doesn't fall back to its
-/// default path.
-fn handleSetTitle(_: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, action: c.ghostty_action_s) bool {
-    const t = action.action.set_title;
-    if (t.title) |title| {
-        std.debug.print("ghostty set_title: {s}\n", .{std.mem.span(title)});
-        return true;
+/// (LSUIElement, no titlebar); retain the source title for tabs and the
+/// menubar, including synchronous construction-time configuration titles.
+fn handleSetTitle(host: *HostContext, _: c.ghostty_app_t, target: c.ghostty_target_s, action: c.ghostty_action_s) bool {
+    const session = sessionFromTarget(host, target) orelse pending: {
+        if (target.tag != c.GHOSTTY_TARGET_SURFACE or target.target.surface == null) return false;
+        const pending = pending_construction orelse return false;
+        const sm = host.app_state.session_manager orelse return false;
+        // Do not attribute an arbitrary unknown handle to the active tab.
+        const userdata = c.ghostty_surface_userdata(target.target.surface);
+        break :pending pending.matches(sm.sessions.items, userdata) orelse return false;
+    };
+    const payload = if (action.tag == c.GHOSTTY_ACTION_SET_TAB_TITLE) action.action.set_tab_title else action.action.set_title;
+    const title = std.mem.span(payload.title orelse return false);
+    setSessionTitle(session, title);
+    @import("../session/tab_strip.zig").refresh();
+    if (host.app_state.menubar) |mb| mb.refresh();
+    return true;
+}
+
+fn setSessionTitle(session: *Session, title: []const u8) void {
+    var len = @min(title.len, session.terminal_title.len);
+    while (len > 0 and !std.unicode.utf8ValidateSlice(title[0..len])) len -= 1;
+    for (title[0..len], 0..) |byte, i| {
+        session.terminal_title[i] = if (byte < 0x20 or byte == 0x7f) ' ' else byte;
+    }
+    session.terminal_title_len = len;
+}
+
+fn handleQuit(host: *HostContext, _: c.ghostty_app_t, _: c.ghostty_target_s, _: c.ghostty_action_s) bool {
+    const panel = host.app_state.window.panel orelse return false;
+    panel.ns_app.msgSend(void, "terminate:", .{@as(?*anyopaque, null)});
+    return true;
+}
+
+/// Only actions this small host actually implements belong in the table.
+const action_table = [_]ActionEntry{
+    .{ .tag = c.GHOSTTY_ACTION_QUIT, .handler = handleQuit },
+    .{ .tag = c.GHOSTTY_ACTION_DESKTOP_NOTIFICATION, .handler = handleDesktopNotification },
+    .{ .tag = c.GHOSTTY_ACTION_SET_TITLE, .handler = handleSetTitle },
+    .{ .tag = c.GHOSTTY_ACTION_SET_TAB_TITLE, .handler = handleSetTitle },
+    .{ .tag = c.GHOSTTY_ACTION_PWD, .handler = handlePwd },
+    .{ .tag = c.GHOSTTY_ACTION_MOUSE_SHAPE, .handler = handleMouseShape },
+    .{ .tag = c.GHOSTTY_ACTION_MOUSE_VISIBILITY, .handler = handleMouseVisibility },
+    .{ .tag = c.GHOSTTY_ACTION_MOUSE_OVER_LINK, .handler = handleMouseOverLink },
+    .{ .tag = c.GHOSTTY_ACTION_SECURE_INPUT, .handler = handleSecureInput },
+    .{ .tag = c.GHOSTTY_ACTION_RING_BELL, .handler = handleRingBell },
+    .{ .tag = c.GHOSTTY_ACTION_OPEN_URL, .handler = handleOpenUrl },
+    .{ .tag = c.GHOSTTY_ACTION_SHOW_CHILD_EXITED, .handler = handleChildExited },
+    .{ .tag = c.GHOSTTY_ACTION_START_SEARCH, .handler = handleStartSearch },
+    .{ .tag = c.GHOSTTY_ACTION_END_SEARCH, .handler = handleEndSearch },
+    .{ .tag = c.GHOSTTY_ACTION_SEARCH_TOTAL, .handler = handleSearchTotal },
+    .{ .tag = c.GHOSTTY_ACTION_SEARCH_SELECTED, .handler = handleSearchSelected },
+};
+
+const clipboard_text_mime: [*:0]const u8 = "text/plain";
+
+/// Only the standard pasteboard exists in this host. Never alias an
+/// unsupported primary/selection request to the user's general pasteboard.
+fn supportsClipboard(clipboard: c.ghostty_clipboard_e) bool {
+    return clipboard == c.GHOSTTY_CLIPBOARD_STANDARD;
+}
+
+fn clipboardRequestsText(mimes: [*c]const [*c]const u8, mimes_len: usize) bool {
+    if (mimes == null) return false;
+    for (mimes[0..mimes_len]) |mime| {
+        if (mime != null and std.mem.eql(u8, std.mem.sliceTo(mime, 0), "text/plain")) return true;
     }
     return false;
 }
 
-/// Dispatch table covering every `ghostty_action_tag_e` value as of the
-/// vendored ghostty.h. Each entry is `{ tag, name, handler }`. Step 8
-/// fills handlers in-place — no caller change needed.
-///
-/// Order mirrors ghostty.h so a diff against an upstream bump is
-/// trivial. `name` is only used for log lines; tag is what dispatch
-/// actually compares.
-const action_table = [_]ActionEntry{
-    .{ .tag = c.GHOSTTY_ACTION_QUIT, .name = "quit", .handler = stub("quit") },
-    .{ .tag = c.GHOSTTY_ACTION_NEW_WINDOW, .name = "new_window", .handler = stub("new_window") },
-    .{ .tag = c.GHOSTTY_ACTION_NEW_TAB, .name = "new_tab", .handler = stub("new_tab") },
-    .{ .tag = c.GHOSTTY_ACTION_CLOSE_TAB, .name = "close_tab", .handler = stub("close_tab") },
-    .{ .tag = c.GHOSTTY_ACTION_NEW_SPLIT, .name = "new_split", .handler = stub("new_split") },
-    .{ .tag = c.GHOSTTY_ACTION_CLOSE_ALL_WINDOWS, .name = "close_all_windows", .handler = stub("close_all_windows") },
-    .{ .tag = c.GHOSTTY_ACTION_TOGGLE_MAXIMIZE, .name = "toggle_maximize", .handler = stub("toggle_maximize") },
-    .{ .tag = c.GHOSTTY_ACTION_TOGGLE_FULLSCREEN, .name = "toggle_fullscreen", .handler = stub("toggle_fullscreen") },
-    .{ .tag = c.GHOSTTY_ACTION_TOGGLE_TAB_OVERVIEW, .name = "toggle_tab_overview", .handler = stub("toggle_tab_overview") },
-    .{ .tag = c.GHOSTTY_ACTION_TOGGLE_WINDOW_DECORATIONS, .name = "toggle_window_decorations", .handler = stub("toggle_window_decorations") },
-    .{ .tag = c.GHOSTTY_ACTION_TOGGLE_QUICK_TERMINAL, .name = "toggle_quick_terminal", .handler = stub("toggle_quick_terminal") },
-    .{ .tag = c.GHOSTTY_ACTION_TOGGLE_COMMAND_PALETTE, .name = "toggle_command_palette", .handler = stub("toggle_command_palette") },
-    .{ .tag = c.GHOSTTY_ACTION_TOGGLE_VISIBILITY, .name = "toggle_visibility", .handler = stub("toggle_visibility") },
-    .{ .tag = c.GHOSTTY_ACTION_TOGGLE_BACKGROUND_OPACITY, .name = "toggle_background_opacity", .handler = stub("toggle_background_opacity") },
-    .{ .tag = c.GHOSTTY_ACTION_MOVE_TAB, .name = "move_tab", .handler = stub("move_tab") },
-    .{ .tag = c.GHOSTTY_ACTION_GOTO_TAB, .name = "goto_tab", .handler = stub("goto_tab") },
-    .{ .tag = c.GHOSTTY_ACTION_GOTO_SPLIT, .name = "goto_split", .handler = stub("goto_split") },
-    .{ .tag = c.GHOSTTY_ACTION_GOTO_WINDOW, .name = "goto_window", .handler = stub("goto_window") },
-    .{ .tag = c.GHOSTTY_ACTION_RESIZE_SPLIT, .name = "resize_split", .handler = stub("resize_split") },
-    .{ .tag = c.GHOSTTY_ACTION_EQUALIZE_SPLITS, .name = "equalize_splits", .handler = stub("equalize_splits") },
-    .{ .tag = c.GHOSTTY_ACTION_TOGGLE_SPLIT_ZOOM, .name = "toggle_split_zoom", .handler = stub("toggle_split_zoom") },
-    .{ .tag = c.GHOSTTY_ACTION_PRESENT_TERMINAL, .name = "present_terminal", .handler = stub("present_terminal") },
-    .{ .tag = c.GHOSTTY_ACTION_SIZE_LIMIT, .name = "size_limit", .handler = stub("size_limit") },
-    .{ .tag = c.GHOSTTY_ACTION_RESET_WINDOW_SIZE, .name = "reset_window_size", .handler = stub("reset_window_size") },
-    .{ .tag = c.GHOSTTY_ACTION_INITIAL_SIZE, .name = "initial_size", .handler = stub("initial_size") },
-    .{ .tag = c.GHOSTTY_ACTION_CELL_SIZE, .name = "cell_size", .handler = stub("cell_size") },
-    .{ .tag = c.GHOSTTY_ACTION_SCROLLBAR, .name = "scrollbar", .handler = stub("scrollbar") },
-    .{ .tag = c.GHOSTTY_ACTION_RENDER, .name = "render", .handler = stub("render") },
-    .{ .tag = c.GHOSTTY_ACTION_INSPECTOR, .name = "inspector", .handler = stub("inspector") },
-    .{ .tag = c.GHOSTTY_ACTION_SHOW_GTK_INSPECTOR, .name = "show_gtk_inspector", .handler = stub("show_gtk_inspector") },
-    .{ .tag = c.GHOSTTY_ACTION_RENDER_INSPECTOR, .name = "render_inspector", .handler = stub("render_inspector") },
-    .{ .tag = c.GHOSTTY_ACTION_DESKTOP_NOTIFICATION, .name = "desktop_notification", .handler = handleDesktopNotification },
-    .{ .tag = c.GHOSTTY_ACTION_SET_TITLE, .name = "set_title", .handler = handleSetTitle },
-    .{ .tag = c.GHOSTTY_ACTION_SET_TAB_TITLE, .name = "set_tab_title", .handler = handleSetTitle },
-    .{ .tag = c.GHOSTTY_ACTION_PROMPT_TITLE, .name = "prompt_title", .handler = stub("prompt_title") },
-    .{ .tag = c.GHOSTTY_ACTION_PWD, .name = "pwd", .handler = handlePwd },
-    .{ .tag = c.GHOSTTY_ACTION_MOUSE_SHAPE, .name = "mouse_shape", .handler = handleMouseShape },
-    .{ .tag = c.GHOSTTY_ACTION_MOUSE_VISIBILITY, .name = "mouse_visibility", .handler = handleMouseVisibility },
-    .{ .tag = c.GHOSTTY_ACTION_MOUSE_OVER_LINK, .name = "mouse_over_link", .handler = handleMouseOverLink },
-    .{ .tag = c.GHOSTTY_ACTION_RENDERER_HEALTH, .name = "renderer_health", .handler = stub("renderer_health") },
-    .{ .tag = c.GHOSTTY_ACTION_OPEN_CONFIG, .name = "open_config", .handler = stub("open_config") },
-    .{ .tag = c.GHOSTTY_ACTION_QUIT_TIMER, .name = "quit_timer", .handler = stub("quit_timer") },
-    .{ .tag = c.GHOSTTY_ACTION_FLOAT_WINDOW, .name = "float_window", .handler = stub("float_window") },
-    .{ .tag = c.GHOSTTY_ACTION_SECURE_INPUT, .name = "secure_input", .handler = handleSecureInput },
-    .{ .tag = c.GHOSTTY_ACTION_KEY_SEQUENCE, .name = "key_sequence", .handler = stub("key_sequence") },
-    .{ .tag = c.GHOSTTY_ACTION_KEY_TABLE, .name = "key_table", .handler = stub("key_table") },
-    .{ .tag = c.GHOSTTY_ACTION_COLOR_CHANGE, .name = "color_change", .handler = stub("color_change") },
-    .{ .tag = c.GHOSTTY_ACTION_RELOAD_CONFIG, .name = "reload_config", .handler = stub("reload_config") },
-    .{ .tag = c.GHOSTTY_ACTION_CONFIG_CHANGE, .name = "config_change", .handler = stub("config_change") },
-    .{ .tag = c.GHOSTTY_ACTION_CLOSE_WINDOW, .name = "close_window", .handler = stub("close_window") },
-    .{ .tag = c.GHOSTTY_ACTION_RING_BELL, .name = "ring_bell", .handler = handleRingBell },
-    .{ .tag = c.GHOSTTY_ACTION_UNDO, .name = "undo", .handler = stub("undo") },
-    .{ .tag = c.GHOSTTY_ACTION_REDO, .name = "redo", .handler = stub("redo") },
-    .{ .tag = c.GHOSTTY_ACTION_CHECK_FOR_UPDATES, .name = "check_for_updates", .handler = stub("check_for_updates") },
-    .{ .tag = c.GHOSTTY_ACTION_OPEN_URL, .name = "open_url", .handler = handleOpenUrl },
-    .{ .tag = c.GHOSTTY_ACTION_SHOW_CHILD_EXITED, .name = "show_child_exited", .handler = handleChildExited },
-    .{ .tag = c.GHOSTTY_ACTION_PROGRESS_REPORT, .name = "progress_report", .handler = stub("progress_report") },
-    .{ .tag = c.GHOSTTY_ACTION_SHOW_ON_SCREEN_KEYBOARD, .name = "show_on_screen_keyboard", .handler = stub("show_on_screen_keyboard") },
-    .{ .tag = c.GHOSTTY_ACTION_COMMAND_FINISHED, .name = "command_finished", .handler = stub("command_finished") },
-    .{ .tag = c.GHOSTTY_ACTION_START_SEARCH, .name = "start_search", .handler = handleStartSearch },
-    .{ .tag = c.GHOSTTY_ACTION_END_SEARCH, .name = "end_search", .handler = handleEndSearch },
-    .{ .tag = c.GHOSTTY_ACTION_SEARCH_TOTAL, .name = "search_total", .handler = handleSearchTotal },
-    .{ .tag = c.GHOSTTY_ACTION_SEARCH_SELECTED, .name = "search_selected", .handler = handleSearchSelected },
-    .{ .tag = c.GHOSTTY_ACTION_READONLY, .name = "readonly", .handler = stub("readonly") },
-    .{ .tag = c.GHOSTTY_ACTION_COPY_TITLE_TO_CLIPBOARD, .name = "copy_title_to_clipboard", .handler = stub("copy_title_to_clipboard") },
-};
+/// The C payload is length-delimited, not a C string. Bound the slice before
+/// forming it, preserve interior NULs, and reject malformed UTF-8 rather than
+/// letting NSString conversion truncate or silently replace clipboard text.
+fn clipboardText(entry: c.ghostty_clipboard_content_s) ?[]const u8 {
+    if (entry.mime == null or !std.mem.eql(u8, std.mem.sliceTo(entry.mime, 0), "text/plain")) return null;
+    if (entry.len > std.math.maxInt(isize)) return null;
+    if (entry.len == 0) return "";
+    if (entry.data == null) return null;
+    const bytes = entry.data[0..entry.len];
+    return if (std.unicode.utf8ValidateSlice(bytes)) bytes else null;
+}
 
-/// Surface fired `paste_from_clipboard` (or OSC 52 read). Pull the
-/// general pasteboard's text and hand it back via
-/// `ghostty_surface_complete_clipboard_request`. Cmd+V on the host
-/// short-circuits this path (pasteFromClipboard in view.zig writes
-/// directly to the surface), but ghostty-side bindings + OSC 52 reads
-/// still come through here.
+/// Serve text only when requested. Listing MIME types must not read any
+/// representation. Ghostty borrows the completion arrays and bytes only for
+/// this call, and takes ownership of state only when we return STARTED.
 fn readClipboardImpl(
     userdata: ?*anyopaque,
     clipboard: c.ghostty_clipboard_e,
     state: ?*anyopaque,
-) callconv(.c) bool {
-    _ = clipboard;
-    const surf_ptr = host_storage.app_state.ghostty.surface orelse return false;
-    _ = userdata;
-    const surf: c.ghostty_surface_t = @ptrCast(surf_ptr);
+    mimes: [*c]const [*c]const u8,
+    mimes_len: usize,
+    list: bool,
+) callconv(.c) c.ghostty_clipboard_read_result_e {
+    if (!supportsClipboard(clipboard)) return c.GHOSTTY_CLIPBOARD_READ_UNSUPPORTED;
+    const session = sessionFromUserdata(userdata) orelse return c.GHOSTTY_CLIPBOARD_READ_UNAVAILABLE;
+    const surf: c.ghostty_surface_t = @ptrCast(session.surface.?);
+    const want_text = clipboardRequestsText(mimes, mimes_len);
+    if (!want_text and !list) return c.GHOSTTY_CLIPBOARD_READ_UNAVAILABLE;
 
     const objc = @import("objc");
-    const NSPasteboard = objc.getClass("NSPasteboard") orelse return false;
-    const NSString = objc.getClass("NSString") orelse return false;
+    const NSPasteboard = objc.getClass("NSPasteboard") orelse return c.GHOSTTY_CLIPBOARD_READ_UNAVAILABLE;
+    const NSString = objc.getClass("NSString") orelse return c.GHOSTTY_CLIPBOARD_READ_UNAVAILABLE;
     const pb = NSPasteboard.msgSend(objc.Object, "generalPasteboard", .{});
+    if (pb.value == null) return c.GHOSTTY_CLIPBOARD_READ_UNAVAILABLE;
     const type_str = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "public.utf8-plain-text")});
-    const ns_str = pb.msgSend(objc.Object, "stringForType:", .{type_str});
-    if (ns_str.value == null) return false;
-    const utf8 = ns_str.msgSend([*c]const u8, "UTF8String", .{});
-    if (utf8 == null) return false;
-    c.ghostty_surface_complete_clipboard_request(surf, utf8, state, true);
-    return true;
+    if (type_str.value == null) return c.GHOSTTY_CLIPBOARD_READ_UNAVAILABLE;
+    const types = pb.msgSend(objc.Object, "types", .{});
+    const has_text = types.value != null and types.msgSend(bool, "containsObject:", .{type_str});
+    if (!has_text and !list) return c.GHOSTTY_CLIPBOARD_READ_UNAVAILABLE;
+
+    var contents: [1]c.ghostty_clipboard_content_s = undefined;
+    var contents_len: usize = 0;
+    if (want_text and has_text) {
+        const ns_str = pb.msgSend(objc.Object, "stringForType:", .{type_str});
+        if (ns_str.value == null) return c.GHOSTTY_CLIPBOARD_READ_UNAVAILABLE;
+        const len = ns_str.msgSend(c_ulong, "lengthOfBytesUsingEncoding:", .{@as(c_ulong, 4)});
+        if (len > std.math.maxInt(isize)) return c.GHOSTTY_CLIPBOARD_READ_UNAVAILABLE;
+        const utf8 = ns_str.msgSend([*c]const u8, "UTF8String", .{});
+        if (utf8 == null) return c.GHOSTTY_CLIPBOARD_READ_UNAVAILABLE;
+        contents[0] = .{ .mime = clipboard_text_mime, .data = utf8, .len = len };
+        contents_len = 1;
+    }
+    const available = [_][*c]const u8{clipboard_text_mime};
+    const complete: c.ghostty_clipboard_complete_s = .{
+        .contents = if (contents_len > 0) &contents else null,
+        .contents_len = contents_len,
+        .available = if (list and has_text) &available else null,
+        .available_len = if (list and has_text) 1 else 0,
+        .confirmed = false,
+        .remember = false,
+    };
+    c.ghostty_surface_complete_clipboard_request(surf, &complete, state);
+    return c.GHOSTTY_CLIPBOARD_READ_STARTED;
 }
 
 fn confirmReadClipboardStub(
     userdata: ?*anyopaque,
-    text: [*c]const u8,
+    payload: [*c]const c.ghostty_clipboard_confirm_s,
     state: ?*anyopaque,
     request: c.ghostty_clipboard_request_e,
 ) callconv(.c) void {
-    _ = userdata;
-    _ = text;
-    _ = state;
+    _ = payload;
     _ = request;
+    // No permission UI: explicitly DENY, never complete with confirmed=true.
+    // This also sends protocol denial replies and releases request ownership.
+    const session = sessionFromUserdata(userdata) orelse return;
+    c.ghostty_surface_deny_clipboard_request(@ptrCast(session.surface.?), state);
 }
 
-/// Surface fired `copy_to_clipboard` (or OSC 52 write). Iterate the
-/// content array and push each `text/plain` entry to the macOS general
-/// pasteboard. ghostty.app additionally gates OSC 52 writes behind a
-/// confirmation dialog when `confirm=true`; we just write through for
-/// now — Quake-drop UX, single user, no shared X11-style selection
-/// pasteboard to worry about. `clipboard=SELECTION` (Linux primary
-/// selection) collapses onto the general pasteboard on macOS.
+/// Normal text copy/OSC 52 write remains supported. Confirmation-required
+/// writes fail closed, and unsupported/binary representations leave the
+/// pasteboard untouched. Kitty writes requiring permission enter the confirm
+/// callback above before Ghostty invokes this write callback.
 fn writeClipboardImpl(
     userdata: ?*anyopaque,
     clipboard: c.ghostty_clipboard_e,
@@ -981,43 +1101,232 @@ fn writeClipboardImpl(
     contents_len: usize,
     confirm: bool,
 ) callconv(.c) void {
-    _ = userdata;
-    _ = clipboard;
-    _ = confirm;
-    if (contents_len == 0) return;
+    _ = sessionFromUserdata(userdata) orelse return;
+    if (confirm or !supportsClipboard(clipboard) or contents == null or contents_len == 0) return;
 
     const objc = @import("objc");
     const NSPasteboard = objc.getClass("NSPasteboard") orelse return;
     const NSString = objc.getClass("NSString") orelse return;
     const pb = NSPasteboard.msgSend(objc.Object, "generalPasteboard", .{});
-    _ = pb.msgSend(c_long, "clearContents", .{});
+    if (pb.value == null) return;
+    const type_str = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "public.utf8-plain-text")});
+    if (type_str.value == null) return;
 
-    var wrote_any = false;
-    var i: usize = 0;
-    while (i < contents_len) : (i += 1) {
-        const entry = contents[i];
-        if (entry.mime == null or entry.data == null) continue;
-        const mime = std.mem.sliceTo(entry.mime, 0);
-        // text/plain → NSPasteboardTypeString. Other mime types (HTML,
-        // image) ghostty doesn't currently emit; ignore until needed.
-        if (!std.mem.eql(u8, mime, "text/plain")) continue;
-
-        const data_str = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{entry.data});
-        const type_str = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "public.utf8-plain-text")});
-        _ = pb.msgSend(c_long, "setString:forType:", .{ data_str, type_str });
-        wrote_any = true;
+    var cleared = false;
+    for (contents[0..contents_len]) |entry| {
+        const bytes = clipboardText(entry) orelse continue;
+        const data_str = NSString.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "initWithBytes:length:encoding:", .{ bytes.ptr, @as(c_ulong, bytes.len), @as(c_ulong, 4) });
+        if (data_str.value == null) continue;
+        defer data_str.msgSend(void, "release", .{});
+        if (!cleared) {
+            _ = pb.msgSend(c_long, "clearContents", .{});
+            cleared = true;
+        }
+        _ = pb.msgSend(bool, "setString:forType:", .{ data_str, type_str });
     }
-    if (!wrote_any) return;
 }
 
 fn closeSurfaceStub(userdata: ?*anyopaque, _: bool) callconv(.c) void {
-    // Surface requested close — only fires for paths NOT suppressed by
-    // handleChildExited (returning true there short-circuits this).
-    // Reaches here on app shutdown / forced close. Hide the panel;
-    // per-session `exited` state is owned by handleChildExited where
-    // target.surface lets us identify the right session.
-    const host = hostFromUserdata(userdata) orelse return;
-    if (host.app_state.window.panel) |p| {
-        dispatch_async_f(@ptrCast(c_dispatch.dispatch_get_main_queue()), p, &closePanelMain);
-    }
+    const session = sessionFromUserdata(userdata) orelse return;
+    const lifecycle = @import("surface_lifecycle.zig");
+    const allocator = host_storage.app_state.allocator orelse return;
+    const ticket = allocator.create(lifecycle.Ticket) catch return;
+    ticket.* = .{ .session_id = session.id, .generation = session.surface_generation };
+    dispatch_async_f(@ptrCast(c_dispatch.dispatch_get_main_queue()), ticket, &closeSessionMain);
+}
+
+test "clipboard text uses explicit byte lengths and preserves interior NULs" {
+    const data = [_]u8{ 'a', 0, 0xc3, 0xa9, 'z', 0xff };
+    const entry: c.ghostty_clipboard_content_s = .{
+        .mime = "text/plain",
+        .data = &data,
+        .len = 5,
+    };
+    try std.testing.expectEqualSlices(u8, data[0..5], clipboardText(entry).?);
+    var partial = entry;
+    partial.len = 3; // Mid-codepoint: reject rather than truncate or replace.
+    try std.testing.expect(clipboardText(partial) == null);
+    partial.len = data.len; // Invalid trailing byte must not be ignored.
+    try std.testing.expect(clipboardText(partial) == null);
+    partial.len = 1;
+    try std.testing.expectEqualStrings("a", clipboardText(partial).?);
+}
+
+test "clipboard text rejects invalid payloads without reading past the declared length" {
+    var entry: c.ghostty_clipboard_content_s = .{ .mime = "text/plain", .data = null, .len = 0 };
+    try std.testing.expectEqualStrings("", clipboardText(entry).?);
+    entry.len = 1;
+    try std.testing.expect(clipboardText(entry) == null);
+    entry.data = @ptrFromInt(16);
+    entry.len = @as(usize, std.math.maxInt(isize)) + 1;
+    try std.testing.expect(clipboardText(entry) == null); // No dereference.
+    entry.len = 0;
+    entry.mime = null;
+    try std.testing.expect(clipboardText(entry) == null);
+    entry.mime = "image/png";
+    try std.testing.expect(clipboardText(entry) == null);
+}
+
+test "clipboard requests serve only standard text and list-only requests do not select data" {
+    try std.testing.expect(supportsClipboard(c.GHOSTTY_CLIPBOARD_STANDARD));
+    try std.testing.expect(!supportsClipboard(c.GHOSTTY_CLIPBOARD_SELECTION));
+    try std.testing.expect(!supportsClipboard(c.GHOSTTY_CLIPBOARD_PRIMARY));
+    const mixed = [_][*c]const u8{ "image/png", null, "text/plain" };
+    try std.testing.expect(clipboardRequestsText(&mixed, mixed.len));
+    try std.testing.expect(!clipboardRequestsText(&mixed, 2));
+    try std.testing.expect(!clipboardRequestsText(&mixed, 0));
+    try std.testing.expect(!clipboardRequestsText(null, 0));
+    try std.testing.expect(!clipboardRequestsText(null, 1));
+}
+
+test "host input transitions balance only the active visible focused source" {
+    // Simulate the SAME transition planner used by the native bridge, without
+    // calling privacy APIs or AppKit. Count only edges, not repeated requests.
+    const Recorder = struct {
+        state: HostInputState = .{},
+        enables: usize = 0,
+        disables: usize = 0,
+        hides: usize = 0,
+        unhides: usize = 0,
+
+        fn apply(self: *@This(), source: ?*const Session) void {
+            const next = inputStateForSession(source);
+            const changes = inputChanges(self.state, next);
+            if (changes.secure) |on| {
+                if (on) self.enables += 1 else self.disables += 1;
+            }
+            if (changes.cursor_hidden) |hidden| {
+                if (hidden) self.hides += 1 else self.unhides += 1;
+            }
+            self.state = next;
+        }
+    };
+    var a: Session = .{ .id = 1, .profile = .{ .name = "a" }, .surface = @ptrFromInt(16) };
+    var b: Session = .{ .id = 2, .profile = .{ .name = "b" }, .surface = @ptrFromInt(32) };
+    var recorder: Recorder = .{};
+    a.requested_secure_input = true;
+    a.requested_cursor_hidden = true;
+    recorder.apply(&a); // new surfaces begin hidden/unfocused
+    try std.testing.expectEqual(@as(usize, 0), recorder.enables);
+    a.surface_focused = true;
+    recorder.apply(&a); // focus alone is insufficient
+    try std.testing.expectEqual(@as(usize, 0), recorder.hides);
+    a.surface_visible = true;
+    recorder.apply(&a);
+    recorder.apply(&a); // duplicate ON/hidden must not stack references
+    try std.testing.expectEqual(@as(usize, 1), recorder.enables);
+    try std.testing.expectEqual(@as(usize, 1), recorder.hides);
+    b.requested_secure_input = true;
+    b.requested_cursor_hidden = true;
+    b.mouse_over_link = true;
+    recorder.apply(&a); // inactive source cannot change the host cursor
+    try std.testing.expectEqualStrings("IBeamCursor", recorder.state.cursor_selector.?);
+    a.surface_focused = false; // blur releases, requests remain session-owned
+    recorder.apply(&a);
+    try std.testing.expectEqual(@as(usize, 1), recorder.disables);
+    try std.testing.expectEqual(@as(usize, 1), recorder.unhides);
+    a.surface_focused = true;
+    recorder.apply(&a);
+    a.surface_visible = false; // occlusion also releases despite stale focus
+    recorder.apply(&a);
+    b.surface_visible = true;
+    b.surface_focused = true;
+    recorder.apply(&b); // active source switched
+    try std.testing.expectEqualStrings("pointingHandCursor", recorder.state.cursor_selector.?);
+    a.surface_visible = true;
+    recorder.apply(&a); // handoff between two ON sources needs no extra acquire
+    try std.testing.expectEqualStrings("IBeamCursor", recorder.state.cursor_selector.?);
+    recorder.apply(&b);
+    try std.testing.expectEqual(@as(usize, 3), recorder.enables);
+    try std.testing.expectEqual(@as(usize, 3), recorder.hides);
+    clearSessionInput(&a); // destroying inactive a cannot release b's references
+    recorder.apply(&b);
+    try std.testing.expect(recorder.state.secure);
+    clearSessionInput(&b); // destroy must release BEFORE surface is cleared
+    recorder.apply(&b);
+    try std.testing.expect(b.surface != null);
+    try std.testing.expect(recorder.state.cursor_selector == null);
+    try std.testing.expect(!b.requested_secure_input and !b.requested_cursor_hidden);
+    b.surface = null;
+    recorder.apply(&b);
+    b.surface = @ptrFromInt(48); // restart cannot inherit old requests
+    b.surface_visible = true;
+    b.surface_focused = true;
+    recorder.apply(&b);
+    recorder.apply(null); // app teardown is idempotent
+    recorder.apply(null);
+    try std.testing.expectEqual(@as(usize, 3), recorder.enables);
+    try std.testing.expectEqual(recorder.enables, recorder.disables);
+    try std.testing.expectEqual(@as(usize, 3), recorder.hides);
+    try std.testing.expectEqual(recorder.hides, recorder.unhides);
+}
+
+test "secure input ON OFF and TOGGLE are session-local and idempotent" {
+    try std.testing.expect(secureInputRequest(false, c.GHOSTTY_SECURE_INPUT_ON).?);
+    try std.testing.expect(secureInputRequest(true, c.GHOSTTY_SECURE_INPUT_ON).?);
+    try std.testing.expect(!secureInputRequest(true, c.GHOSTTY_SECURE_INPUT_OFF).?);
+    try std.testing.expect(!secureInputRequest(false, c.GHOSTTY_SECURE_INPUT_OFF).?);
+    try std.testing.expect(secureInputRequest(false, c.GHOSTTY_SECURE_INPUT_TOGGLE).?);
+    try std.testing.expect(!secureInputRequest(true, c.GHOSTTY_SECURE_INPUT_TOGGLE).?);
+    const current: HostInputState = .{ .secure = true, .cursor_hidden = true, .cursor_selector = "IBeamCursor" };
+    const changes = inputChanges(current, current);
+    try std.testing.expect(changes.secure == null and changes.cursor_hidden == null and !changes.cursor_shape);
+}
+
+test "pending construction title routing requires member userdata and generation" {
+    var sessions = [_]Session{
+        .{ .id = 1, .profile = .{ .name = "active" }, .surface = @ptrFromInt(16) },
+        .{ .id = 2, .profile = .{ .name = "constructing" }, .surface_generation = 4 },
+    };
+    const pending: PendingConstruction = .{ .session = &sessions[1], .generation = 4 };
+    try std.testing.expect(pending.matches(&sessions, null) == null);
+    try std.testing.expect(pending.matches(&sessions, &sessions[0]) == null);
+    try std.testing.expect(pending.matches(&sessions, @ptrFromInt(48)) == null);
+    try std.testing.expect(pending.matches(&sessions, &sessions[1]) == &sessions[1]);
+    setSessionTitle(pending.matches(&sessions, &sessions[1]).?, "initial title");
+    try std.testing.expectEqualStrings("initial title", sessions[1].label());
+    try std.testing.expectEqualStrings("active", sessions[0].label());
+    sessions[1].surface_generation += 1;
+    try std.testing.expect(pending.matches(&sessions, &sessions[1]) == null);
+    sessions[1].surface_generation = 4;
+    sessions[1].surface = @ptrFromInt(32);
+    try std.testing.expect(pending.matches(&sessions, &sessions[1]) == null);
+    sessions[1].surface = null;
+    try std.testing.expect(pending.matches(sessions[0..1], &sessions[1]) == null);
+}
+
+test "surface routing preserves source and rejects absent or replaced handles" {
+    const a: *anyopaque = @ptrFromInt(0x1000);
+    const b: *anyopaque = @ptrFromInt(0x2000);
+    var sessions = [_]Session{
+        .{ .id = 1, .profile = .{ .name = "shell" }, .surface = a },
+        .{ .id = 2, .profile = .{ .name = "tools" }, .surface = b },
+    };
+    try std.testing.expectEqual(@as(u64, 2), sessionForSurface(&sessions, b).?.id);
+    try std.testing.expectEqual(@as(u64, 1), sessionForSurface(&sessions, a).?.id);
+    try std.testing.expect(sessionForSurface(&sessions, null) == null);
+    sessions[1].surface = @ptrFromInt(0x3000);
+    try std.testing.expect(sessionForSurface(&sessions, b) == null);
+}
+
+test "terminal titles are bounded display text with intact UTF-8" {
+    var session: Session = .{ .id = 1, .profile = .{ .name = "shell" } };
+    setSessionTitle(&session, "task\nready\x1b");
+    try std.testing.expectEqualStrings("task ready ", session.label());
+    const long: [200][2]u8 = @splat("é".*);
+    setSessionTitle(&session, std.mem.asBytes(&long));
+    try std.testing.expectEqual(@as(usize, 256), session.terminal_title_len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(session.label()));
+    setSessionTitle(&session, "bad\xff");
+    try std.testing.expectEqualStrings("bad", session.label());
+    session.profile.title = "Pinned";
+    try std.testing.expectEqualStrings("Pinned", session.label());
+}
+
+fn closeSessionMain(raw: ?*anyopaque) callconv(.c) void {
+    const lifecycle = @import("surface_lifecycle.zig");
+    const ticket: *lifecycle.Ticket = @ptrCast(@alignCast(raw orelse return));
+    const allocator = host_storage.app_state.allocator orelse return;
+    defer allocator.destroy(ticket);
+    lifecycle.closeRequested(ticket.*);
 }

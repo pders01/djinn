@@ -72,6 +72,11 @@ pub const GDBusSignalCallback = *const fn (
     user_data: gpointer,
 ) callconv(.c) void;
 
+// ─── Cancellation ────────────────────────────────────────────────────
+
+pub extern "c" fn g_cancellable_new() *GCancellable;
+pub extern "c" fn g_cancellable_cancel(cancellable: *GCancellable) void;
+
 // ─── Bus + connection ────────────────────────────────────────────────
 
 pub extern "c" fn g_bus_get_sync(

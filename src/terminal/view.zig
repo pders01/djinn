@@ -1,47 +1,133 @@
 const std = @import("std");
+const platform = @import("../io/platform.zig");
 const objc = @import("objc");
 const app = @import("../app.zig");
 const ghostty_runtime = @import("../ghostty/runtime.zig");
-const AgentState = @import("../agent/state.zig").AgentState;
-const Agent = @import("../agent/state.zig").Agent;
-const LogView = @import("../agent/log_view.zig").LogView;
-const Menubar = @import("../notify/menubar.zig").Menubar;
-const MenubarAgentState = @import("../notify/menubar.zig").AgentState;
 const menubar_mod = @import("../notify/menubar.zig");
 const tis = @import("tis.zig");
 const chrome_mod = @import("../chrome.zig");
 const keymap = @import("keymap.zig");
 const find = @import("find.zig");
 const font_mod = @import("font.zig");
-const divider_mod = @import("divider.zig");
-const dragdrop = @import("dragdrop.zig");
 const ime = @import("ime.zig");
-const theme_apply = @import("theme_apply.zig");
+const Ticket = @import("../ghostty/surface_lifecycle.zig").Ticket;
+const Session = @import("../session/manager.zig").Session;
 
-const cg = @cImport({
-    @cInclude("CoreGraphics/CoreGraphics.h");
-    @cInclude("CoreText/CoreText.h");
-});
+const cg = @import("darwin-c");
 
 pub const NSPoint = extern struct { x: f64, y: f64 };
 pub const NSSize = extern struct { width: f64, height: f64 };
 pub const NSRect = extern struct { origin: NSPoint, size: NSSize };
 pub const NSRange = extern struct { location: c_ulong, length: c_ulong };
 
-// Module-private state lives here; everything cross-callback flows through
-// `app.g`. `g_class_registered` and the PTY read buffer stay local because
-// they're implementation details of view-class registration / drain — no
-// other module reads them.
+// Cross-callback state lives in app.g; class registration stays local.
 var g_class_registered: bool = false;
 
-/// Forward a UTF-8 text blob to the ghostty surface (paste / drop /
-/// IME commit / unmapped-key fallback path). Returns false when the
-/// surface isn't bound yet — caller decides whether that's a hard
-/// failure (drag-drop) or silent (key fallback).
+/// Main-thread physical key ownership, separate from modifier flagsChanged
+/// reporting. macOS virtual keycodes fit in one byte. Never retain a surface
+/// pointer: a press belongs to one session incarnation until its release.
+const ForwardedKeys = struct {
+    sources: [256]?Ticket = @splat(null),
+
+    fn begin(self: *ForwardedKeys, keycode: u16, repeat: bool) void {
+        if (keycode < self.sources.len and !repeat) self.sources[keycode] = null;
+    }
+
+    fn forward(self: *ForwardedKeys, keycode: u16, repeat: bool, source: Ticket) bool {
+        if (keycode >= self.sources.len) return false;
+        if (repeat) {
+            const original = self.sources[keycode] orelse return false;
+            // A consumed initial press cannot become a terminal repeat,
+            // and holding a key across a tab switch cannot transfer it.
+            return original.session_id == source.session_id and original.generation == source.generation;
+        }
+        self.sources[keycode] = source;
+        return true;
+    }
+
+    fn release(self: *ForwardedKeys, keycode: u16) ?Ticket {
+        if (keycode >= self.sources.len) return null;
+        const source = self.sources[keycode];
+        self.sources[keycode] = null;
+        return source;
+    }
+};
+
+var g_forwarded_keys: ForwardedKeys = .{};
+
+fn keySourceSurface(ticket: Ticket, sessions: []const Session) ?*anyopaque {
+    for (sessions) |*session| {
+        if (ticket.matches(session)) return session.surface;
+    }
+    return null;
+}
+
+fn activeKeySource(surface: *anyopaque) ?Ticket {
+    const sm = app.g.session_manager orelse return null;
+    const session = sm.active();
+    if (session.surface != surface) return null;
+    return .{ .session_id = session.id, .generation = session.surface_generation };
+}
+
+test "key releases require a forwarded physical press and preserve repeat ownership" {
+    var keys: ForwardedKeys = .{};
+    const source: Ticket = .{ .session_id = 1, .generation = 3 };
+    const other: Ticket = .{ .session_id = 2, .generation = 1 };
+    // Host/find/IME consumed the down: even a later repeat cannot acquire it.
+    keys.begin(12, false);
+    keys.begin(12, true);
+    try std.testing.expect(!keys.forward(12, true, source));
+    try std.testing.expectEqual(@as(?Ticket, null), keys.release(12));
+
+    keys.begin(12, false);
+    try std.testing.expect(keys.forward(12, false, source));
+    keys.begin(12, true);
+    try std.testing.expect(keys.forward(12, true, source));
+    try std.testing.expect(!keys.forward(12, true, other));
+    try std.testing.expectEqualDeep(source, keys.release(12).?);
+    try std.testing.expectEqual(@as(?Ticket, null), keys.release(12));
+
+    // A fresh, consumed down clears a stale press if AppKit lost its up.
+    try std.testing.expect(keys.forward(12, false, source));
+    keys.begin(12, false);
+    try std.testing.expectEqual(@as(?Ticket, null), keys.release(12));
+    // Independent held keys must not clear one another.
+    try std.testing.expect(keys.forward(12, false, source));
+    keys.begin(13, false);
+    try std.testing.expect(keys.forward(13, false, other));
+    try std.testing.expectEqualDeep(source, keys.release(12).?);
+    try std.testing.expectEqualDeep(other, keys.release(13).?);
+}
+
+test "key release resolves the live source not the active or replacement surface" {
+    const first: *anyopaque = @ptrFromInt(0x1000);
+    const second: *anyopaque = @ptrFromInt(0x2000);
+    var sessions = [_]Session{
+        .{ .id = 1, .surface_generation = 3, .surface = first, .profile = .{ .name = "first" } },
+        .{ .id = 2, .surface_generation = 1, .surface = second, .profile = .{ .name = "second" } },
+    };
+    const source: Ticket = .{ .session_id = 1, .generation = 3 };
+    // Source need not be the selected session or the first array entry.
+    std.mem.swap(Session, &sessions[0], &sessions[1]);
+    try std.testing.expectEqual(first, keySourceSurface(source, &sessions).?);
+    sessions[1].surface = null;
+    try std.testing.expectEqual(@as(?*anyopaque, null), keySourceSurface(source, &sessions));
+    sessions[1].surface = first; // allocator may reuse the same address
+    sessions[1].surface_generation += 1;
+    try std.testing.expectEqual(@as(?*anyopaque, null), keySourceSurface(source, &sessions));
+    try std.testing.expectEqual(@as(?*anyopaque, null), keySourceSurface(source, sessions[0..1]));
+}
+
+/// Explicit paste/drop input uses Ghostty's protected paste API. IME commits
+/// use ghostty_surface_text separately in ime.zig; they must not trigger paste
+/// confirmation. Ghostty copies the sentinel-terminated payload before return.
 fn forwardText(text: []const u8) bool {
     const surf_ptr = app.g.ghostty.surface orelse return false;
+    const allocator = std.heap.page_allocator;
+    const text_z = allocator.dupeSentinel(u8, text, 0) catch return false;
+    defer allocator.free(text_z);
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
-    ghostty_runtime.c.ghostty_surface_text(surf, text.ptr, text.len);
+    ghostty_runtime.c.ghostty_surface_paste_text(surf, text_z.ptr, text_z.len);
     return true;
 }
 
@@ -100,7 +186,7 @@ pub const TerminalView = struct {
         // Drag-drop types: file URLs (Finder), and raw image data (PNG/
         // TIFF) so screenshots / Photos / browser image drags also reach
         // performDragOperation. We save image bytes to /tmp and paste
-        // the path so CC's Read tool can pick the file up.
+        // the path for the running command to consume.
         const NSString = objc.getClass("NSString") orelse return error.ClassNotFound;
         const NSArray = objc.getClass("NSArray") orelse return error.ClassNotFound;
         const file_url_type = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "public.file-url")});
@@ -132,11 +218,26 @@ pub const TerminalView = struct {
             @as(?*anyopaque, null),
         });
         view.msgSend(void, "addTrackingArea:", .{ta});
+        ta.msgSend(void, "release", .{});
 
         // Find-overlay NSTextField — read-only display chip parented
         // to the terminal view. See `find.createOverlay` for the layer
         // setup and find-mode dataflow.
         try find.createOverlay(view, width, height, style);
+
+        // Frame/bounds notifications fire for programmatic and hidden-view
+        // changes as well as live resize. No host polling timer is needed.
+        view.msgSend(void, "setPostsFrameChangedNotifications:", .{@as(c_int, 1)});
+        view.msgSend(void, "setPostsBoundsChangedNotifications:", .{@as(c_int, 1)});
+        if (objc.getClass("NSNotificationCenter")) |NotificationCenter| {
+            const center = NotificationCenter.msgSend(objc.Object, "defaultCenter", .{});
+            for ([_][*:0]const u8{ "NSViewFrameDidChangeNotification", "NSViewBoundsDidChangeNotification" }) |name| {
+                const ns_name = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, name)});
+                center.msgSend(void, "addObserver:selector:name:object:", .{
+                    view, objc.sel("djinnViewGeometryDidChange:"), ns_name, view,
+                });
+            }
+        }
 
         return .{ .view = view, .cell_w = metrics.cell_w, .cell_h = metrics.cell_h };
     }
@@ -150,19 +251,7 @@ pub const TerminalView = struct {
     }
 
     pub fn attach(self: *TerminalView) void {
-        _ = self;
-        startTickTimer();
-    }
-
-    pub fn observeAgent(self: *TerminalView, state: *AgentState, menubar: *Menubar) void {
-        _ = self;
-        app.g.agent.state = state;
-        app.g.agent.menubar = menubar;
-    }
-
-    pub fn observeLog(self: *TerminalView, log_view: *LogView) void {
-        _ = self;
-        app.g.agent.log_view = log_view;
+        checkResize(self.view);
     }
 };
 
@@ -177,7 +266,7 @@ fn registerClass() void {
     _ = cls.addMethod("resignFirstResponder", resignFirstResponderImpl);
     _ = cls.addMethod("flagsChanged:", flagsChangedImpl);
     _ = cls.addMethod("keyDown:", keyDownImpl);
-    _ = cls.addMethod("tick:", tickImpl);
+    _ = cls.addMethod("djinnViewGeometryDidChange:", geometryDidChangeImpl);
     _ = cls.addMethod("mouseDown:", mouseDownImpl);
     _ = cls.addMethod("mouseDragged:", mouseDraggedImpl);
     _ = cls.addMethod("mouseUp:", mouseUpImpl);
@@ -200,14 +289,14 @@ fn registerClass() void {
     _ = cls.addMethod("viewDidChangeEffectiveAppearance", viewDidChangeEffectiveAppearanceImpl);
     _ = cls.addMethod("resetCursorRects", resetCursorRectsImpl);
     // Drag-drop: NSDraggingDestination protocol — file URLs paste as text.
-    _ = cls.addMethod("draggingEntered:", dragdrop.draggingEnteredImpl);
-    _ = cls.addMethod("performDragOperation:", dragdrop.performDragOperationImpl);
+    _ = cls.addMethod("draggingEntered:", draggingEnteredImpl);
+    _ = cls.addMethod("performDragOperation:", performDragOperationImpl);
     // NSTextInputClient — wires IME for non-Latin input. AppKit calls
     // back into these in response to inputContext.handleEvent: from
     // keyDownImpl. Without these the view is invisible to input
     // sources (Korean/Japanese/Chinese), pinyin candidates, dead keys.
     _ = cls.addMethod("insertText:replacementRange:", ime.insertTextImpl);
-    _ = cls.addMethod("doCommandBySelector:", ime.doCommandBySelectorImpl);
+    _ = cls.addMethod("doCommandBySelector:", imeCommandImpl);
     _ = cls.addMethod("setMarkedText:selectedRange:replacementRange:", ime.setMarkedTextImpl);
     _ = cls.addMethod("unmarkText", ime.unmarkTextImpl);
     _ = cls.addMethod("selectedRange", ime.selectedRangeImpl);
@@ -246,20 +335,28 @@ fn syncLayerScale(view: objc.Object) void {
     layer.msgSend(void, "setContentsScale:", .{scale});
 }
 
+fn geometryDidChangeImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
+    checkResize(objc.Object.fromId(self_id));
+}
+
 fn viewDidChangeBackingPropertiesImpl(self_id: objc.c.id, _: objc.c.SEL) callconv(.c) void {
-    syncLayerScale(objc.Object.fromId(self_id));
+    const view = objc.Object.fromId(self_id);
+    syncLayerScale(view);
+    checkResize(view);
 }
 
 fn viewDidMoveToWindowImpl(self_id: objc.c.id, _: objc.c.SEL) callconv(.c) void {
-    syncLayerScale(objc.Object.fromId(self_id));
+    const view = objc.Object.fromId(self_id);
+    syncLayerScale(view);
+    checkResize(view);
 }
 
 /// AppKit calls this when system appearance flips (light ↔ dark) for
 /// any view in the hierarchy. Re-resolve the theme through the same
 /// pipeline main() uses on startup, then reapply colors to the
-/// terminal, log pane, and panel without rebuilding anything.
+/// terminal and panel without rebuilding anything.
 fn viewDidChangeEffectiveAppearanceImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) void {
-    theme_apply.reapply();
+    reapplyTheme();
 }
 
 /// AppKit calls resetCursorRects whenever it needs to rebuild cursor
@@ -274,124 +371,194 @@ fn resetCursorRectsImpl(self_id: objc.c.id, _: objc.c.SEL) callconv(.c) void {
     view.msgSend(void, "addCursorRect:cursor:", .{ bounds, ibeam });
 }
 
-/// Final fixup after the user releases a window resize drag. AppKit may
-/// suppress redraws during live resize for performance; once the drag ends
-/// we force a fresh render-state snapshot + setNeedsDisplay on every surface
-/// so neither pane ends up blank.
-fn viewDidEndLiveResizeImpl(self_id: objc.c.id, _: objc.c.SEL) callconv(.c) void {
-    const view = objc.Object.fromId(self_id);
-    checkResize(view);
-    if (app.g.agent.log_view) |lv| {
-        lv.view.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
-        lv.scroll.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
-        lv.text_view.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
-    }
+/// NSDraggingDestination protocol: tell AppKit we accept the drag.
+/// Returns NSDragOperationCopy so the cursor shows the "+" badge.
+fn draggingEnteredImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) c_ulong {
+    return 1; // NSDragOperationCopy
 }
 
-/// Push current view bounds + backing scale into the ghostty surface
-/// every tick. Cheap — surfaceSetSize / surfaceSetContentScale dedupe
-/// internally. Also pokes the log pane to repaint, since its layout
-/// can lag behind a window-resize cascade.
-pub fn checkResize(view: objc.Object) void {
-    const bounds = view.msgSend(NSRect, "bounds", .{});
+/// Pull file URLs off the dragging pasteboard, format paths into a
+/// shell-safe space-separated string, and paste them into the PTY.
+/// Wraps in single quotes when paths contain whitespace or shell
+/// metacharacters; otherwise writes the raw path so completion + tab
+/// expansion still chain cleanly. Uses bracketed paste when the running
+/// TUI requested DEC mode 2004 — the application treats the result as a
+/// pasted block instead of typed input.
+fn performDragOperationImpl(_: objc.c.id, _: objc.c.SEL, sender_id: objc.c.id) callconv(.c) bool {
+    const sender = objc.Object.fromId(sender_id);
+    const pb = sender.msgSend(objc.Object, "draggingPasteboard", .{});
+    if (pb.value == null) return false;
 
-    // Push size + scale to the ghostty surface. The
-    // surface_host's bounds tracks `view`'s frame (sibling, same
-    // autoresize mask), so we use this view's bounds + window scale.
-    // ghostty's CADisplayLink handles the actual refresh tick.
-    if (app.g.ghostty.surface) |surf_ptr| {
-        const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
-        const window = view.msgSend(objc.Object, "window", .{});
-        const scale: f64 = if (window.value != null) window.msgSend(f64, "backingScaleFactor", .{}) else 1.0;
-        const px_w: u32 = @intFromFloat(@max(1.0, bounds.size.width) * scale);
-        const px_h: u32 = @intFromFloat(@max(1.0, bounds.size.height) * scale);
-        ghostty_runtime.surfaceSetContentScale(surf, scale);
-        ghostty_runtime.surfaceSetSize(surf, px_w, px_h);
+    const NSArray = objc.getClass("NSArray") orelse return false;
+    const NSURL = objc.getClass("NSURL") orelse return false;
+    const classes = NSArray.msgSend(objc.Object, "arrayWithObject:", .{NSURL});
+    const items = pb.msgSend(objc.Object, "readObjectsForClasses:options:", .{ classes, @as(?*anyopaque, null) });
+    const count: c_ulong = if (items.value != null) items.msgSend(c_ulong, "count", .{}) else 0;
+
+    if (count == 0) {
+        // No file URLs → try raw image data (screenshots, Photos drags,
+        // browser image drags). Save bytes to /tmp and paste the path.
+        return tryDropImage(pb);
     }
 
-    // Split-view layout pass during a window resize doesn't reliably
-    // propagate setNeedsDisplay down to the log pane's clip view +
-    // text view; force them explicitly so the panel doesn't end up
-    // with empty rectangles after the user lets go.
-    if (app.g.agent.log_view) |lv| {
-        lv.view.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
-        lv.scroll.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
-        lv.text_view.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
-        const clip = lv.scroll.msgSend(objc.Object, "contentView", .{});
-        if (clip.value != null) clip.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
-    }
-}
+    var buf: [4096]u8 = undefined;
+    var len: usize = 0;
+    var i: c_ulong = 0;
+    while (i < count) : (i += 1) {
+        const url = items.msgSend(objc.Object, "objectAtIndex:", .{i});
+        if (url.value == null) continue;
+        const path_str = url.msgSend(objc.Object, "path", .{});
+        if (path_str.value == null) continue;
+        const utf8_ptr = path_str.msgSend([*c]const u8, "UTF8String", .{});
+        if (utf8_ptr == null) continue;
+        const path = std.mem.sliceTo(utf8_ptr, 0);
+        if (path.len == 0) continue;
 
-/// Schedule a 60Hz timer that drains the PTY and redraws. Runs on main thread.
-/// Registered in `NSRunLoopCommonModes` so it keeps firing during window drags
-/// (event-tracking mode) — without that, the tick freezes during a resize and
-/// the panel ends up blank afterward, because the post-resize PTY redraw from
-/// the shell never gets drained.
-fn startTickTimer() void {
-    const view_id = app.g.term.view_id orelse return;
-    const NSTimer = objc.getClass("NSTimer") orelse return;
-    const NSRunLoop = objc.getClass("NSRunLoop") orelse return;
-    const NSString = objc.getClass("NSString") orelse return;
-
-    const timer = NSTimer.msgSend(
-        objc.Object,
-        "timerWithTimeInterval:target:selector:userInfo:repeats:",
-        .{
-            @as(f64, 1.0 / 60.0),
-            objc.Object.fromId(view_id),
-            objc.sel("tick:"),
-            @as(?*anyopaque, null),
-            @as(c_int, 1),
-        },
-    );
-    const main_loop = NSRunLoop.msgSend(objc.Object, "mainRunLoop", .{});
-    const common_modes = NSString.msgSend(
-        objc.Object,
-        "stringWithUTF8String:",
-        .{@as([*c]const u8, "kCFRunLoopCommonModes")},
-    );
-    main_loop.msgSend(void, "addTimer:forMode:", .{ timer, common_modes });
-}
-
-fn tickImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
-    app.g.agent.tick_count +%= 1;
-
-    const view = objc.Object.fromId(self_id);
-    checkResize(view);
-
-    // PTY drain moved to a kqueue-backed dispatch_source_t (see
-    // ptyReadHandler). Tick now only covers what's still polled:
-    // window resize, agent-state sync, and the cursor-blink cadence.
-
-    // (cursor blink + visual bell flash retired in step 10 — surface
-    // owns both.)
-
-    // Poll agent state every 15 ticks (~250ms at 60Hz).
-    if (app.g.agent.tick_count % 15 == 0) {
-        if (app.g.agent.state) |state| {
-            if (app.g.agent.log_view) |lv| lv.syncFrom(state);
-
-            if (app.g.agent.menubar) |menubar| {
-                const snap = state.snapshot();
-                if (snap.state != app.g.agent.last_state or app.g.agent.tick_count == 15) {
-                    const mb_state: MenubarAgentState = switch (snap.state) {
-                        .idle => .idle,
-                        .working => .working,
-                        .attention => .attention,
-                        .done => .done,
-                        .@"error" => .@"error",
-                    };
-                    menubar.updateState(mb_state, snap.message);
-                    // Echo the state flip onto the tab strip's
-                    // trailing-edge dot. `refresh` is a setNeedsDisplay:
-                    // call that no-ops when no strip is mounted (single-
-                    // profile setups), so it's safe to fire on every
-                    // state change.
-                    @import("../session/tab_strip.zig").refresh();
-                    app.g.agent.last_state = snap.state;
-                }
+        if (i > 0) {
+            if (len < buf.len) {
+                buf[len] = ' ';
+                len += 1;
             }
         }
+        const needs_quote = std.mem.indexOfAny(u8, path, " \t'\"\\$&|;()<>*?#`!") != null;
+        if (needs_quote) {
+            // Single-quote wrap; embedded single quotes via '\'' POSIX dance.
+            if (len < buf.len) {
+                buf[len] = '\'';
+                len += 1;
+            }
+            for (path) |c| {
+                if (c == '\'') {
+                    const seq = "'\\''";
+                    for (seq) |sc| {
+                        if (len >= buf.len) break;
+                        buf[len] = sc;
+                        len += 1;
+                    }
+                } else {
+                    if (len >= buf.len) break;
+                    buf[len] = c;
+                    len += 1;
+                }
+            }
+            if (len < buf.len) {
+                buf[len] = '\'';
+                len += 1;
+            }
+        } else {
+            const remaining = buf.len - len;
+            const take = @min(remaining, path.len);
+            @memcpy(buf[len .. len + take], path[0..take]);
+            len += take;
+        }
+    }
+    if (len == 0) return false;
+    const text = buf[0..len];
+    _ = forwardText(text);
+    return true;
+}
+
+/// Pull an NSImage off the pasteboard, encode as PNG, write to /tmp,
+/// and paste the resulting path for the running command to consume.
+/// Used when a drop carried image bytes but no NSURL — Photos, Cmd+
+/// Shift+4 screenshots, browser drags, etc.
+fn tryDropImage(pb: objc.Object) bool {
+    const NSImage = objc.getClass("NSImage") orelse return false;
+    const NSArray = objc.getClass("NSArray") orelse return false;
+    const NSBitmapImageRep = objc.getClass("NSBitmapImageRep") orelse return false;
+    const NSDictionary = objc.getClass("NSDictionary") orelse return false;
+    const NSString = objc.getClass("NSString") orelse return false;
+
+    const img_classes = NSArray.msgSend(objc.Object, "arrayWithObject:", .{NSImage});
+    const images = pb.msgSend(objc.Object, "readObjectsForClasses:options:", .{ img_classes, @as(?*anyopaque, null) });
+    if (images.value == null) return false;
+    const img_count: c_ulong = images.msgSend(c_ulong, "count", .{});
+    if (img_count == 0) return false;
+
+    const img = images.msgSend(objc.Object, "objectAtIndex:", .{@as(c_ulong, 0)});
+    if (img.value == null) return false;
+
+    // NSImage → TIFF data → NSBitmapImageRep → PNG. The TIFF detour is
+    // the canonical AppKit path; NSImage holds vector reps when the
+    // source is PDF/SVG, so we can't go straight to PNG without first
+    // rasterizing via TIFFRepresentation.
+    const tiff = img.msgSend(objc.Object, "TIFFRepresentation", .{});
+    if (tiff.value == null) return false;
+    const rep = NSBitmapImageRep.msgSend(objc.Object, "imageRepWithData:", .{tiff});
+    if (rep.value == null) return false;
+
+    const empty_dict = NSDictionary.msgSend(objc.Object, "dictionary", .{});
+    // NSBitmapImageFileType: PNG = 4 (NSBitmapImageRepFileTypePNG).
+    const png = rep.msgSend(objc.Object, "representationUsingType:properties:", .{
+        @as(c_ulong, 4),
+        empty_dict,
+    });
+    if (png.value == null) return false;
+
+    // Filename is randomised so a co-operating local process can't
+    // pre-position a symlink at the path and trick the writeToFile
+    // call into following it elsewhere. With a 128-bit suffix the
+    // path is unpredictable within the sub-millisecond create→write
+    // window — same protection mkstemp(3) provides via a different
+    // mechanism.
+    var rand_buf: [16]u8 = undefined;
+    platform.io().randomSecure(&rand_buf) catch return false;
+    var hex_buf: [32]u8 = undefined;
+    const hex_chars = "0123456789abcdef";
+    for (rand_buf, 0..) |b, i| {
+        hex_buf[i * 2] = hex_chars[b >> 4];
+        hex_buf[i * 2 + 1] = hex_chars[b & 0x0f];
+    }
+    var path_buf: [128]u8 = undefined;
+    const path = std.mem.printSentinel(&path_buf, "/tmp/djinn-drop-{s}.png", .{hex_buf[0..]}, 0) catch return false;
+    const ns_path = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, path.ptr)});
+    if (ns_path.value == null) return false;
+    const wrote: bool = png.msgSend(bool, "writeToFile:atomically:", .{ ns_path, @as(c_int, 1) });
+    if (!wrote) return false;
+
+    // Paths under /tmp don't contain shell metacharacters; quoting
+    // unnecessary. Surface handles bracketed-paste internally based
+    // on the active mode.
+    _ = forwardText(path);
+    return true;
+}
+
+/// Final size synchronization after AppKit's live-resize cascade.
+fn viewDidEndLiveResizeImpl(self_id: objc.c.id, _: objc.c.SEL) callconv(.c) void {
+    checkResize(objc.Object.fromId(self_id));
+}
+
+/// Explicit recovery hook for panel show, window/screen notifications,
+/// and callers that bind or activate a surface after layout has settled.
+pub fn syncResize() void {
+    const view_id = app.g.term.view_id orelse return;
+    const view = objc.Object.fromId(view_id);
+    syncLayerScale(view);
+    checkResize(view);
+}
+
+/// Push point bounds and backing scale on geometry events, including
+/// while hidden. All session hosts share the input overlay's frame, so
+/// inactive surfaces stay sized too. Ghostty owns rendering and wakeups.
+fn checkResize(view: objc.Object) void {
+    const bounds = view.msgSend(NSRect, "bounds", .{});
+    const window = view.msgSend(objc.Object, "window", .{});
+    const backing_scale = if (window.value != null) window.msgSend(f64, "backingScaleFactor", .{}) else 1.0;
+    const scale = if (backing_scale > 0) backing_scale else 1.0;
+    const px_w: u32 = @intFromFloat(@max(1.0, bounds.size.width * scale));
+    const px_h: u32 = @intFromFloat(@max(1.0, bounds.size.height * scale));
+    if (app.g.session_manager) |sm| {
+        for (sm.sessions.items) |sess| {
+            if (sess.surface) |surface| {
+                const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surface);
+                ghostty_runtime.surfaceSetContentScale(surf, scale);
+                ghostty_runtime.surfaceSetSize(surf, px_w, px_h);
+            }
+        }
+    } else if (app.g.ghostty.surface) |surface| {
+        const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surface);
+        ghostty_runtime.surfaceSetContentScale(surf, scale);
+        ghostty_runtime.surfaceSetSize(surf, px_w, px_h);
     }
 }
 
@@ -472,10 +639,15 @@ fn flagsChangedImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.
 /// blink stays in one mode (steady block when "focused", hollow when
 /// "unfocused"), and apps that subscribe to focus reports
 /// (`\e[I`/`\e[O`, mode 1004) never see anything.
-fn becomeFirstResponderImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
+fn becomeFirstResponderImpl(self_id: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
+    const view = objc.Object.fromId(self_id);
+    const window = view.msgSend(objc.Object, "window", .{});
+    // A programmatic responder change (e.g. ending search before a
+    // background session switch) must not refocus an inactive window.
+    const focused = window.value != null and window.msgSend(bool, "isKeyWindow", .{});
     if (app.g.ghostty.surface) |surf_ptr| {
         const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
-        ghostty_runtime.surfaceSetFocus(surf, true);
+        ghostty_runtime.surfaceSetFocus(surf, focused);
     }
     return true;
 }
@@ -509,10 +681,12 @@ fn eventToCell(view: objc.Object, event: objc.Object) struct { col: i32, row: i3
 /// independently, so the same body handles every drag variant.
 fn forwardMousePos(self_id: objc.c.id, event_id: objc.c.id) void {
     const surf_ptr = app.g.ghostty.surface orelse return;
-    const view = objc.Object.fromId(self_id);
-    const event = objc.Object.fromId(event_id);
-    const ghostty_input = @import("../ghostty/input.zig");
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
+    forwardMousePosTo(surf, objc.Object.fromId(self_id), objc.Object.fromId(event_id));
+}
+
+fn forwardMousePosTo(surf: ghostty_runtime.c.ghostty_surface_t, view: objc.Object, event: objc.Object) void {
+    const ghostty_input = @import("../ghostty/input.zig");
     const loc = event.msgSend(NSPoint, "locationInWindow", .{});
     const local = view.msgSend(NSPoint, "convertPoint:fromView:", .{ loc, @as(?*anyopaque, null) });
     const frame = view.msgSend(NSRect, "frame", .{});
@@ -524,10 +698,14 @@ fn forwardMousePos(self_id: objc.c.id, event_id: objc.c.id) void {
 /// AppKit splits button events across three method families (left,
 /// right, "other" = middle/4/5+); ghostty's `mouse_button` API takes
 /// a single button enum, so the handlers all funnel through here.
-fn forwardMouseButton(event: objc.Object, state: ghostty_runtime.c.ghostty_input_mouse_state_e) void {
+fn forwardMouseButton(self_id: objc.c.id, event_id: objc.c.id, state: ghostty_runtime.c.ghostty_input_mouse_state_e) void {
     const surf_ptr = app.g.ghostty.surface orelse return;
     const ghostty_input = @import("../ghostty/input.zig");
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
+    const event = objc.Object.fromId(event_id);
+    // A click/release may arrive without any preceding move (including on
+    // an inactive panel). Position and button must target the same surface.
+    forwardMousePosTo(surf, objc.Object.fromId(self_id), event);
     const button_num: c_long = event.msgSend(c_long, "buttonNumber", .{});
     const flags: u64 = @intCast(event.msgSend(c_ulong, "modifierFlags", .{}));
     _ = ghostty_runtime.c.ghostty_surface_mouse_button(
@@ -542,32 +720,32 @@ fn mouseMovedImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callco
     forwardMousePos(self_id, event_id);
 }
 
-fn mouseDownImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
-    forwardMouseButton(objc.Object.fromId(event_id), ghostty_runtime.c.GHOSTTY_MOUSE_PRESS);
+fn mouseDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    forwardMouseButton(self_id, event_id, ghostty_runtime.c.GHOSTTY_MOUSE_PRESS);
 }
 
 fn mouseDraggedImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
     forwardMousePos(self_id, event_id);
 }
 
-fn rightMouseDownImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
-    forwardMouseButton(objc.Object.fromId(event_id), ghostty_runtime.c.GHOSTTY_MOUSE_PRESS);
+fn rightMouseDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    forwardMouseButton(self_id, event_id, ghostty_runtime.c.GHOSTTY_MOUSE_PRESS);
 }
 
-fn rightMouseUpImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
-    forwardMouseButton(objc.Object.fromId(event_id), ghostty_runtime.c.GHOSTTY_MOUSE_RELEASE);
+fn rightMouseUpImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    forwardMouseButton(self_id, event_id, ghostty_runtime.c.GHOSTTY_MOUSE_RELEASE);
 }
 
 fn rightMouseDraggedImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
     forwardMousePos(self_id, event_id);
 }
 
-fn otherMouseDownImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
-    forwardMouseButton(objc.Object.fromId(event_id), ghostty_runtime.c.GHOSTTY_MOUSE_PRESS);
+fn otherMouseDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    forwardMouseButton(self_id, event_id, ghostty_runtime.c.GHOSTTY_MOUSE_PRESS);
 }
 
-fn otherMouseUpImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
-    forwardMouseButton(objc.Object.fromId(event_id), ghostty_runtime.c.GHOSTTY_MOUSE_RELEASE);
+fn otherMouseUpImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    forwardMouseButton(self_id, event_id, ghostty_runtime.c.GHOSTTY_MOUSE_RELEASE);
 }
 
 fn otherMouseDraggedImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
@@ -631,6 +809,7 @@ fn updateTrackingAreasImpl(self_id: objc.c.id, _: objc.c.SEL) callconv(.c) void 
     });
     if (area.value == null) return;
     view.msgSend(void, "addTrackingArea:", .{area});
+    area.msgSend(void, "release", .{});
 }
 
 // Trackpad scroll deltas arrive as fine-grained pixels. ghostty owns
@@ -677,25 +856,33 @@ fn scrollMods(precision: bool, phase: c_ulong) c_int {
     return v;
 }
 
-fn mouseUpImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
-    forwardMouseButton(objc.Object.fromId(event_id), ghostty_runtime.c.GHOSTTY_MOUSE_RELEASE);
+fn mouseUpImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
+    forwardMouseButton(self_id, event_id, ghostty_runtime.c.GHOSTTY_MOUSE_RELEASE);
 }
 
-/// Cmd+V: read pasteboard string + forward raw to ghostty surface.
-/// Surface handles bracketed-paste wrapping internally based on the
-/// terminal's mode 2004 state, so no host-side encode dance needed.
+/// Paste actions (including rebound Cmd+V) belong to the query while find
+/// is open. Otherwise the surface handles terminal bracketed-paste mode.
 fn pasteFromClipboard() void {
     const NSPasteboard = objc.getClass("NSPasteboard") orelse return;
     const pb = NSPasteboard.msgSend(objc.Object, "generalPasteboard", .{});
+    if (pb.value == null) return;
 
     const NSString = objc.getClass("NSString") orelse return;
     const type_name = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "public.utf8-plain-text")});
+    if (type_name.value == null) return;
     const ns_str = pb.msgSend(objc.Object, "stringForType:", .{type_name});
     if (ns_str.value == null) return;
 
     const utf8_ptr = ns_str.msgSend([*c]const u8, "UTF8String", .{});
     if (utf8_ptr == null) return;
-    const text = std.mem.sliceTo(utf8_ptr, 0);
+    // Preserve the explicit byte length, including embedded NULs. Find
+    // rejects binary input; Ghostty's clipboard API handles paste policy.
+    const byte_len = ns_str.msgSend(c_ulong, "lengthOfBytesUsingEncoding:", .{@as(c_ulong, 4)});
+    const text = utf8_ptr[0..@intCast(byte_len)];
+    if (app.g.find.mode) {
+        find.appendText(text);
+        return; // Even rejected input must never fall through to the shell.
+    }
     if (text.len == 0) return;
 
     _ = forwardText(text);
@@ -707,11 +894,45 @@ const mod_control = keymap.mod_control;
 const mod_alt = keymap.mod_alt;
 const mod_cmd = keymap.mod_cmd;
 
+/// All physical key encoders, including AppKit's IME command fallback,
+/// share source ownership. Text commits and preedit never acquire a key.
+fn forwardOwnedKey(surface: *anyopaque, keycode: u16, repeat: bool, event: ghostty_runtime.c.ghostty_input_key_s) void {
+    const source = activeKeySource(surface) orelse return;
+    if (!g_forwarded_keys.forward(keycode, repeat, source)) return;
+    const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surface);
+    _ = ghostty_runtime.c.ghostty_surface_key(surf, event);
+}
+
+fn imeCommandImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.SEL) callconv(.c) void {
+    ime.handled_during_interpret = true;
+    const event_id = ime.current_keydown orelse return;
+    const surf_ptr = app.g.ghostty.surface orelse return;
+    const event = objc.Object.fromId(event_id);
+    const ghostty_input = @import("../ghostty/input.zig");
+    const keycode = event.msgSend(c_ushort, "keyCode", .{});
+    const flags: u64 = @intCast(event.msgSend(c_ulong, "modifierFlags", .{}));
+    const mods = ghostty_input.modsFromNS(flags);
+    const repeat = event.msgSend(bool, "isARepeat", .{});
+    forwardOwnedKey(surf_ptr, keycode, repeat, .{
+        .action = if (repeat) ghostty_runtime.c.GHOSTTY_ACTION_REPEAT else ghostty_runtime.c.GHOSTTY_ACTION_PRESS,
+        .mods = mods,
+        .consumed_mods = mods,
+        .keycode = keycode,
+        .text = null,
+        .unshifted_codepoint = 0,
+        .composing = false,
+    });
+}
+
 fn keyDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
     const event = objc.Object.fromId(event_id);
 
     const flags: u64 = @intCast(event.msgSend(c_ulong, "modifierFlags", .{}));
     const keycode: u16 = event.msgSend(c_ushort, "keyCode", .{});
+    const is_repeat = event.msgSend(bool, "isARepeat", .{});
+    // Clear stale ownership before any host/find/IME early return. Repeats
+    // retain the initial press, even when an individual repeat is consumed.
+    g_forwarded_keys.begin(keycode, is_repeat);
 
     // App-level shortcuts go through the action table; on a hit we return
     // and never reach the encoder. Host shortcuts always win — Cmd+/-,
@@ -723,28 +944,6 @@ fn keyDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(
     // (so Cmd+G can navigate without entering "G" into the needle).
     if (app.g.find.mode and (flags & (mod_cmd | mod_control)) == 0) {
         find.handleKey(event, keycode);
-        return;
-    }
-
-    // Palette mode is modal too — same Cmd/Ctrl fall-through as
-    // find_mode so Cmd+Shift+P toggling stays reachable.
-    if (app.g.palette.mode and (flags & (mod_cmd | mod_control)) == 0) {
-        @import("../session/palette.zig").handleKey(event, keycode);
-        return;
-    }
-
-    // Log filter chip — same modal idiom as find / palette. Cmd-held
-    // chords fall through so the toggle (Cmd+Shift+L) stays reachable.
-    if (app.g.log_filter.mode and (flags & (mod_cmd | mod_control)) == 0) {
-        @import("../session/log_filter.zig").handleKey(event, keycode);
-        return;
-    }
-
-    // Cheatsheet overlay — any non-modifier key dismisses (the
-    // overlay is read-only; there's nothing meaningful to type
-    // into it).
-    if (app.g.cheatsheet.mode and (flags & (mod_cmd | mod_control)) == 0) {
-        @import("../session/cheatsheet.zig").handleKey(event, keycode);
         return;
     }
 
@@ -775,7 +974,6 @@ fn keyDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(
     // through this single path.
     if (app.g.ghostty.surface) |surf_ptr| {
         const ghostty_input = @import("../ghostty/input.zig");
-        const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
 
         // Text field: ghostty's KeyEncoder expects the *unmapped* character
         // for control inputs (so it can apply the Ctrl→C0 mapping itself).
@@ -815,7 +1013,6 @@ fn keyDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(
             }
         }
 
-        const is_repeat: bool = event.msgSend(bool, "isARepeat", .{});
         const mods_g = ghostty_input.modsFromNS(flags);
         // consumed_mods: mods that contributed to text translation. Per
         // upstream's heuristic, control + command never contribute (they
@@ -833,23 +1030,23 @@ fn keyDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(
             .unshifted_codepoint = unshifted_cp,
             .composing = false,
         };
-        _ = ghostty_runtime.c.ghostty_surface_key(surf, key_event);
+        forwardOwnedKey(surf_ptr, keycode, is_repeat, key_event);
         return;
     }
 }
 
-/// keyUp companion to keyDownImpl. Only meaningful for terminals
-/// running the Kitty Keyboard Protocol in full mode (CSI u with key
-/// release reporting); regular VT terminals don't observe key
-/// releases. Cheap to forward unconditionally — ghostty's key encoder
-/// drops the event when the surface isn't in keyboard-protocol mode.
+/// Release only a press actually forwarded to this still-live source.
+/// Selection changes, consumed downs, and destroyed/recreated surfaces must
+/// never leak an orphan keyUp into the currently selected terminal.
 fn keyUpImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
-    const surf_ptr = app.g.ghostty.surface orelse return;
     const event = objc.Object.fromId(event_id);
+    const keycode: u16 = event.msgSend(c_ushort, "keyCode", .{});
+    const source = g_forwarded_keys.release(keycode) orelse return;
+    const sm = app.g.session_manager orelse return;
+    const surf_ptr = keySourceSurface(source, sm.sessions.items) orelse return;
     const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
     const ghostty_input = @import("../ghostty/input.zig");
     const flags: u64 = @intCast(event.msgSend(c_ulong, "modifierFlags", .{}));
-    const keycode: u16 = event.msgSend(c_ushort, "keyCode", .{});
     const key_event = ghostty_runtime.c.ghostty_input_key_s{
         .action = ghostty_runtime.c.GHOSTTY_ACTION_RELEASE,
         .mods = ghostty_input.modsFromNS(flags),
@@ -875,11 +1072,8 @@ fn pressureChangeImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv
     ghostty_runtime.c.ghostty_surface_mouse_pressure(surf, @intCast(stage), pressure);
 }
 
-// (Glyph caches + drawRectImpl + drawPreedit were retired in step 10
-// stage B — ghostty surface owns rendering. TerminalView is now a
-// transparent input-overlay; AppKit only calls input/IME/mouse
-// methods on it, never drawRect:.)
-
+// Ghostty owns rendering. This transparent overlay handles native input,
+// IME, and mouse events without a second terminal drawing pipeline.
 
 // ─── Action table ────────────────────────────────────────────────────
 //
@@ -891,8 +1085,9 @@ fn pressureChangeImpl(_: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv
 /// Mutable so user keymap overrides can rebind individual entries at
 /// startup without rebuilding the table. Length stays fixed; we only
 /// swap mods/keycode, never add/remove handlers.
-var actions = [_]keymap.Action{
+const default_actions = [_]keymap.Action{
     // Selection / clipboard
+    .{ .name = "copy", .mods = mod_cmd, .keycode = 8, .handler = actionCopy }, // Cmd+C
     .{ .name = "paste", .mods = mod_cmd, .keycode = 9, .handler = pasteFromClipboard }, // Cmd+V
     // Scrollback
     .{ .name = "scroll_page_up", .mods = mod_cmd, .keycode = 126, .handler = actionScrollPageUp }, // Cmd+↑
@@ -907,9 +1102,6 @@ var actions = [_]keymap.Action{
     .{ .name = "clear_scrollback", .mods = mod_cmd, .keycode = 40, .handler = actionClearScrollback }, // Cmd+K
     // Settings — Cmd+, opens ~/.config/djinn/config in default editor.
     .{ .name = "open_settings", .mods = mod_cmd, .keycode = 43, .handler = actionOpenSettings }, // Cmd+,
-    // Toggle log pane visibility on demand. Cmd+/ chosen for parity
-    // with iTerm-style "show debug pane" muscle memory; rebindable.
-    .{ .name = "toggle_log_pane", .mods = mod_cmd, .keycode = 44, .handler = actionToggleLogPane }, // Cmd+/
     // Find on page — Cmd+F prompts for a query (NSAlert + text
     // field). Cmd+G / Cmd+Shift+G cycle through matches.
     .{ .name = "find_open", .mods = mod_cmd, .keycode = 3, .handler = find.actionOpen }, // Cmd+F
@@ -930,41 +1122,28 @@ var actions = [_]keymap.Action{
     .{ .name = "tab_9", .mods = mod_cmd, .keycode = 25, .handler = actionTab9 },
     .{ .name = "next_tab", .mods = mod_cmd | mod_shift, .keycode = 30, .handler = actionNextTab },
     .{ .name = "prev_tab", .mods = mod_cmd | mod_shift, .keycode = 33, .handler = actionPrevTab },
-    // Palette switcher — Cmd+Shift+P (kVK_ANSI_P = 35).
-    .{ .name = "palette_open", .mods = mod_cmd | mod_shift, .keycode = 35, .handler = actionPaletteOpen },
-    // Log filter chip — Cmd+Shift+L (kVK_ANSI_L = 37).
-    .{ .name = "log_filter_open", .mods = mod_cmd | mod_shift, .keycode = 37, .handler = actionLogFilterOpen },
-    // Cheatsheet — Cmd+Shift+. (kVK_ANSI_Period = 47). Cmd+? would
-    // be the conventional binding but macOS's system-wide "Show
-    // Help Menu" shortcut consumes Cmd+Shift+/ before the event
-    // reaches our keyDown handler, even in Accessory apps with no
-    // Help menu set. Period is unclaimed and stable across layouts.
-    .{ .name = "cheatsheet_open", .mods = mod_cmd | mod_shift, .keycode = 47, .handler = actionCheatsheetOpen },
-    // Duplicate active profile — Cmd+Shift+N (kVK_ANSI_N = 45).
-    .{ .name = "profile_duplicate", .mods = mod_cmd | mod_shift, .keycode = 45, .handler = actionProfileDuplicate },
-    // Close active profile — Cmd+Shift+W (kVK_ANSI_W = 13). Tab-close
-    // convention; refuses to remove the last profile.
-    .{ .name = "profile_close", .mods = mod_cmd | mod_shift, .keycode = 13, .handler = actionProfileClose },
+    // Close the ordinary session without removing its configured profile.
+    .{ .name = "close_session", .mods = mod_cmd | mod_shift, .keycode = 13, .handler = actionCloseSession },
     // Cycle theme override — Cmd+Shift+T (kVK_ANSI_T = 17).
     .{ .name = "theme_toggle", .mods = mod_cmd | mod_shift, .keycode = 17, .handler = actionThemeToggle },
     // Restart dead session — Cmd+R re-spawns with the same profile command.
     .{ .name = "restart_session", .mods = mod_cmd, .keycode = 15, .handler = actionRestartSession },
-    // Drop to a plain shell — Cmd+Shift+R forces /bin/zsh for the session.
-    .{ .name = "shell_session", .mods = mod_cmd | mod_shift, .keycode = 15, .handler = actionShellSession },
 };
+var actions = default_actions;
+
+pub fn resetBindings() void {
+    actions = default_actions;
+}
+
+fn actionCopy() void {
+    forwardBindingAction("copy_to_clipboard");
+}
 
 /// Override an entry's binding by name. Called from main() during
 /// startup for each user keymap entry. Unknown names log + are
 /// ignored — a typo in config shouldn't crash djinn.
 pub fn rebind(name: []const u8, mods: u64, keycode: u16) bool {
     return keymap.rebind(&actions, name, mods, keycode);
-}
-
-/// Read-only access to the host action table. The cheatsheet
-/// overlay (`session/cheatsheet.zig`) iterates this to render the
-/// live keymap (reflects user `rebind` overrides).
-pub fn actionList() []const keymap.Action {
-    return &actions;
 }
 
 fn dispatchAction(flags: u64, keycode: u16) bool {
@@ -979,12 +1158,8 @@ fn actionScrollPageDown() void {
     scrollByPage(1);
 }
 
-/// Page scroll forwards as PgUp/PgDn keypress to the surface — surface
-/// owns scrollback view + pin semantics. Sequence is `ESC [ 5 ~` /
-/// `ESC [ 6 ~` per VT100, both honored by ghostty's parser.
 fn scrollByPage(direction: i32) void {
-    const seq: []const u8 = if (direction < 0) "\x1b[5~" else "\x1b[6~";
-    _ = forwardText(seq);
+    forwardBindingAction(if (direction < 0) "scroll_page_up" else "scroll_page_down");
 }
 
 fn actionFontInc() void {
@@ -1003,68 +1178,14 @@ fn actionOpenSettings() void {
     menubar_mod.openSettings();
 }
 
-fn actionToggleLogPane() void {
-    const lv = app.g.agent.log_view orelse return;
-    const log_frame = lv.view.msgSend(NSRect, "frame", .{});
-    setLogPaneHidden(log_frame.size.width > 0);
-}
-
-/// Re-run the container's tab-aware reflow against the live log
-/// width, without changing log visibility. Used by hot-config-reload's
-/// session add/remove path: after building or removing the tab
-/// strip we need every child (terminal, log, divider, surface_hosts)
-/// to absorb / release `tab_strip.tab_h` of vertical space, and
-/// `applyLogLayout` is the canonical place where that math lives.
-/// Reads the current log width off the live frame so a user's
-/// drag-resize or Cmd+/ toggle isn't reset.
+/// Reflow the terminal-first container and synchronize its surfaces.
 pub fn relayout() void {
-    const container_id = app.g.layout.container_id orelse return;
-    const container = objc.Object.fromId(container_id);
-    const c_bounds = container.msgSend(NSRect, "bounds", .{});
-
-    var log_w: f64 = 0;
-    if (app.g.agent.log_view) |lv| {
-        log_w = lv.view.msgSend(NSRect, "frame", .{}).size.width;
-    }
-    const eff_div_w: f64 = if (log_w > 0) divider_mod.width else 0;
-    const term_w = @max(1.0, c_bounds.size.width - log_w - eff_div_w);
-    @import("../window/layout.zig").applyLogLayout(container, term_w, log_w, c_bounds.size.height);
-}
-
-/// Show or hide the log pane at runtime. Hidden state collapses log +
-/// divider frames to width 0 (Metal-layer compositor honors zero-pixel
-/// frames, unlike setHidden which left translucent leaks). Stays in
-/// the view tree to keep responder-chain + key-window state intact on
-/// borderless NSPanels.
-pub fn setLogPaneHidden(hide: bool) void {
-    const view_id = app.g.term.view_id orelse return;
-    const term_view = objc.Object.fromId(view_id);
-    const container = term_view.msgSend(objc.Object, "superview", .{});
-    if (container.value == null) return;
-
-    const c_bounds = container.msgSend(NSRect, "bounds", .{});
-    const cfg = app.g.config orelse return;
-    const layout = @import("../window/layout.zig");
-    const log_baseline_w: f64 = layout.computeLogWidth(c_bounds.size.width, cfg);
-    const log_w: f64 = if (hide) 0 else log_baseline_w;
-    const eff_div_w: f64 = if (hide) 0 else divider_mod.width;
-    const term_w: f64 = @max(1.0, c_bounds.size.width - log_w - eff_div_w);
-
-    layout.applyLogLayout(container, term_w, log_w, c_bounds.size.height);
-
-    // Clear log filter state when the pane hides — chip is a
-    // subview of the log pane wrapper, so without this the chip
-    // stays on screen at frame-zero size + the filter mode keeps
-    // routing printable keys away from the surface.
-    if (hide) @import("../session/log_filter.zig").onPaneHidden();
+    @import("../window/layout.zig").relayout();
+    syncResize();
 }
 
 fn actionClearScrollback() void {
-    // CSI H + CSI 2 J + CSI 3 J: cursor home + erase visible + erase
-    // scrollback (xterm extension; ghostty's parser honors it). Forward
-    // to the surface — it parses through its own VT path which both
-    // clears its own scrollback + paints the cleared frame.
-    _ = forwardText("\x1b[H\x1b[2J\x1b[3J");
+    forwardBindingAction("clear_screen");
 }
 
 // Tab switching — thin wrappers around
@@ -1074,15 +1195,33 @@ fn actionClearScrollback() void {
 fn activateSessionByIndex(idx: usize) void {
     _ = @import("../ghostty/surface_lifecycle.zig").activateSession(idx);
 }
-fn actionTab1() void { activateSessionByIndex(0); }
-fn actionTab2() void { activateSessionByIndex(1); }
-fn actionTab3() void { activateSessionByIndex(2); }
-fn actionTab4() void { activateSessionByIndex(3); }
-fn actionTab5() void { activateSessionByIndex(4); }
-fn actionTab6() void { activateSessionByIndex(5); }
-fn actionTab7() void { activateSessionByIndex(6); }
-fn actionTab8() void { activateSessionByIndex(7); }
-fn actionTab9() void { activateSessionByIndex(8); }
+fn actionTab1() void {
+    activateSessionByIndex(0);
+}
+fn actionTab2() void {
+    activateSessionByIndex(1);
+}
+fn actionTab3() void {
+    activateSessionByIndex(2);
+}
+fn actionTab4() void {
+    activateSessionByIndex(3);
+}
+fn actionTab5() void {
+    activateSessionByIndex(4);
+}
+fn actionTab6() void {
+    activateSessionByIndex(5);
+}
+fn actionTab7() void {
+    activateSessionByIndex(6);
+}
+fn actionTab8() void {
+    activateSessionByIndex(7);
+}
+fn actionTab9() void {
+    activateSessionByIndex(8);
+}
 fn actionNextTab() void {
     const sm = app.g.session_manager orelse return;
     const idx = sm.peekNext() orelse return;
@@ -1094,20 +1233,8 @@ fn actionPrevTab() void {
     activateSessionByIndex(idx);
 }
 
-fn actionLogFilterOpen() void {
-    @import("../session/log_filter.zig").actionOpen();
-}
-
-fn actionCheatsheetOpen() void {
-    @import("../session/cheatsheet.zig").actionOpen();
-}
-
-fn actionProfileDuplicate() void {
-    @import("../session/profile_manager.zig").duplicateActive();
-}
-
-fn actionProfileClose() void {
-    @import("../session/profile_manager.zig").closeActive();
+fn actionCloseSession() void {
+    @import("../ghostty/surface_lifecycle.zig").closeActiveSession();
 }
 
 fn actionThemeToggle() void {
@@ -1124,33 +1251,11 @@ fn actionThemeToggle() void {
     } else {
         app.g.theme.override = .light;
     }
-    theme_apply.reload();
-
-    // Log the new state to the agent log pane. The visible chrome
-    // flip only happens when the user's ghostty config has a
-    // `theme = light:X,dark:Y` split — without it the override is
-    // applied internally but the static theme palette doesn't
-    // change, leaving the action looking like a no-op. Surfacing
-    // the override in the log makes the action observable.
-    if (app.g.agent.state) |st| {
-        const label: []const u8 = if (app.g.theme.override) |cur| switch (cur) {
-            .light => "theme override → light",
-            .dark => "theme override → dark",
-        } else "theme override cleared (follow system)";
-        st.appendLog(.info, label) catch {};
-    }
-}
-
-fn actionPaletteOpen() void {
-    @import("../session/palette.zig").open();
+    reloadTheme();
 }
 
 fn actionRestartSession() void {
     @import("../ghostty/surface_lifecycle.zig").restartActiveSession(null);
-}
-
-fn actionShellSession() void {
-    @import("../ghostty/surface_lifecycle.zig").restartActiveSession("/bin/zsh");
 }
 
 // IME (NSTextInputClient) bindings live in `terminal/ime.zig`. The
@@ -1159,8 +1264,91 @@ fn actionShellSession() void {
 // `ime.current_keydown` / `ime.handled_during_interpret` to gate the
 // fall-through to ghostty_surface_key.
 
-// Theme reapply path lives in `terminal/theme_apply.zig`. view.zig
-// internal callers go through `theme_apply.reload` /
-// `theme_apply.reapply`; external callers (panel show, main hot-reload)
-// reach the module directly.
+// ─── Theme reload ────────────────────────────────────────────────────
+//
+// Triggered by viewDidChangeEffectiveAppearance: when macOS toggles
+// light ↔ dark (or the user runs `defaults write -g AppleInterfaceStyle`).
+// Goes through the same theme.resolve pipeline as startup, then pushes
+// the new colors into the terminal and panel.
+
 const theme_mod = @import("../theme/theme.zig");
+
+/// Force a theme re-resolve regardless of the cached appearance tag.
+/// Called by the live-config reload path after the user edits theme
+/// fields; we can't rely on the appearance comparison since the
+/// appearance hasn't changed — only the config has.
+pub fn reloadTheme() void {
+    app.g.theme.last_appearance = 0;
+    reapplyTheme();
+}
+
+/// Re-resolve theme only if system appearance has actually changed.
+/// Cheap no-op when stable — used by panel show path to recover from
+/// system flips that happened while the panel was offscreen and
+/// AppKit suppressed viewDidChangeEffectiveAppearance.
+pub fn reapplyThemeIfChanged() void {
+    reapplyTheme();
+}
+
+fn reapplyTheme() void {
+    const allocator = app.g.allocator orelse return;
+    const config = app.g.config orelse return;
+
+    // Skip when system appearance hasn't actually changed since the
+    // last reload. AppKit fires viewDidChangeEffectiveAppearance for
+    // many state transitions besides light/dark flips — first
+    // window-attach, panel show, layout passes — and re-running
+    // theme.resolve (file IO + parse) on every show is the source of
+    // the perceived show-time lag.
+    // Runtime override (Cmd+Shift+T) wins over system appearance.
+    // When null, fall back to NSAppearance probe.
+    const current_appearance = app.g.theme.override orelse theme_mod.detectSystemAppearance();
+    const current_tag: u8 = switch (current_appearance) {
+        .light => 1,
+        .dark => 2,
+    };
+    if (app.g.theme.last_appearance == current_tag) return;
+
+    // Push the new appearance to ghostty + reload its Config BEFORE
+    // theme.resolve runs. theme.resolve reads `app.g.ghostty.config`
+    // via applyFromGhostty, so the chrome palette is sourced from
+    // whichever variant ghostty currently has resolved for `theme =
+    // light:X,dark:Y`. If we resolve first, chrome locks onto the
+    // pre-flip variant while the surface (which ghostty repaints on
+    // its own pipeline) flips correctly — produces the visible
+    // tab-strip / panel-bg mismatch reported on light↔dark flips.
+    ghostty_runtime.appSetColorScheme(current_appearance == .dark);
+    ghostty_runtime.reloadConfigFromDisk();
+
+    var new_theme = theme_mod.resolve(allocator, .{
+        .inherit_ghostty_config = true, // Runtime already chose inherited files or standalone defaults.
+        .ghostty_cfg = app.g.ghostty.config,
+        .font_family = config.terminal.font_family,
+        .font_size = config.terminal.font_size,
+        .padding_x = config.terminal.padding_x,
+        .padding_y = config.terminal.padding_y,
+        .opacity = config.theme.opacity,
+        .background = if (config.theme.background) |s| theme_mod.parseColor(s) else null,
+        .foreground = if (config.theme.foreground) |s| theme_mod.parseColor(s) else null,
+        .cursor_color = if (config.theme.cursor) |s| theme_mod.parseColor(s) else null,
+    }) catch return;
+    defer new_theme.deinit();
+
+    const new_style = chrome_mod.Style.fromTheme(new_theme);
+    app.g.theme.chrome_style = new_style;
+    find.applyOverlayStyle(new_style);
+    @import("../session/tab_strip.zig").applyStyle(new_style);
+
+    if (app.g.window.panel) |p| {
+        const bg_r = @as(f64, @floatFromInt(new_theme.background.r)) / 255.0;
+        const bg_g = @as(f64, @floatFromInt(new_theme.background.g)) / 255.0;
+        const bg_b = @as(f64, @floatFromInt(new_theme.background.b)) / 255.0;
+        p.setBackgroundColor(bg_r, bg_g, bg_b, new_theme.opacity);
+    }
+
+    // Stamp last_appearance only after a successful apply. Pre-stamping
+    // and bailing on theme.resolve failure would poison the guard —
+    // every subsequent call would short-circuit until the system
+    // flipped a second time.
+    app.g.theme.last_appearance = current_tag;
+}

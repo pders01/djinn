@@ -6,25 +6,26 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const is_linux = builtin.os.tag == .linux;
+const loginitem = if (is_linux) @import("platform/linux/autostart.zig") else @import("system/loginitem.zig");
+pub const WindowAction = enum { toggle, show, hide, quit };
 
-// `system/loginitem.zig` imports the darwin-only `objc` module (built
-// only on darwin per build.zig). Gating the import keeps this file
-// compilable on linux; the three login-item flag entries below drop
-// out of the table on non-darwin, so `--help` reflects the actual
-// platform surface and `--login-item-*` isn't recognized.
-const is_darwin = builtin.os.tag == .macos;
-const loginitem = if (is_darwin) @import("system/loginitem.zig") else struct {};
+const LoginAction = enum { enable, disable, status };
 
 pub const Args = struct {
     keybinding_override: ?[]const u8 = null,
-    provider_override: ?[]const u8 = null,
+    diagnose_hotkey: bool = false,
+    login_action: ?LoginAction = null,
+    /// Linux's local terminal-window IPC; never an agent protocol.
+    window_action: ?WindowAction = null,
 };
 
 pub const ParseResult = enum { run, exit_ok, exit_err };
 
 const Ctx = struct {
-    args: *std.process.ArgIterator,
+    args: *std.process.Args.Iterator,
     parsed: *Args,
+    info_action: ?enum { help, version } = null,
 };
 
 const Handler = *const fn (ctx: *Ctx) ParseResult;
@@ -36,70 +37,47 @@ const Flag = struct {
     arg_label: []const u8 = "",
     help: []const u8,
     handler: Handler,
+    linux_only: bool = false,
+    darwin_only: bool = false,
 };
 
-const common_flags = [_]Flag{
+const flags = [_]Flag{
     .{
         .name = "--hotkey",
         .arg_label = "<binding>",
-        .help = "Toggle keybinding (default: ctrl+space)",
+        .help = "Toggle keybinding (default: ctrl+shift+space)",
         .handler = struct {
             fn h(ctx: *Ctx) ParseResult {
-                return consumeValue(ctx, "--hotkey", &ctx.parsed.keybinding_override);
-            }
-        }.h,
-    },
-    .{
-        .name = "--provider",
-        .arg_label = "<name>",
-        .help = "Provider: claude/codex/aider/gemini/opencode/crush/pi/generic",
-        .handler = struct {
-            fn h(ctx: *Ctx) ParseResult {
-                return consumeValue(ctx, "--provider", &ctx.parsed.provider_override);
-            }
-        }.h,
-    },
-    .{
-        .name = "--version",
-        .help = "Print version and exit",
-        .handler = struct {
-            fn h(_: *Ctx) ParseResult {
-                std.debug.print("djinn {s}\n", .{@import("version.zig").string});
-                return .exit_ok;
-            }
-        }.h,
-    },
-    .{
-        .name = "--help",
-        .help = "Show this help",
-        .handler = struct {
-            fn h(_: *Ctx) ParseResult {
-                printHelp();
-                return .exit_ok;
-            }
-        }.h,
-    },
-};
-
-// Login-item management lives on darwin only — linux uses
-// `system.open_at_login` in the config file (drives autostart.zig
-// to write / remove `~/.config/autostart/djinn.desktop`). These
-// three flags drop out of the table on non-darwin so they don't
-// appear in `--help` and `--login-item-enable` returns "unknown
-// flag" rather than a runtime "darwin only" error.
-const darwin_flags = [_]Flag{
-    .{
-        .name = "--login-item-enable",
-        .help = "Register Djinn.app to launch at login",
-        .handler = struct {
-            fn h(_: *Ctx) ParseResult {
-                loginitem.register() catch |err| {
-                    std.debug.print("error: register failed ({}). Bundle must be code-signed; run from Djinn.app.\n", .{err});
+                const binding = ctx.args.next() orelse {
+                    std.debug.print("error: --hotkey requires a binding, for example --hotkey ctrl+shift+space\n", .{});
                     return .exit_err;
                 };
-                const s = loginitem.status() catch loginitem.Status.unknown;
-                std.debug.print("login item: {s}\n", .{s.label()});
-                return .exit_ok;
+                if (std.mem.startsWith(u8, binding, "--")) {
+                    std.debug.print("error: --hotkey requires a binding, not '{s}'\n", .{binding});
+                    return .exit_err;
+                }
+                ctx.parsed.keybinding_override = binding;
+                return .run;
+            }
+        }.h,
+    },
+    .{
+        .name = "--diagnose-hotkey",
+        .darwin_only = true,
+        .help = "Probe native registration (--hotkey or built-in default), then exit",
+        .handler = struct {
+            fn h(ctx: *Ctx) ParseResult {
+                ctx.parsed.diagnose_hotkey = true;
+                return .run;
+            }
+        }.h,
+    },
+    .{
+        .name = "--login-item-enable",
+        .help = if (is_linux) "Enable XDG launch-at-login" else "Register Djinn.app to launch at login",
+        .handler = struct {
+            fn h(ctx: *Ctx) ParseResult {
+                return setLoginAction(ctx, .enable);
             }
         }.h,
     },
@@ -107,13 +85,8 @@ const darwin_flags = [_]Flag{
         .name = "--login-item-disable",
         .help = "Unregister from launch-at-login",
         .handler = struct {
-            fn h(_: *Ctx) ParseResult {
-                loginitem.unregister() catch |err| {
-                    std.debug.print("error: unregister failed ({})\n", .{err});
-                    return .exit_err;
-                };
-                std.debug.print("login item: not registered\n", .{});
-                return .exit_ok;
+            fn h(ctx: *Ctx) ParseResult {
+                return setLoginAction(ctx, .disable);
             }
         }.h,
     },
@@ -121,69 +94,173 @@ const darwin_flags = [_]Flag{
         .name = "--login-item-status",
         .help = "Print current login-item status",
         .handler = struct {
-            fn h(_: *Ctx) ParseResult {
-                const s = loginitem.status() catch |err| {
-                    std.debug.print("error: status query failed ({})\n", .{err});
-                    return .exit_err;
-                };
-                std.debug.print("login item: {s}\n", .{s.label()});
-                return .exit_ok;
+            fn h(ctx: *Ctx) ParseResult {
+                return setLoginAction(ctx, .status);
+            }
+        }.h,
+    },
+    .{ .name = "--toggle", .linux_only = true, .help = "Toggle the running terminal", .handler = windowHandler(.toggle) },
+    .{ .name = "--show", .linux_only = true, .help = "Show the running terminal", .handler = windowHandler(.show) },
+    .{ .name = "--hide", .linux_only = true, .help = "Hide the running terminal", .handler = windowHandler(.hide) },
+    .{ .name = "--quit", .linux_only = true, .help = "Quit the running terminal", .handler = windowHandler(.quit) },
+    .{
+        .name = "--version",
+        .help = "Print version and exit",
+        .handler = struct {
+            fn h(ctx: *Ctx) ParseResult {
+                ctx.info_action = .version;
+                return .run;
+            }
+        }.h,
+    },
+    .{
+        .name = "--help",
+        .help = "Show this help",
+        .handler = struct {
+            fn h(ctx: *Ctx) ParseResult {
+                ctx.info_action = .help;
+                return .run;
             }
         }.h,
     },
 };
 
-const flags: [if (is_darwin) common_flags.len + darwin_flags.len else common_flags.len]Flag =
-    if (is_darwin) common_flags ++ darwin_flags else common_flags;
-
-/// Consume the next argv token as the value for `flag_name`, with
-/// guards against the common typo "djinn --hotkey --provider claude"
-/// — under the prior shape `ctx.args.next()` blindly returned
-/// "--provider" and the user's `--provider claude` was silently
-/// dropped on the floor. Reject flag-like values (start with `--`)
-/// and missing values with a clear error.
-fn consumeValue(ctx: *Ctx, flag_name: []const u8, slot: *?[]const u8) ParseResult {
-    const val = ctx.args.next() orelse {
-        std.debug.print("error: {s} requires a value\n", .{flag_name});
-        return .exit_err;
-    };
-    if (std.mem.startsWith(u8, val, "--")) {
-        std.debug.print(
-            "error: {s} requires a value (got flag-like \"{s}\")\n",
-            .{ flag_name, val },
-        );
+fn setLoginAction(ctx: *Ctx, action: LoginAction) ParseResult {
+    if (ctx.parsed.login_action != null) {
+        std.debug.print("error: choose only one login-item action\n", .{});
         return .exit_err;
     }
-    slot.* = val;
+    ctx.parsed.login_action = action;
     return .run;
 }
 
-pub fn parse(args_iter: *std.process.ArgIterator, parsed: *Args) ParseResult {
+fn windowHandler(comptime action: WindowAction) Handler {
+    return struct {
+        fn h(ctx: *Ctx) ParseResult {
+            if (ctx.parsed.window_action != null) {
+                std.debug.print("error: choose only one window action\n", .{});
+                return .exit_err;
+            }
+            ctx.parsed.window_action = action;
+            return .run;
+        }
+    }.h;
+}
+
+fn available(flag: Flag) bool {
+    return (!flag.linux_only or is_linux) and (!flag.darwin_only or builtin.os.tag == .macos);
+}
+
+fn validateActions(parsed: Args) !void {
+    if (parsed.diagnose_hotkey and parsed.login_action != null)
+        return error.IncompatibleActions;
+    if (parsed.window_action != null and (parsed.login_action != null or parsed.diagnose_hotkey or parsed.keybinding_override != null))
+        return error.IncompatibleActions;
+}
+
+fn runLoginAction(action: LoginAction) ParseResult {
+    if (comptime is_linux) {
+        const allocator = std.heap.page_allocator;
+        switch (action) {
+            .enable => loginitem.register(allocator) catch |err| {
+                std.debug.print("error: autostart register failed ({})\n", .{err});
+                return .exit_err;
+            },
+            .disable => loginitem.unregister(allocator) catch |err| {
+                std.debug.print("error: autostart unregister failed ({})\n", .{err});
+                return .exit_err;
+            },
+            .status => {},
+        }
+        const status = loginitem.status(allocator) catch |err| {
+            std.debug.print("error: autostart status failed ({})\n", .{err});
+            return .exit_err;
+        };
+        std.debug.print("login item: {s}\n", .{status.label()});
+        return .exit_ok;
+    }
+    switch (action) {
+        .enable => {
+            loginitem.register() catch |err| {
+                std.debug.print("error: register failed ({}). Bundle must be code-signed; run from Djinn.app.\n", .{err});
+                return .exit_err;
+            };
+            const s = loginitem.status() catch loginitem.Status.unknown;
+            std.debug.print("login item: {s}\n", .{s.label()});
+        },
+        .disable => {
+            loginitem.unregister() catch |err| {
+                std.debug.print("error: unregister failed ({})\n", .{err});
+                return .exit_err;
+            };
+            std.debug.print("login item: not registered\n", .{});
+        },
+        .status => {
+            const s = loginitem.status() catch |err| {
+                std.debug.print("error: status query failed ({})\n", .{err});
+                return .exit_err;
+            };
+            std.debug.print("login item: {s}\n", .{s.label()});
+        },
+    }
+    return .exit_ok;
+}
+
+pub fn parse(args_iter: *std.process.Args.Iterator, parsed: *Args) ParseResult {
+    const result = parseFlags(args_iter, parsed);
+    if (result != .run) return result;
+    if (parsed.login_action) |action| return runLoginAction(action);
+    return .run;
+}
+
+/// Pure argument validation: login registration is deliberately outside this
+/// function so tests and all error/help paths cannot change system state.
+fn parseFlags(args_iter: *std.process.Args.Iterator, parsed: *Args) ParseResult {
     var ctx = Ctx{ .args = args_iter, .parsed = parsed };
     while (args_iter.next()) |arg| {
-        const flag = findFlag(arg) orelse continue;
+        if (std.mem.eql(u8, arg, "--provider") or std.mem.startsWith(u8, arg, "--provider=")) {
+            std.debug.print("error: --provider was removed; set profile.<name>.command in ~/.config/djinn/config, or omit it for your default shell\n", .{});
+            return .exit_err;
+        }
+        const flag = findFlag(arg) orelse {
+            std.debug.print("error: unknown argument '{s}'; use --help for supported options\n", .{arg});
+            return .exit_err;
+        };
         const r = flag.handler(&ctx);
         if (r != .run) return r;
+    }
+    // Defer side effects until every argument has been validated.
+    validateActions(parsed.*) catch {
+        std.debug.print("error: incompatible diagnostic, login-item or window actions\n", .{});
+        return .exit_err;
+    };
+    if (ctx.info_action) |action| {
+        switch (action) {
+            .help => printHelp(),
+            .version => std.debug.print("djinn {s}\n", .{@import("version.zig").string}),
+        }
+        return .exit_ok;
     }
     return .run;
 }
 
 fn findFlag(name: []const u8) ?*const Flag {
     inline for (&flags) |*f| {
-        if (std.mem.eql(u8, name, f.name)) return f;
+        if (available(f.*) and std.mem.eql(u8, name, f.name)) return f;
     }
     return null;
 }
 
 fn printHelp() void {
     std.debug.print(
-        \\djinn -- Quake-drop terminal + AI agent status surface
+        \\djinn -- Quake-drop terminal
         \\
         \\Usage: djinn [options]
         \\
     , .{});
     const col = comptime helpCol();
     inline for (flags) |f| {
+        if (comptime !available(f)) continue;
         const lhs_len = f.name.len + (if (f.arg_label.len > 0) f.arg_label.len + 1 else 0);
         if (f.arg_label.len > 0) {
             std.debug.print("  {s} {s}", .{ f.name, f.arg_label });
@@ -204,8 +281,70 @@ fn printHelp() void {
 fn helpCol() usize {
     var max: usize = 0;
     for (flags) |f| {
+        if (!available(f)) continue;
         const len = f.name.len + (if (f.arg_label.len > 0) f.arg_label.len + 1 else 0);
         if (len > max) max = len;
     }
     return max + 2;
+}
+
+test "CLI: useful flags remain, provider flag is removed" {
+    try std.testing.expect(findFlag("--provider") == null);
+    const retained = [_][]const u8{
+        "--hotkey",             "--help",              "--version", "--login-item-enable",
+        "--login-item-disable", "--login-item-status",
+    };
+    for (retained) |name| try std.testing.expect(findFlag(name) != null);
+    try std.testing.expectEqual(builtin.os.tag == .macos, findFlag("--diagnose-hotkey") != null);
+    inline for (.{ "--toggle", "--show", "--hide", "--quit" }) |name|
+        try std.testing.expectEqual(is_linux, findFlag(name) != null);
+}
+
+test "CLI: window actions cannot cause login side effects or launch with hotkey overrides" {
+    try validateActions(.{ .window_action = .toggle });
+    try std.testing.expectError(error.IncompatibleActions, validateActions(.{ .window_action = .show, .login_action = .enable }));
+    try std.testing.expectError(error.IncompatibleActions, validateActions(.{ .window_action = .quit, .keybinding_override = "ctrl+x" }));
+}
+
+test "CLI: full argv is validated before login actions or informational exit" {
+    const cases = [_][]const [*:0]const u8{
+        &.{ "--login-item-enable", "--unknown" },
+        &.{ "--login-item-disable", "--hotkey" },
+        &.{ "--login-item-status", "--login-item-enable" },
+        &.{ "--help", "--unknown" },
+        &.{ "--version", "--provider=removed" },
+        &.{ "--hotkey", "--help" },
+    };
+    for (cases) |argv| {
+        var iter = std.process.Args.Iterator.init(.{ .vector = argv });
+        var parsed = Args{};
+        try std.testing.expectEqual(ParseResult.exit_err, parseFlags(&iter, &parsed));
+    }
+}
+
+test "CLI: Linux window actions validate the whole argv without side effects" {
+    if (!is_linux) return;
+    const cases = [_][]const [*:0]const u8{
+        &.{ "--show", "--hide" },
+        &.{ "--show", "--login-item-enable" },
+        &.{ "--quit", "--unknown" },
+        &.{ "--toggle", "--hotkey", "ctrl+x" },
+    };
+    for (cases) |argv| {
+        var iter = std.process.Args.Iterator.init(.{ .vector = argv });
+        var parsed = Args{};
+        try std.testing.expectEqual(ParseResult.exit_err, parseFlags(&iter, &parsed));
+    }
+    var iter = std.process.Args.Iterator.init(.{ .vector = &.{"--toggle"} });
+    var parsed = Args{};
+    try std.testing.expectEqual(ParseResult.run, parseFlags(&iter, &parsed));
+    try std.testing.expectEqual(@as(?WindowAction, .toggle), parsed.window_action);
+}
+
+test "CLI: diagnostics reject all login actions before side effects" {
+    try validateActions(.{ .diagnose_hotkey = true });
+    try validateActions(.{ .login_action = .status });
+    inline for (.{ LoginAction.enable, LoginAction.disable, LoginAction.status }) |action| {
+        try std.testing.expectError(error.IncompatibleActions, validateActions(.{ .diagnose_hotkey = true, .login_action = action }));
+    }
 }

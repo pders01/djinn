@@ -1,644 +1,459 @@
 # djinn
 
-Quake-drop terminal for macOS and Linux/Wayland, with an MCP-driven agent status surface.
+A terminal-first, Quake-style drop-down terminal for **macOS and Linux**.
+A global shortcut shows or hides a native panel. macOS embeds **Ghostty**;
+Linux uses **GTK4/VTE**, with Wayland layer-shell where the compositor
+supports it. The terminal engines own the PTY, rendering, scrollback,
+selection, and text input. Djinn adds panel/focus handling, find, optional
+static session tabs, settings, and a small menubar/tray menu.
 
-Two products in one binary:
+Run any CLI in the terminal. djinn has **no MCP server, agent adapters,
+plugin service, or agent-status model**. There is no log UI, command
+palette, keymap cheatsheet, or profile-editing/writeback UI. Profiles are
+optional: with no profiles configured, djinn starts an ordinary default
+shell. See [TODO.md](TODO.md) for outstanding verification.
 
-- A native Quake-drop popup terminal — NSPanel + libghostty + CoreText on macOS; GTK4 + gtk4-layer-shell + VTE on Wayland (KDE Plasma, Hyprland, sway, wlroots-likes; plain undecorated toplevel fallback on GNOME).
-- An HTTP MCP server that lets AI coding agents push structured status to the menubar / system tray — so you know the agent's state without keeping the terminal focused.
+## Build and test
 
-## Status
+Use **Zig 0.17.1**, supplied by the Nix development environment. Platform
+backends and dependencies are selected at build time; Linux does not link
+Ghostty's renderer or Apple frameworks.
 
-The sections below cover the macOS build. **Linux users: jump to [Linux (Wayland)](#linux-wayland)** for the parallel install path, feature list, and troubleshooting.
+### macOS
 
-djinn is a libghostty-surface host on macOS. ghostty owns the visible
-terminal area end-to-end (PTY, render, scrollback, selection,
-hyperlink hover, search, IME). djinn keeps panel chrome, MCP
-server, agent state surface, hotkey, menubar, log pane, drag-drop,
-find-overlay UI, and an action keymap.
-
-Working:
-
-- Hotkey-toggled NSPanel (Quake-drop, follows you across spaces, overlays fullscreen).
-- libghostty surface bound to a layer-backed NSView; ghostty's CAMetalLayer renders directly.
-- Live window resize that reflows the surface + grid.
-- NSVisualEffectView blur when ghostty config sets `background-blur-radius`.
-- Mouse selection + Cmd+C copy + Cmd+V paste (surface-owned).
-- Scrollback (mouse wheel + Cmd+Up/Down).
-- Find on page (Cmd+F) — host-owned overlay chip + ghostty's surface search API.
-- IME (NSTextInputClient) — preedit + candidate window anchored at the cursor cell.
-- Drag-drop file URLs + image data (PNG/TIFF saved to /tmp, paths pasted bracketed).
-- Hyperlink hover (OSC 8) with Cmd-click open.
-- Menubar SF Symbol icon with a dropdown menu (state, show/hide, copy MCP config, quit).
-- HTTP MCP server with bearer-token auth.
-- Five-tool MCP surface (attention / progress / done / error / log).
-- Side log panel — feed-style entries, group-by-client, drag-to-resize.
-- Ghostty config inheritance (font, palette, padding, opacity, blur, theme files with `light:X,dark:Y` switching by system appearance) + live reload.
-- User-configurable keymap action table (`keybind = action=trigger`).
-- Bell (audible / visual).
-- SMAppService login-item registration when launched from the bundle.
-- Unified chrome design language (`src/chrome.zig`): log pane + find chip share Style-derived colors + typography.
-
-Known gaps: per-call log expansion (collapsed args + result), animated row insertion, sleep/wake recovery. See `TODO.md`.
-
-## Build
-
-### Prerequisites (one-time)
-
-- **Zig 0.15.2+.** Either install via your package manager (`brew install zig`, mise, asdf, …) or use the included nix flake (see below).
-- **Xcode + the optional Metal Toolchain.** djinn links the full libghostty, whose renderer compiles `.metal` shaders:
-
-  ```sh
-  sudo xcodebuild -downloadComponent MetalToolchain
-  ```
-
-  Several GB; only needs to happen once per Xcode install.
-
-### Build
+Use full Xcode with its optional Metal Toolchain. If that component is missing,
+install it manually once:
 
 ```sh
-./scripts/build.sh                              # debug, zig-out/bin/djinn
-./scripts/build.sh test                         # unit tests
-./scripts/build.sh -Doptimize=ReleaseFast       # release exe
-./scripts/build.sh install-app                  # signed bundle → ~/Applications
+xcodebuild -downloadComponent MetalToolchain
+xcrun -sdk macosx metal --version
 ```
 
-`scripts/build.sh` wraps `zig build` and handles two integration steps:
+Alternatively, install it through **Xcode → Settings → Components**.
+Verify that `metal --version` succeeds before building; an asset being
+listed as downloaded or installed does not by itself establish usability.
 
-1. Applies `patches/ghostty-001-darwin-install.patch` to the cached ghostty source via `scripts/apply-ghostty-patch.sh`. The patch drops an upstream darwin install guard + registers the shared lib in the artifact registry so `dep.artifact("ghostty")` resolves on macOS. Idempotent — re-runs are no-ops.
-2. Unsets `DEVELOPER_DIR` + `SDKROOT` and prepends `/usr/bin` to `PATH` so `xcrun` finds the system Metal Toolchain (nix dev shells default these env vars to a stripped Apple SDK that ships no Metal).
-
-If you have `just` installed, the `justfile` exposes the same recipes (`just build`, `just test`, `just install-app`, `just release`, …). Each recipe wraps `nix develop --command bash -c ...` so it works regardless of whether you're inside the dev shell — see "Without a system zig" below.
-
-Debug builds run libghostty's verifyIntegrity sweep and look ~3× slower than they actually are; use ReleaseFast for any performance measurement.
-
-### Without a system zig — use the nix flake
-
-If you don't have zig 0.15.2 on PATH, the flake supplies it:
+From the repository root:
 
 ```sh
-nix develop                      # drop into a shell with the right zig
-./scripts/build.sh install-app   # then build as normal
+nix develop --command ./scripts/build.sh                         # debug executable
+nix develop --command ./scripts/build.sh test                    # unit tests
+nix develop --command ./scripts/build.sh check                   # compile-only native host check (no Metal)
+nix develop --command ./scripts/build.sh -Doptimize=ReleaseFast   # release executable
+nix develop --command ./scripts/build.sh bundle                  # zig-out/Djinn.app
+nix develop --command ./scripts/build.sh bundle-sign             # signed bundle
 ```
 
-Or invoke the same step in one shot:
+These are host-side builds using system Xcode/Metal, not a pure Nix
+package build. `scripts/build.sh` prepares the existing Ghostty patches
+and SDK/tool environment before invoking `zig build`. Use the wrapper
+rather than bypassing those integration steps. The coordinated dependency
+refresh pins **Ghostty 1.4.0** and its release-matched **zig-objc** revision.
+Zig 0.17 extracts dependencies into checkout-local `zig-pkg/`, so the small
+Darwin artifact-export patch no longer modifies shared cached sources.
+The flake selects **SDK 26.5** from the locked nixpkgs input for Zig's SDK
+discovery and Ghostty's CoreVideo headers, while delegating Metal tool
+execution to system Xcode.
+Bundle builds default to a macOS 13 deployment target and baseline CPU,
+and load their bundled Ghostty library without Nix/build-cache rpaths.
+
+Equivalent convenience runners include `nix run .#test` and
+`nix run .#bundle` (the latter builds the signed bundle). The `just` build,
+check, test, and bundle recipes also use the pinned Nix environment rather
+than selecting a potentially incompatible host Zig. Use ReleaseFast for
+performance checks; no startup, memory, or latency numbers are claimed here.
+
+For ad-hoc verification without keychain-backed signing helpers:
+
+```sh
+nix develop --command ./scripts/build.sh bundle check test resources --summary all
+codesign --force --sign - zig-out/Djinn.app/Contents/MacOS/libghostty.dylib
+codesign --force --sign - zig-out/Djinn.app
+./scripts/verify-bundle.sh
+```
+
+The verifier checks signatures, deployment targets, runtime linkage, and
+resources, then runs relocated `--version`/`--help` in a clean environment
+and checks which Ghostty library dyld loaded. CI and release workflows use
+this verifier too. These are automated packaging/CLI checks, not GUI or
+macOS 13 runtime acceptance.
+
+### Linux
+
+Use the Linux Nix development shell or install development packages for
+GTK **4.12 or newer**, VTE's GTK4 variant, gtk4-layer-shell, GLib/GIO,
+and pkg-config:
+
+```sh
+nix develop --command ./scripts/build.sh check
+nix develop --command ./scripts/build.sh test
+nix develop --command ./scripts/build.sh -Doptimize=ReleaseSafe
+./zig-out/bin/djinn
+```
+
+Linux uses the existing VTE backend, not a Ghostty surface emulation. Its
+Ghostty-style appearance configuration is a supported subset, not full
+Ghostty runtime/configuration parity. Linux dynamically links its native
+libraries; the macOS self-contained bundle verifier does not apply to it.
+
+Wayland drop-down positioning depends on compositor layer-shell support.
+Global shortcuts use the desktop portal when available; compositor bindings
+can invoke `djinn --toggle`, `--show`, or `--hide` as a fallback. The local
+control socket is only for these window/instance commands, not an agent API.
+Portal approval and compositor policy are distinct from macOS registration.
+Linux uses **Ctrl+Alt+R** to restart a session and **Ctrl+Shift+R** for a fresh
+interactive shell; ordinary **Ctrl+R** remains available to the terminal's
+reverse search. Background/inactive-session BEL can send ordinary desktop
+notifications, respecting the enable/rate-limit settings; no agent API is used.
+
+For a compile-only Linux check from a Mac, without GTK development libraries:
+
+```sh
+nix develop --command ./scripts/build.sh check -Dtarget=x86_64-linux-gnu
+nix develop --command ./scripts/build.sh check -Dtarget=aarch64-linux-gnu
+```
+
+The shared config/session/persistence suite can run on either host without
+linking a native UI backend:
+
+```sh
+nix develop --command ./scripts/build.sh test-shared
+```
+
+Cross-compilation is not a Linux link, runtime, or compositor test. Run the
+Linux CI/build/test commands on Linux before treating this reconciliation
+as Linux-ready. Packaging sources live in `contrib/packaging/`; system
+installation is explicit (`-Dsystem-install=true`). A supplied systemd user
+unit is optional and is not enabled by a developer build.
+
+## macOS installation and signing
+
+Build and install a signed bundle into `~/Applications`:
 
 ```sh
 nix develop --command ./scripts/build.sh install-app
-```
-
-The flake also exposes `apps.*` runners that wrap `zig build` for nix-only users (no clone-and-zig dance):
-
-```sh
-nix run .                # build + launch the dev exe
-nix run .#bundle         # build the signed Djinn.app
-nix run .#install        # build + sign + rsync to ~/Applications
-nix run .#test           # run the unit suite
-nix flake check          # tests in the sandbox
-```
-
-**These runners build on the HOST against your working tree**, not inside `/nix/store`. djinn doesn't ship a pure `packages.default`: ghostty's `.metal` shader compile goes through `xcrun → metal`, and Apple ships the Metal Toolchain through cryptexd at `/var/run/com.apple.security.cryptexd/...`, which the nix builder can't reach even with `__noChroot = true`.
-
-### Why a wrapper script
-
-`dep.artifact("ghostty")` on darwin is blocked by an unintentional install guard in upstream ghostty (their own comment: "we shouldn't have this guard but we don't currently build on macOS this way ironically so we need to fix that"). djinn vendor-patches the guard locally; see `patches/ghostty-001-darwin-install.patch` for the full motivation.
-
-## Install
-
-### Quick install (pre-built bundle)
-
-```sh
-curl -fsSL https://github.com/pders01/djinn/releases/download/pre-release/install.sh | bash
-```
-
-Downloads the latest `main`-tip bundle, drops it into `~/Applications`, opens it. macOS prompts for Accessibility permission on first launch (needed for the global hotkey).
-
-The `pre-release` tag is rolled forward on every push to `main`, so the installer always pulls the freshest build. For a pinned alpha/beta build, use a stable tag from [Releases](https://github.com/pders01/djinn/releases) and replace `pre-release` in the URL.
-
-The downloaded bundle is ad-hoc signed (no Apple Developer ID — see "Stable signing identity" below). macOS Gatekeeper may show a "downloaded from the internet" prompt on first launch despite the installer stripping the quarantine xattr; click "Open" to proceed.
-
-### Build from source
-
-For a real install — Spotlight launchable, login-item capable, surviving relog — build the signed `.app` bundle and copy it to `~/Applications`:
-
-```sh
-./scripts/build.sh install-app
 open ~/Applications/Djinn.app
 ```
 
-(or `nix run .#install` if you don't have zig locally — both run the same `bundle-sign` → ad-hoc codesign → rsync chain.)
+`nix run .#install` is the equivalent runner. The bundle includes
+`libghostty.dylib`, compiled terminfo, shell integration, and themes from
+the pinned Ghostty sources; an installed Ghostty.app must not be required.
+Verify that with the installed-app acceptance checks below, not just a
+dev-tree launch.
 
-The bundle lands at `~/Applications/Djinn.app` (no sudo). macOS treats `~/Applications` as a first-class Application directory on macOS 12+, so SMAppService login-items work from there.
+Prebuilt bundles and the rolling `pre-release` installer are available at
+[Releases](https://github.com/pders01/djinn/releases). Rolling builds follow
+`main`; choose a versioned tag when you need a pinned release. Downloads
+are not Developer ID signed/notarized, so Gatekeeper may require explicit
+approval.
 
-The intermediate steps if you want to inspect or move artefacts manually:
+The global toggle uses Carbon `RegisterEventHotKey` with exclusive
+registration. It does not monitor keyboard events and requires neither
+Accessibility nor Input Monitoring permission.
 
-```sh
-zig build bundle        # zig-out/Djinn.app, unsigned
-zig build bundle-sign   # zig-out/Djinn.app + ad-hoc signature
-```
+### Stable local signing
 
-### First launch
-
-macOS asks for **Accessibility** permission for the global hotkey (CGEventTap). Without it the app exits. Grant via System Settings → Privacy & Security → Accessibility, then re-launch.
-
-### Login-item
-
-Once the bundle is in `~/Applications`:
-
-```sh
-~/Applications/Djinn.app/Contents/MacOS/djinn --login-item-enable
-~/Applications/Djinn.app/Contents/MacOS/djinn --login-item-status
-```
-
-The CLI flags wrap `SMAppService.mainAppService` and only work from a code-signed bundle home — running the raw `./zig-out/bin/djinn` will return `error.OperationFailed`. Disable with `--login-item-disable` or via `system.open_at_login = false` in the config.
-
-### Stable signing identity (one-shot)
-
-By default every `install-app` re-signs ad-hoc, which produces a fresh cdhash and burns TCC's Accessibility / Input Monitoring grants — the hotkey silently stops working until you reset + re-grant. To keep grants across rebuilds without paying for a Developer ID:
+Optional: review the helper before running it. It changes the login
+keychain and trust settings and may remove an existing certificate with
+the same name. This path is not exercised by the ad-hoc verification above.
 
 ```sh
 just dev-cert
 ```
 
-Generates a self-signed code-signing certificate (`DjinnLocalDev`) in your login keychain, marks it trusted-for-code-signing locally, and wires it into the bundle codesign step. The bundle's designated requirement (`identifier "com.pders01.djinn" and certificate leaf = H"…"`) then stays constant across rebuilds, so TCC matches subsequent builds as the same app and preserves grants.
+This creates the local `DjinnLocalDev` signing identity in the login
+keychain. The signing script uses it when available, otherwise falls back
+to ad-hoc signing. A stable identity keeps the designated requirement
+consistent across rebuilds. This is a local packaging identity, not a
+hotkey requirement or a substitute for Developer ID/notarization. Do not
+run keychain/signing helpers to fix hotkey registration.
 
-Idempotent — re-running detects the existing identity and skips. The cert is local-only; it doesn't pass Gatekeeper notarization and isn't a substitute for a paid Developer ID for distribution. Solo iteration only.
+Quit the old app before launching a rebuilt or installed bundle: installing
+one does not replace an already running app, whose exclusive hotkey
+registration can conflict with another instance.
 
-### If it's stuck
+### Diagnose a failing global hotkey
 
-Symptoms: hotkey does nothing, panel never appears, or the running djinn keeps the old binary loaded.
-
-If you've run `just dev-cert`, the cdhash-driven grant churn shouldn't happen. If it does:
-
-```sh
-killall djinn                                # drop the running instance
-tccutil reset All com.pders01.djinn          # clear stale TCC grants
-just deploy                                  # rebuild bundle + sign + install + open
-```
-
-If you haven't run `just dev-cert`, every `install-app` will keep burning grants. Run it once and avoid the dance.
-
-Standalone steps for inspection between stages:
+If menubar show/hide works but the shortcut does not, probe native hotkey
+registration separately from the panel. **Quit running Djinn instances
+first** to avoid a conflict with their exclusive registration. From the
+repository root, invoke the executable directly:
 
 ```sh
-nix develop --command bash -c './scripts/build.sh install-app'   # rebuild only
-open ~/Applications/Djinn.app                                    # re-launch
+./zig-out/Djinn.app/Contents/MacOS/djinn --diagnose-hotkey --hotkey ctrl+shift+space
 ```
 
-After the next launch following a TCC reset, macOS prompts for Accessibility — grant it, re-launch, the hotkey is live.
+`--diagnose-hotkey` accepts an optional `--hotkey` binding. Without that
+option it tests the built-in **`ctrl+shift+space`** default, not the binding in
+user config. It attempts exclusive native registration, immediately
+unregisters on success, and reports the native `OSStatus`, executable path,
+bundle identifier, and Secure Input status. It does not perform
+Accessibility (AX) or permission-preflight checks, monitor/log keys, load
+user config, start a shell, or sync login items.
 
-## Linux (Wayland)
+Registration errors include the native `OSStatus`; an exclusive ownership
+conflict is reported as `HotkeyConflict`. Check other running instances
+and macOS/global shortcut owners. OS registration cannot discover ordinary
+per-app shortcut bindings, and a successful probe does not prove runtime
+keyboard delivery or panel behavior. Those still require manual testing.
+Accessibility grants, privacy resets, and signing/keychain changes are not
+hotkey remedies. If startup registration fails, Djinn temporarily enables
+the menubar even when configured off, so Show/Hide and Settings remain
+reachable. A rejected live rebind keeps the previous binding/settings;
+`--hotkey` remains authoritative across config reloads.
 
-djinn runs on Wayland with the same chrome and MCP surface as the macOS build. Tested on KDE Plasma 6 (CachyOS / Arch), expected to work on Hyprland, sway, and any wlroots-based compositor; falls back to a plain undecorated toplevel on GNOME (no layer-shell protocol).
+### Launch at login
 
-The Linux build embeds VTE instead of libghostty — ghostty's embeddable surface C API is darwin/iOS-only. Most everything else is shared: same MCP server, same agent state, same config file shape. ghostty's `~/.config/ghostty/config` is honored for font / palette / theme inheritance.
-
-Working today: layer-shell Quake-drop panel · VTE terminal with the user shell · live theme + window-size reload · xdg-desktop-portal global hotkey · StatusNotifierItem tray with state-driven icon · `org.freedesktop.Notifications` desktop notifications · XDG `.desktop` autostart · drag-drop files + images into the terminal · 11-action keymap (font zoom, clear scrollback, copy/paste, open settings, copy MCP endpoint, log-pane toggle, hide-on-Escape opt-in) · MCP HTTP server · Unix-socket IPC bridge for compositor-driven hotkeys · log pane with attention chip + free-text filter + client-grouped headers.
-
-Not yet wired (darwin has these): multi-profile + tab strip + command palette + cheatsheet + in-terminal find overlay. The single-profile drop-down is fully usable today.
-
-### Install
-
-**Arch / Arch-likes** — via the AUR PKGBUILD (pacman-tracked, recommended):
+From a signed, installed bundle:
 
 ```sh
-# From the cloned repo:
-cd contrib/packaging/arch
-makepkg -si
+~/Applications/Djinn.app/Contents/MacOS/djinn --login-item-enable
+~/Applications/Djinn.app/Contents/MacOS/djinn --login-item-status
+~/Applications/Djinn.app/Contents/MacOS/djinn --login-item-disable
 ```
 
-Requires `zig0.15` from the AUR (Arch's stock `zig` is 0.16, which ghostty rejects). The PKGBUILD pulls latest `main` from GitHub.
-
-**Quick install for development** — via `justfile` (no pacman tracking):
-
-```sh
-just install-arch
-```
-
-Builds ReleaseSafe and sudo-installs the binary + `.desktop` entry + systemd user unit under `/usr/local`. Use `just uninstall-arch` to remove.
-
-**Build from source manually**:
-
-```sh
-# Runtime + dev deps on Ubuntu / Debian:
-sudo apt install libgtk-4-dev libgtk4-layer-shell-dev libvte-2.91-gtk4-dev libglib2.0-dev pkg-config
-# Or on Arch (runtime libs are runtime-only — dev headers ship with them):
-sudo pacman -S gtk4 gtk4-layer-shell vte4 glib2 pkgconf
-
-# Build with zig 0.15.2 (AUR: zig0.15 → /usr/bin/zig-0.15, Nix: nix develop)
-zig build -Doptimize=ReleaseSafe        # zig-out/bin/djinn
-zig build test                          # unit suite
-```
-
-The Nix flake's dev shell pins zig 0.15.2 if your distro doesn't have it: `nix develop --command zig build -Doptimize=ReleaseSafe`.
-
-**Pre-built tarball** (rolling pre-release from main):
-
-```sh
-curl -fsSLO https://github.com/pders01/djinn/releases/download/pre-release/djinn-pre-release-x86_64-linux.tar.gz
-tar -xzf djinn-pre-release-x86_64-linux.tar.gz
-sudo cp -r djinn-pre-release-x86_64-linux/* /usr/local/
-```
-
-### First launch
-
-```sh
-djinn   # opens the panel; layer-shell anchors to top of screen on KDE/Hyprland/sway/wlroots, plain toplevel on GNOME
-```
-
-**Global hotkey** is auto-registered through `xdg-desktop-portal.GlobalShortcuts`. On KDE the first launch pops a confirmation dialog — accept it and the binding is persisted. Then **bind a key to the registered action** in `System Settings → Shortcuts → djinn → toggle` (the portal accepts the registration but KDE doesn't auto-assign a key — this trip-up has confused a first-time user).
-
-If your compositor doesn't ship a portal backend that implements `GlobalShortcuts` (bare wlroots, some sway setups), bind your compositor's native hotkey to the IPC socket:
-
-```sh
-# Hyprland: ~/.config/hypr/hyprland.conf
-bind = ALT, space, exec, printf toggle | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/djinn.sock
-
-# sway: ~/.config/sway/config
-bindsym Mod1+space exec printf toggle | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/djinn.sock
-
-# KDE Custom Shortcut: System Settings → Shortcuts → Custom → Edit → New → Global → Command/URL
-sh -c 'printf toggle | socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/djinn.sock'
-```
-
-The socket accepts `toggle` / `show` / `hide` / `quit`. Mode is `0600` (owner-only) so multi-user systems stay private.
-
-### Systemd user unit
-
-`djinn.service` is installed alongside the binary (`/usr/local/lib/systemd/user/` for `just install-arch`, `/usr/lib/systemd/user/` for the PKGBUILD path). Opt in:
-
-```sh
-systemctl --user daemon-reload
-systemctl --user enable --now djinn.service
-```
-
-KDE / GNOME tie this into `graphical-session.target` automatically. Hyprland / sway need a session manager (`uwsm`, `niri-session`) to drive that target, or `systemctl --user start graphical-session.target` manually.
-
-### Troubleshooting
-
-- **Tray icon doesn't appear** — your compositor has no SNI host running (bare wlroots without a panel). plasmashell / waybar / xfce4-panel host the watcher. djinn re-registers automatically when one starts mid-session.
-- **Panel renders opaque even with `theme.opacity = 0.9`** — grep stderr for `Gtk-WARNING`. GTK 4.20+ drops CSS rules on parse error, and the symptoms look exactly like a compositor transparency bug. One grep beats an afternoon of red herrings.
-- **Hotkey "registration confirmed" but pressing it does nothing on KDE** — portal registration is separate from the System Settings → Shortcuts binding step. See "First launch" above.
-- **VTE renders each character double-wide** — Pango substituted a non-monospace font for your configured `font_family`. Check stderr for the warning djinn logs when this happens, and pick a font that's actually installed.
-- **Build fails with `requireZig` error** — your `zig` is 0.16 (Arch stock). Install `zig0.15` from the AUR (provides `/usr/bin/zig-0.15`), or use `nix develop`.
-
-`src/platform/linux/TODO.md` carries the deep-dive notes on every subsystem and a backlog of known issues + priorities. Read it before filing a bug — it might already be tracked.
-
-## Wiring an agent
-
-djinn writes its MCP endpoint info on startup to:
-
-```
-~/.config/djinn/mcp.json
-```
-
-The file already has the correct shape for Claude Code's `.mcp.json` (HTTP transport with bearer token). Three ways to use it:
-
-- Click the menubar icon → **Copy MCP config to clipboard** → paste into your project's `.mcp.json`.
-- Symlink it into a project: `ln -sf ~/.config/djinn/mcp.json .mcp.json`.
-- Paste manually:
-
-```json
-{
-  "mcpServers": {
-    "djinn": {
-      "type": "http",
-      "url": "http://127.0.0.1:PORT",
-      "headers": { "Authorization": "Bearer TOKEN" }
-    }
-  }
-}
-```
-
-The token is regenerated and the port re-bound on each launch — re-paste after each djinn start.
-
-## Tool surface
-
-| Tool                       | Purpose                                                      |
-|----------------------------|--------------------------------------------------------------|
-| `djinn_attention`          | "I need user input" — flashes the menubar to attention state |
-| `djinn_progress`           | "Working on X (3/8)" — menubar text update                   |
-| `djinn_done`               | Task complete; menubar returns to a quiescent icon           |
-| `djinn_error`              | Task failed                                                  |
-| `djinn_log`                | Append a structured event to djinn's side log panel          |
-| `djinn_recent_logs`        | Read recent log entries (JSON array)                         |
-| `djinn_recent_attentions`  | Read pinned attention + recent warn entries (JSON object)    |
-| `djinn_active_profile`     | Read active profile name / label / cwd / spawn command       |
-
-Tools update djinn's internal `AgentState`; the menubar polls at ~4Hz, the log panel at the same cadence.
-
-## UI
-
-| Action               | Binding                              |
-|----------------------|--------------------------------------|
-| Show / hide          | `ctrl+space` (configurable)          |
-| Resize               | Drag any edge or corner              |
-| Select text          | Click and drag                       |
-| Copy selection       | `cmd+C`                              |
-| Special keys         | Arrows, home/end/pgup/pgdn, escape, return, tab, backspace |
-| Ctrl + letter        | Sent as C0 control byte (Ctrl+L = 0x0c, etc.)              |
-| Alt + key            | ESC-prefixed (xterm convention used by readline / zsh)     |
-| Switch profile       | `cmd+1` … `cmd+9` (jump by index)    |
-| Cycle profile        | `cmd+shift+]` next, `cmd+shift+[` prev |
-| Find on page         | `cmd+F` open, `cmd+G` next, `cmd+shift+G` prev |
-| Toggle log pane      | `cmd+/`                              |
-| Filter log entries   | `cmd+shift+L` — type, Esc clears, Return keeps |
-| Keymap cheatsheet    | `cmd+shift+.` — any key dismisses (Cmd+? is reserved by macOS) |
-| Duplicate profile    | `cmd+shift+N` — clones active profile, reloads via FSEvent |
-| Close profile        | `cmd+shift+W` — removes active profile from config (refuses last) |
-| Cycle theme override | `cmd+shift+T` — system → light → dark → system |
-| Quit                 | `cmd+Q` (from the menubar menu)      |
-
-The menubar dropdown also exposes show/hide, copy MCP config, and quit.
-
-### Picking a hotkey that won't fight macOS
-
-CGEventTap doesn't beat the system-shortcut layer: combos already
-claimed by macOS (Spotlight, Mission Control, IME switchers,
-text-replacement, …) reach those services before djinn's tap fires.
-There is no public API to query the current system-shortcut bindings,
-so the practical workaround is to pick a combo macOS doesn't ship
-with.
-
-Conflict-free defaults that work on a stock install:
-
-- `ctrl+grave` — backtick key, no system claim by default
-- `alt+space` — Spotlight defaults to `cmd+space`, leaving alt+space free
-- `ctrl+\\` — backslash, also unclaimed
-
-Conflict-prone combos to avoid:
-
-- `cmd+space` — Spotlight (always)
-- `ctrl+space` — Input Source switcher (when multiple sources are enabled)
-- `cmd+tab` / `cmd+~` — application + window switcher
-- `f3` / `f4` / `f11` / `f12` — Mission Control / Launchpad / Show Desktop / Dashboard on most defaults
-
-If a hotkey silently does nothing after grant, suspect a system claim
-first — try a different combo, or reassign the conflicting macOS
-shortcut in System Settings → Keyboard → Keyboard Shortcuts.
+These wrap `SMAppService.mainAppService`; the raw development executable
+is not a supported login-item home. `open-at-login = true|false` controls
+the same registration at startup.
 
 ## Configuration
 
-`~/.config/djinn/config`. Ghostty's `key = value` format — `#` at line
-start is a comment, inline `#` is a hex color. All keys optional:
+Settings (Cmd+, or the menubar) opens `~/.config/djinn/config` in the default
+text editor, creating a small starter file if missing. The format is
+`key = value`, with full-line `#` comments. All keys are optional. See
+[`config/default.conf`](config/default.conf) for the starter; the menubar
+keeps a small mirrored skeleton because its Zig module cannot embed a
+file outside `src/`.
 
 ```ini
-# Window
-window-width = 800                  # pixels
-window-height = 400                 # pixels
-window-position = top_center        # 9-grid anchor on the active screen
-#                                   # values: {top,center,bottom}_{left,center,right}
-#                                   # also accepts `X,Y` in NSScreen coords
-#                                   # (origin bottom-left of the active screen, +Y up)
-# window-position-x = 100           # manual axis override, NSScreen coords
-# window-position-y = 200           # set window-position to clear these (named anchor wins)
-window-toggle-style = instant       # instant (pop in place) | minimize (slide animation)
-window-topmost = true               # bool — float above normal windows (NSFloatingWindowLevel)
-hide-on-blur = false                # bool — auto-hide when djinn loses key focus
+hotkey = ctrl+shift+space
+window-width = 800
+window-height = 400
+window-position = top_center
+window-toggle-style = instant
+window-topmost = true
+hide-on-blur = false
+inherit-ghostty = true
 
-# Hotkey (see "Picking a hotkey that won't fight macOS")
-# Modifiers: cmd, ctrl, alt/option, shift. Key: any character or named key
-# (grave, space, escape, return, tab, f1..f12, up/down/left/right).
-hotkey = ctrl+grave
+# Optional terminal/theme overrides
+# font-family = Menlo
+# font-size = 13
+# padding-x = 8
+# padding-y = 8
+# scrollback-size = 100000
+# opacity = 1.0
+# background = #1a1a1e
+# foreground = #cccccc
+# cursor-color = #ffffff
 
-# Provider — child program. Shortcuts: claude / codex / aider /
-# gemini / opencode / crush / pi. Anything else falls back to
-# /bin/zsh.
-provider = generic
-# provider-command = /opt/bin/my-claude
-
-# Profiles — each named profile is one provider session. Cmd+1..9
-# jumps to a specific profile by index; Cmd+Shift+] / Cmd+Shift+[
-# cycle. Lazy-spawned: a profile's child process only starts on the
-# first activate.
-#
-# Spawn-command precedence:  script > command > provider > /bin/zsh
-#
-# default-profile = main
-# profile.main.provider  = claude
-# profile.main.cwd       = ~/projects/main
-# profile.main.title     = main repo
-# profile.codex.provider = codex
-# profile.codex.command  = /opt/bin/codex
-# profile.codex.cwd      = ~/projects/side
-#
-# `script` points at an executable user script that builds the agentic
-# shell (load env vars, unwrap secrets, mise/asdf shim, conda activate,
-# etc.). The script must `exec` the agent at the end — otherwise the
-# PTY child exits and djinn shows an empty terminal.
-#
-# profile.work.script = ~/.config/djinn/profiles/work.sh
-# profile.work.cwd    = ~/projects/work
-# profile.work.title  = work claude
-#
-# Per-profile bell overrides fall through to the global bell.*
-# settings when unset. Useful for muting a chatter profile (working
-# Claude session) while keeping the bell on for interactive shells.
-#
-# profile.work.bell-audible = false
-# profile.work.bell-visual  = true
-# profile.work.bell-sound   = Pop
-
-# Theme — falls through to ghostty's resolved config when
-# inherit-ghostty=true (default). Overrides only listed below.
-inherit-ghostty = true              # bool
-# opacity = 0.95                    # float 0.0 – 1.0
-# background = #1a1a1e              # hex color
-# foreground = #cccccc              # hex color
-# cursor-color = #ffffff            # hex color
-
-# Terminal typography
-# font-family = Menlo               # any installed font
-# font-size = 13                    # points
-# padding-x = 8                     # pixels
-# padding-y = 8                     # pixels
-# scrollback-size = 100000          # rows; unset → ghostty's default (10M)
-
-# Log pane
-log-pane-enabled = false            # bool
-log-pane-width-fraction = 0.28      # float — share of panel width
-log-pane-width-min = 220            # pixel floor
-log-pane-width-max = 360            # pixel ceiling
-
-# Bell
-bell-audible = true                 # bool — play sound on BEL (0x07)
-bell-visual = false                 # bool — brief alpha flash on the panel
-bell-sound = Tink                   # name in /System/Library/Sounds or absolute path
-
-# System
-open-at-login = false               # bool — only effective from a signed .app bundle
-mcp-enabled = true                  # bool — listen on 127.0.0.1 for MCP clients
-system-notifications = true         # bool — NSUserNotification on agent attention/done
-menubar-icon = true                 # bool
-attention-sound = Glass             # system sound name, "default" (= Funk), or absolute path
-
-# Per-state banner gates — which MCP tool calls deliver a banner.
-# Menubar + log surfaces always update; this only governs the noisy
-# OS-level notification. Defaults shipped to surface user-actionable
-# events (attention, error) and stay silent on chatter (progress,
-# per-completion done).
-notify-attention = true             # bool
-notify-error = true                 # bool
-notify-done = false                 # bool
-notify-progress = false             # bool
-
-# Banner rate limit per (client, state) tuple. Different agents or
-# different states still get their own first banner immediately;
-# repeat banners from the same (client, state) within this window
-# are dropped silently.
-notify-rate-limit-ms = 30000        # u64 — milliseconds
-
-# Per-client identity — rename the raw 6-hex hash that the log
-# pane / menubar use to identify each MCP client, and optionally
-# mute its OS-level banners. The id is the same hex string shown
-# in log headers (derived from User-Agent). Log entries continue
-# to flow even when muted — only the noisy banner is suppressed.
-# client.abc123.name = review-bot
-# client.abc123.mute = true
-
-# Keymap overrides — `keybind = <action>=<trigger>`
-# Actions: copy, paste, scroll_page_up, scroll_page_down, font_inc, font_dec,
-#          font_reset, clear_scrollback, open_settings, toggle_log_pane,
-#          palette_open, log_filter_open, cheatsheet_open,
-#          profile_duplicate, profile_close, theme_toggle,
-#          tab_1..tab_9, next_tab, prev_tab.
-# Triggers: same modifier+key grammar as `hotkey`.
-# keybind = clear_scrollback=cmd+l
-# keybind = copy=cmd+c
+bell-audible = true
+bell-visual = false
+bell-sound = Tink
+system-notifications = true
+notify-rate-limit-ms = 30000
+menubar-icon = true
+open-at-login = false
 ```
 
-> Bool values accept `true|yes|on|1` or `false|no|off|0`.
+Booleans accept `true|yes|on|1` and `false|no|off|0`. Window positions accept
+a nine-grid anchor (`top_left`, `top_center`, …, `bottom_right`, with
+`center` for the middle) or `X,Y` in NSScreen coordinates. Optional
+`window-position-x` / `window-position-y` override individual axes.
+`window-toggle-style` is `instant` or `minimize`.
 
-`provider` selects the default command to spawn in the terminal. Known shortcuts: `claude`, `codex`, `aider`, `gemini`, `opencode`, `crush` (charmbracelet/crush), `pi` (Pi AI). Anything else uses `/bin/zsh` (macOS's default since 10.15). Override with `--provider <name>` or by setting `provider-command` directly.
+The default is **`ctrl+shift+space`**, avoiding the usual Ctrl+Space
+input-source shortcut while keeping Space easy to reach across layouts.
+Some IDEs use this for completion, so choose another binding if needed.
+Existing config files are not rewritten; update their `hotkey` setting
+explicitly to adopt the new default. Exclusive registration reports native
+`OSStatus` errors and `HotkeyConflict` for ownership conflicts; it cannot
+discover ordinary per-app shortcut bindings.
 
-> **Why /bin/zsh and not $SHELL?** djinn is normally launched from a dev shell (`nix develop`, devbox, etc.) which sets `$SHELL` to a sandboxed bash with broken terminfo lookup. `/bin/zsh` always has working terminfo so readline arrow keys / Ctrl bindings work without surprises.
+Hotkey config changes apply live: the replacement is registered before the
+old binding is removed, and a failed replacement leaves the old binding
+active. A config change can also recover registration after startup failed
+to acquire a hotkey. A CLI `--hotkey` override remains authoritative during
+config reloads. The existing `parseKeybinding` grammar and CG/NSEvent
+modifier bits are unchanged; only native registration converts modifiers
+to Carbon's representation.
 
-### Profile scripts
+### Optional static profiles
 
-For anything more elaborate than `provider = X` + `command = /opt/bin/X`, point `profile.<name>.script` at an executable shell script. djinn passes the script's path to ghostty as the PTY command — the script does whatever setup it needs (env vars, secret unwrap, mise/asdf, conda activate, dotenv load, …) and then `exec`s the agent so the agent inherits the configured environment as PID 1 of the PTY.
+Each configured profile represents one terminal session. Without any,
+djinn synthesizes a `default` shell session. Profiles do not select an
+agent/provider type.
+
+```ini
+default-profile = work
+profile.work.script = ~/.config/djinn/profiles/work.sh
+profile.work.cwd = ~/projects/work
+profile.work.title = Work
+
+profile.shell.title = Shell
+# profile.tools.command = /opt/local/bin/my-tool
+# profile.tools.bell-audible = false
+```
+
+Launch precedence is **`script` > `command` > default shell**. An invalid
+explicit script or working directory is a launch-configuration error, not
+permission to fall back to another command. Explicit commands are passed
+unchanged to Ghostty's shell-command interface; execution failures belong
+to that command, not a silent default-shell fallback. Omitting launch
+settings intentionally selects the default shell. An unknown
+`default-profile` warns and selects the first configured profile.
+
+Use an executable script for arguments, environment setup, version
+managers, or secrets, and finish it with `exec`:
 
 ```sh
-#!/usr/bin/env bash
-# ~/.config/djinn/profiles/work.sh
-set -euo pipefail
-
-export ANTHROPIC_API_KEY="$(security find-generic-password -a work -s anthropic -w)"
-export PATH="$HOME/.mise/installs/node/22.6.0/bin:$PATH"
-cd ~/projects/work
-
-exec claude --model sonnet
+#!/bin/sh
+# ~/.config/djinn/profiles/work.sh (make executable with chmod +x)
+export PATH="$HOME/.local/bin:$PATH"
+exec my-tool --interactive
 ```
 
-```ini
-profile.work.script = ~/.config/djinn/profiles/work.sh
-profile.work.title  = work claude
+The pinned embedding API interprets `command` as a shell command (not a
+structured argv vector). Script paths are validated and shell-quoted as
+literal executable paths. Keep complex invocation details in scripts. Profile definitions
+are static: **restart djinn after profile changes**. Restarting a session
+reuses the loaded profile; it does not reload profile definitions.
+Closing a session does not rewrite the config or delete the profile; the
+next show starts a fresh child. Exited command profiles retain Ghostty's
+exit/error output until closed or explicitly restarted with Cmd+R. An
+explicit profile title wins over the terminal's OSC title.
+
+### Theme inheritance
+
+By default, djinn reads Ghostty's user config and resolves its font,
+palette, padding, opacity, blur, and `light:Day,dark:Night` theme choices.
+User/system theme locations may be used when present, but Ghostty.app
+must not be required to launch djinn. Set `inherit-ghostty = false` for
+standalone defaults. Explicit djinn font/padding/color/opacity settings
+override inherited values. Use `opacity = 1.0` if translucent rendering
+looks too soft on your display.
+
+### Terminal notifications and sound
+
+Terminal-originated notifications are generic title/body messages,
+associated with a stable session ID. Runtime policy suppresses banners
+from the focused session while Djinn is active; background-tab and
+hidden-panel messages are subject to
+`system-notifications` and the per-session `notify-rate-limit-ms` window.
+The notifier keeps bounded history (16 sources, FIFO eviction); revisiting
+an evicted source can deliver immediately. Text is copied before main-queue
+dispatch, capped at 256 title bytes and 4096 body bytes without splitting
+UTF-8 codepoints. macOS notification settings/Focus can still suppress
+banners.
+
+Programs can use ordinary terminal sequences; no host integration service
+is needed. For example, from a process with a controlling terminal:
+
+```sh
+printf '\033]2;Reference tools\007' > /dev/tty
+printf '\033]777;notify;Djinn;Task finished\007' > /dev/tty
 ```
 
-The script must be executable (`chmod +x`) and must end with `exec <agent-cmd>` — otherwise the script process exits when the last non-`exec` command returns and djinn shows an empty terminal. djinn validates existence + execute bit at startup; missing or non-executable scripts log a warning and the profile falls through to `command` / `provider` / `/bin/zsh`.
+A hook whose stdout is captured must write to its session's terminal
+(such as `/dev/tty`). A detached service without one is not supported by
+this interface. Notifications do not inject input or take focus.
 
-Spawn-command precedence: `script` > `command` > `provider` shortcut > `/bin/zsh`.
+BEL sound/visual behavior is separate from banners. Sound names resolve
+under `/System/Library/Sounds`; absolute sound paths are restricted to
+that directory or `~/Library/Sounds`, with parent traversal rejected.
+No agent-kind or per-client notification policy remains. On macOS,
+clipboard access follows Ghostty's configured allow/deny policy; requests
+requiring host confirmation are denied rather than silently approved
+(no permission UI). Explicit user copy and safe paste remain available.
+Paste/drop uses Ghostty's protection, including denying explicit user paste
+when confirmation would be required. IME commits use a separate text path.
+Linux delegates clipboard and IME behavior to GTK/VTE; Ghostty clipboard
+permission settings are not a Linux policy layer.
 
-### Ghostty config inheritance
+### Migration from the agent-oriented build
 
-By default, djinn reads `~/.config/ghostty/config` and applies the same font, palette, padding, opacity, and blur. Theme files are searched in:
+Removed keys are warned about and ignored; they do not recreate the old
+services. Remove `provider`, `provider-command`, `profile.*.provider`,
+`mcp-*`, `client.*`, `log-pane-*`, `attention-sound`, and the state gates
+`notify-attention`, `notify-error`, `notify-done`, `notify-progress`.
+`notify-rate-limit-ms` remains, now keyed by terminal session.
 
-- `~/.config/ghostty/themes`
-- `~/Library/Application Support/com.mitchellh.ghostty/themes`
-- `/Applications/Ghostty.app/Contents/Resources/ghostty/themes`
-- `/opt/homebrew/share/ghostty/themes`
-- `/usr/local/share/ghostty/themes`
+Remove keybinds for `toggle_log_pane`, `palette_open`, `log_filter_open`,
+`cheatsheet_open`, `profile_duplicate`, `profile_close`, and `shell_session`.
+Use `close_session` for in-memory session closure. Move old provider launch
+choices into static `command` settings or executable scripts.
 
-The `theme = light:Day,dark:Night` syntax is honored — djinn picks the variant matching the macOS system appearance at startup (queried via `NSAppearance`). Set `inherit-ghostty = false` to opt out and use built-in defaults.
+A profile's `command` is now preserved as a shell expression, not unquoted
+as a configuration scalar. Keep shell-required quotes around an executable
+path with spaces, but remove configuration-only quotes around a whole command
+line such as `"tool --flag"` (write `tool --flag` instead).
 
-Any `font-*` / `padding-*` / `opacity` / `background` / `foreground` / `cursor-color` set in djinn's config overrides ghostty's value.
+Old user endpoint/token files, including `~/.config/djinn/mcp.json`, are
+**left alone**. djinn no longer writes or consumes them. Remove obsolete
+project MCP wiring and clean up those files manually if desired; there is
+no automatic credential/config deletion or profile writeback.
 
-### Font sharpness vs blur
+## Controls
 
-If text reads softer in djinn than in ghostty on the same font, the cause is almost certainly `background-opacity < 1`. macOS's `CGContextSetShouldSmoothFonts` silently no-ops on non-opaque destinations — the toggle that gives terminal.app / ghostty their crisp stems is bypassed when the panel is translucent.
+The menubar always uses the djinn brand mark. Its menu contains only the
+active session label, show/hide, Settings, and Quit.
 
-Workaround:
+| Action | Default binding |
+|---|---|
+| Show / hide | `Ctrl+Shift+Space` (configurable) |
+| Copy / paste | `Cmd+C` / `Cmd+V` |
+| Find / next / previous | `Cmd+F` / `Cmd+G` / `Cmd+Shift+G` |
+| Increase / decrease / reset font | `Cmd+=` (also `Cmd++`) / `Cmd+-` / `Cmd+0` |
+| Scroll page up / down | `Cmd+Up` / `Cmd+Down` |
+| Clear scrollback | `Cmd+K` |
+| Select session | `Cmd+1` … `Cmd+9` |
+| Next / previous session | `Cmd+Shift+]` / `Cmd+Shift+[` |
+| Restart session | `Cmd+R` |
+| Close session | `Cmd+Shift+W` |
+| Cycle theme override | `Cmd+Shift+T` |
+| Settings | `Cmd+,` |
+| Quit | `Cmd+Q` (menubar) |
 
-```ini
-opacity = 1.0
-```
+Find rejects malformed UTF-8 and control-character payloads; oversized
+search selections are truncated at a complete UTF-8 boundary. Rejected find
+text/paste never falls through to the terminal.
 
-Set in `~/.config/djinn/config` to override ghostty's `background-opacity`. Blur stays via `background-blur-radius`, but the visual-effect view sits behind an opaque terminal bg so font smoothing kicks in. Trade-off: you no longer see the blurred backdrop through cell bg cells (only the panel chrome around the text).
+Host overrides use `keybind = action=trigger`. The current host action table
+contains `copy`, `paste`, `find_open`, `find_next`, `find_prev`, `font_inc`,
+`font_inc_shift`, `font_dec`, `font_reset`, `scroll_page_up`,
+`scroll_page_down`, `clear_scrollback`, `tab_1` … `tab_9`, `next_tab`,
+`prev_tab`, `restart_session`, `close_session`, `theme_toggle`, and
+`open_settings`. For example: `keybind = clear_scrollback=cmd+l`.
 
-## Architecture
+## Manual acceptance before release
 
-### View tree
+- Launch the **installed signed app** outside the checkout/dev shell,
+  with Ghostty.app absent; verify bundled dylib/resources and default shell.
+- Verify native hotkey delivery without Accessibility/Input Monitoring
+  grants, exclusive conflicts, live rebinding (including failed replacement
+  retention and recovery after startup registration failure), and CLI
+  `--hotkey` precedence on reload. A diagnostic probe is not keyboard acceptance.
+- Verify repeated show/hide, blur policy, Cmd+Tab focus restoration,
+  fullscreen/Spaces, resize, and multiple screens/scales.
+- Test IME preedit/candidate placement, composed text, clipboard, drag/drop,
+  hyperlink opening, scrollback, find, font changes, and session switching.
+- Sleep/wake with active and hidden sessions; check rendering, input, and
+  focus after waking and after screen changes.
+- Test no-profile startup, static script/command profiles, explicit launch
+  errors, restart/close behavior, and profile changes taking effect only
+  after app restart. Confirm config is not rewritten.
+- Send terminal notifications from focused, background, and hidden sessions; verify suppression,
+  per-session rate boundaries, text truncation, macOS Focus, and BEL settings.
+- Check settings creation/open, theme changes while hidden, login-item
+  registration, clean quit, and relaunch of the installed app.
+- Measure ReleaseFast launch/show latency, idle CPU, and memory over repeated
+  session restarts and hide/show cycles. Record machine/build/workload;
+  do not infer performance from debug builds or claim unmeasured targets.
 
-```mermaid
-flowchart TD
-    HK["CGEventTap<br/>(hotkey)"] -->|toggle| Panel
-    Panel["NSPanel<br/>(Quake-drop, joins all spaces,<br/>NSFloatingWindowLevel)"]
-    Panel --> Content["contentView (NSView)"]
-    Content --> Blur["NSVisualEffectView<br/>(only when blur enabled)"]
-    Content --> Surface["surface_host (NSView)<br/>ghostty CAMetalLayer<br/>renders here"]
-    Content --> Term["TerminalView (NSView)<br/>transparent overlay,<br/>captures keyDown / mouse"]
-    Content --> Divider["DjinnDivider (NSView)<br/>drag-to-resize"]
-    Content --> Log["LogView wrapper (NSView)<br/>NSScrollView → NSTextView"]
-    Content --> Chip["Find chip (NSTextField)<br/>DjinnChipCell"]
+These checks are not automated guarantees. Track results in [TODO.md](TODO.md).
 
-    Term -->|"ghostty_surface_key /<br/>_text / _mouse_*"| Ghostty
-    Surface -->|owns| Ghostty["libghostty surface<br/>(scrollback, render,<br/>selection, search)"]
-    Ghostty -->|spawns| Provider["provider command<br/>(claude / codex / zsh / …)"]
-```
+## Acknowledgements and license
 
-### Agent surface
-
-```mermaid
-flowchart LR
-    Client1["MCP client<br/>(Claude Code, Cursor, …)"] -->|"HTTP POST<br/>+ Bearer"| Server
-    Client2["another MCP client"] -->|same| Server
-    Server["djinn MCP server<br/>(in-process thread,<br/>127.0.0.1:dynamic)"] --> Tools["ToolTable<br/>5 tools: attention /<br/>progress / done /<br/>error / log"]
-    Tools --> State["AgentState<br/>(mutex-protected,<br/>bounded log ring 256)"]
-    State --> Menu["Menubar<br/>(NSStatusItem, SF Symbol)"]
-    State --> LV["LogView<br/>(syncFrom on tick)"]
-    Tools --> Notif["Notifier<br/>(UNUserNotification +<br/>afplay sound)"]
-```
-
-### Chrome (Style.fromTheme)
-
-`src/chrome.zig` derives one chrome surface for every host UI element
-from the resolved Theme. Log pane + find chip both consume it; future
-panels (settings, palette) plug in via `applyStyle(style)`.
-
-```mermaid
-flowchart LR
-    Theme["theme.Theme<br/>(ghostty config +<br/>djinn overrides)"] --> Style
-    Style["chrome.Style<br/>bg / fg / dim /<br/>info|warn|err /<br/>chip{bg,fg,dim} /<br/>font_family /<br/>font_size_sm"]
-    Style --> LP["log pane<br/>wrapper bg = chip.bg,<br/>scroll/text bg = chip.bg,<br/>headers in dim"]
-    Style --> FC["find chip<br/>bg = chip.bg,<br/>border-less, 4px round,<br/>centered via DjinnChipCell"]
-    Style --> Future["…future panels"]
-```
-
-## Acknowledgements
-
-djinn stands almost entirely on top of work that other people did:
-
-- **[ghostty](https://github.com/ghostty-org/ghostty)** (Mitchell
-  Hashimoto + ghostty contributors) — the visible terminal area is
-  ghostty's `libghostty` surface, end-to-end. djinn's config grammar
-  (`key = value`, `keybind = action=trigger`, `theme = light:X,dark:Y`)
-  is also lifted from ghostty so users with an existing ghostty
-  config drop straight in. MIT-licensed.
-- **[zig-objc](https://github.com/mitchellh/zig-objc)** (Mitchell
-  Hashimoto) — the `objc.msgSend` primitives every host-side Cocoa
-  call goes through. MIT-licensed.
-- **Apple** — SF Symbols (menubar state glyphs) and the macOS SDK
-  frameworks (AppKit, Metal, CoreText, …).
-- **[Anthropic](https://modelcontextprotocol.io)** — Model Context
-  Protocol spec.
-- **The Quake-drop terminal lineage** — Quake's tilde console →
-  Tilda → Yakuake → Visor → iTerm2's hotkey window → ghostty's
-  `quick-terminal`. djinn is one more entry in that line.
-
-See [`NOTICES.md`](NOTICES.md) for full third-party attribution
-including the libraries ghostty itself pulls in (libxev, vaxis,
-simdutf, harfbuzz, freetype, …) — they ride along inside the
-redistributed `libghostty.dylib`.
-
-## License
-
-MIT — see [`LICENSE`](LICENSE).
+Built on [Ghostty](https://github.com/ghostty-org/ghostty),
+[zig-objc](https://github.com/mitchellh/zig-objc), and Apple's macOS
+frameworks, following the Quake-drop terminal lineage. See
+[NOTICES.md](NOTICES.md) for third-party attribution. MIT — see [LICENSE](LICENSE).

@@ -6,74 +6,59 @@ const std = @import("std");
 const djinn_version = "0.1.0-alpha.1";
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Follow the host on Linux; only macOS gets the deployment floor.
+    // An explicit -Dtarget=x86_64-linux-gnu must never acquire Apple settings.
+    const target = b.standardTargetOptions(.{
+        .default_target = if (b.graph.host.result.os.tag == .macos) .{
+            // Use an explicit baseline architecture, not a native CPU model.
+            .cpu_arch = b.graph.host.result.cpu.arch,
+            .os_tag = .macos,
+            .os_version_min = .{ .semver = .{ .major = 13, .minor = 0, .patch = 0 } },
+            .cpu_model = .baseline,
+        } else .{ .cpu_model = .baseline },
+    });
     const optimize = b.standardOptimizeOption(.{});
+    const shared_tests = buildSharedTests(b, target, optimize);
 
-    const tag = target.result.os.tag;
-    const is_darwin = tag.isDarwin();
-    const is_linux = tag == .linux;
+    // Linux uses VTE, not libghostty. Return before instantiating either
+    // Apple dependency, translating headers, or constructing Metal tools.
+    if (target.result.os.tag == .linux) {
+        buildLinux(b, target, optimize);
+        return;
+    }
+    if (target.result.os.tag != .macos) @panic("djinn supports macOS and Linux only");
+    const darwin_libc = buildDarwinLibC(b, target);
+    shared_tests.setLibCFile(darwin_libc);
 
-    // System-install gate. `zig build install` from a dev tree should
-    // leave the developer with `zig-out/bin/djinn` and nothing else;
-    // distro packagers and the nix derivation pass
-    // `-Dsystem-install=true` so the linux install step also drops the
-    // `.desktop`, `.service`, LICENSE, and README into their canonical
-    // share/ paths. Darwin ignores the flag — those artifacts are
-    // bundle-shaped on macOS.
-    const system_install = b.option(
-        bool,
-        "system-install",
-        "Install .desktop, systemd user unit, LICENSE, and README to share/ (linux packagers only)",
-    ) orelse false;
+    // zig-objc: native AppKit views, panel, and menubar
+    const objc_dep = b.dependency("zig_objc", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const objc_mod = objc_dep.module("objc");
 
-    // zig-objc: hotkey CGEventTap + menubar. Darwin-only — the
-    // dependency itself compiles only on darwin and isn't imported by
-    // any non-darwin source file.
-    const objc_mod: ?*std.Build.Module = if (is_darwin) blk: {
-        const objc_dep = b.dependency("zig_objc", .{
-            .target = target,
-            .optimize = optimize,
-        });
-        break :blk objc_dep.module("objc");
-    } else null;
-
-    // libghostty-vt: VT parser, screen model, render-state iterators, key encoder.
-    // Tier-5 spike additionally links the full libghostty (shared) for
+    // Full libghostty (shared) owns terminal state, input, and rendering via
     // ghostty_init / ghostty_app_new / ghostty_surface_new. Requires
     // patches/ghostty-001-darwin-install.patch applied via
-    // scripts/apply-ghostty-patch.sh AND (darwin) `DEVELOPER_DIR` +
-    // `SDKROOT` unset (nix shell defaults steer xcrun at the wrong SDK).
-    // Build via:
-    //   nix develop --command bash -c \
-    //     'unset DEVELOPER_DIR SDKROOT; PATH=/usr/bin:$PATH zig build'
-    //
-    // Linux: ghostty's GTK apprt is the eventual surface host. For the
-    // Phase 0 smoke target we still pull the dep but only link
-    // ghostty-vt-static; the full libghostty link comes in once the
-    // GTK4 host shell starts driving surfaces. The `emit-*` options are
-    // darwin-specific bundling toggles in ghostty's build.zig; passing
-    // them on linux errors out as unknown options.
-    const ghostty_dep = if (is_darwin)
-        b.dependency("ghostty", .{
-            .target = target,
-            .optimize = optimize,
-            .@"emit-xcframework" = false,
-            .@"emit-macos-app" = false,
-        })
-    else
-        b.dependency("ghostty", .{
-            .target = target,
-            .optimize = optimize,
-        });
+    // scripts/apply-ghostty-patch.sh. The Nix environment uses its pinned
+    // SDK for Zig discovery but system Xcode for Metal tools. Build via:
+    //   nix develop --command ./scripts/build.sh
+    const ghostty_dep = b.dependency("ghostty", .{
+        .target = target,
+        .optimize = optimize,
+        .@"app-runtime" = .none,
+        .@"emit-lib-vt" = false,
+        .@"emit-exe" = false,
+        .@"emit-xcframework" = false,
+        .@"emit-macos-app" = false,
+    });
 
     const exe_mod = buildModule(b, .{
         .target = target,
         .optimize = optimize,
         .objc_mod = objc_mod,
         .ghostty_dep = ghostty_dep,
-        .link_ghostty_full = is_darwin,
-        .is_darwin = is_darwin,
-        .is_linux = is_linux,
+        .link_ghostty_full = true,
     });
 
     const exe = b.addExecutable(.{
@@ -81,76 +66,26 @@ pub fn build(b: *std.Build) void {
         .root_module = exe_mod,
     });
 
+    exe.setLibCFile(darwin_libc);
     b.installArtifact(exe);
 
-    // Linux: ship the canonical .desktop alongside the binary so
-    // packaging recipes that just do `zig build --prefix /usr install
-    // -Dsystem-install=true` populate a system-menu entry too. Pinning
-    // to $prefix/share/applications/ (the system path the portal hotkey
-    // approval persists against) is what makes KDE's GlobalShortcuts
-    // dialog stop re-prompting on every upgrade — the autostart entry
-    // in ~/.config/autostart/ has a different scope and identity.
-    // Gated on -Dsystem-install so a developer's `zig build run` from
-    // a checkout doesn't pollute zig-out/share/ with files only useful
-    // when staging into /usr. Skipped on darwin (no equivalent).
-    if (is_linux and system_install) {
-        b.installFile(
-            "contrib/packaging/djinn.desktop",
-            "share/applications/djinn.desktop",
-        );
-        // systemd user unit — distro-agnostic. The packagers'
-        // --prefix /usr lands this at /usr/lib/systemd/user/djinn.service,
-        // the canonical search path for system-installed user units
-        // (systemd loads from /etc/systemd/user, $XDG_CONFIG_HOME/
-        // systemd/user, /usr/lib/systemd/user, /usr/share/systemd/user
-        // — the lib/ path is the one distro packages use).
-        // `systemctl --user enable djinn.service` opts in; we don't
-        // auto-enable on install.
-        b.installFile(
-            "contrib/packaging/djinn.service",
-            "lib/systemd/user/djinn.service",
-        );
-        // LICENSE + README land under share/ at freedesktop-conventional
-        // paths so `zig build uninstall` (when it lands upstream) can
-        // remove them as part of the same transaction. Distro recipes
-        // (PKGBUILD, debian/rules) no longer need an out-of-band
-        // `install -Dm644` step — the orphan-on-uninstall hole that
-        // hand-placed files leave is closed.
-        b.installFile("LICENSE", "share/licenses/djinn/LICENSE");
-        b.installFile("README.md", "share/doc/djinn/README.md");
+    // Keep the raw executable usable without Ghostty.app too. Ghostty walks
+    // selfExePath looking for share/terminfo, then uses share/ghostty.
+    // Only install/bundle depend on these resources; unit tests never run
+    // the generator or tic (and don't link either Ghostty library).
+    const runtime_resources = buildRuntimeResources(b, ghostty_dep);
+    const resources_step = b.step("resources", "Install Ghostty runtime resources only (no product build)");
+    if (runtime_resources) |resources| {
+        const dev_resources = installRuntimeResources(b, resources, "share");
+        b.getInstallStep().dependOn(dev_resources);
+        resources_step.dependOn(dev_resources);
     }
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
     const run_step = b.step("run", "Run djinn");
     run_step.dependOn(&run_cmd.step);
-
-    // ─── Tests ──────────────────────────────────────────────────────
-    //
-    // Defined early so both platforms reach this branch before the
-    // darwin-only bundle steps short-circuit a non-darwin build.
-    const test_mod = buildModule(b, .{
-        .target = target,
-        .optimize = optimize,
-        .objc_mod = objc_mod,
-        .ghostty_dep = ghostty_dep,
-        .link_ghostty_full = false,
-        .is_darwin = is_darwin,
-        .is_linux = is_linux,
-    });
-
-    const exe_unit_tests = b.addTest(.{
-        .root_module = test_mod,
-    });
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&b.addRunArtifact(exe_unit_tests).step);
-
-    // Bundle / install-app are darwin .app concepts; bail out before
-    // we touch install_name_tool / codesign on linux.
-    if (!is_darwin) return;
 
     // ─── Djinn.app bundle ────────────────────────────────────────────
     //
@@ -164,7 +99,9 @@ pub fn build(b: *std.Build) void {
     //     Contents/
     //       Info.plist
     //       MacOS/djinn
-    //       Resources/   (icon goes here once we have one)
+    //       Resources/Djinn.icns
+    //       Resources/terminfo/78/xterm-ghostty (+ aliases)
+    //       Resources/ghostty/{shell-integration,themes}
     //
     // Ad-hoc signing (`codesign --sign -`) is sufficient for local
     // dev; CI/release would swap in a Developer ID identity.
@@ -176,6 +113,9 @@ pub fn build(b: *std.Build) void {
     const ghostty_dep_release = b.dependency("ghostty", .{
         .target = target,
         .optimize = .ReleaseFast,
+        .@"app-runtime" = .none,
+        .@"emit-lib-vt" = false,
+        .@"emit-exe" = false,
         .@"emit-xcframework" = false,
         .@"emit-macos-app" = false,
     });
@@ -186,45 +126,31 @@ pub fn build(b: *std.Build) void {
         .objc_mod = objc_mod,
         .ghostty_dep = ghostty_dep_release,
         .link_ghostty_full = true,
-        .is_darwin = true,
-        .is_linux = false,
+        .bundled_library = true,
     });
 
     const bundle_built_exe = b.addExecutable(.{
         .name = "djinn",
         .root_module = bundle_exe_mod,
     });
-    // Reserve room in the Mach-O header so install_name_tool can rewrite
-    // load commands later (we add `@loader_path` to the rpath list so the
-    // bundled binary resolves `@rpath/libghostty.dylib` against the dylib
-    // we copy next to it). Without headerpad, install_name_tool fails:
-    // "larger updated load commands do not fit".
-    bundle_built_exe.headerpad_max_install_names = true;
+    bundle_built_exe.setLibCFile(darwin_libc);
+    // A distributable bundle must never prefer build-cache or Nix paths.
+    // Resolve the shared library beside the executable at link time.
+    bundle_built_exe.each_lib_rpath = false;
+    bundle_exe_mod.addRPathSpecial("@loader_path");
 
     const bundle_exe = b.addInstallArtifact(bundle_built_exe, .{
         .dest_dir = .{ .override = .{ .custom = "Djinn.app/Contents/MacOS" } },
     });
 
-    // libghostty.dylib bundling. Binary references `@rpath/libghostty.dylib`;
-    // the dev cache rpath baked in by the linker only resolves while the
-    // bare exe runs from the project dir. For the bundle we copy the dylib
-    // next to the binary and add `@loader_path` to the rpath list.
+    // Binary references `@rpath/libghostty.dylib`; @loader_path resolves
+    // the copy bundled beside it, independent of the checkout or Nix.
     const ghostty_full_release = ghostty_dep_release.artifact("ghostty");
     const bundle_dylib = b.addInstallFileWithDir(
         ghostty_full_release.getEmittedBin(),
         .{ .custom = "Djinn.app/Contents/MacOS" },
         "libghostty.dylib",
     );
-
-    // install_name_tool runs before codesign — modifying the binary
-    // invalidates the signature, so we have to re-sign after, which is
-    // exactly what the existing sign_cmd does.
-    const bundle_bin_path = b.pathJoin(&.{ b.install_path, "Djinn.app/Contents/MacOS/djinn" });
-    const fix_rpath = b.addSystemCommand(&.{
-        "install_name_tool", "-add_rpath", "@loader_path", bundle_bin_path,
-    });
-    fix_rpath.step.dependOn(&bundle_exe.step);
-    fix_rpath.step.dependOn(&bundle_dylib.step);
 
     const wf = b.addWriteFiles();
     // Interpolate djinn_version into the bundle's CFBundleVersion +
@@ -247,23 +173,28 @@ pub fn build(b: *std.Build) void {
     const bundle_step = b.step("bundle", "Build Djinn.app bundle");
     bundle_step.dependOn(&bundle_exe.step);
     bundle_step.dependOn(&bundle_dylib.step);
-    bundle_step.dependOn(&fix_rpath.step);
     bundle_step.dependOn(&bundle_plist.step);
     bundle_step.dependOn(&bundle_icon.step);
+    if (runtime_resources) |resources| {
+        bundle_step.dependOn(installRuntimeResources(
+            b,
+            resources,
+            "Djinn.app/Contents/Resources",
+        ));
+    }
 
     // codesign-bundle.sh probes login.keychain for a stable
     // self-signed identity (`DjinnLocalDev`, created by
     // `scripts/dev-cert-create.sh`) and uses it if present, else falls
     // back to ad-hoc. The stable identity keeps the bundle's
-    // designated requirement constant across rebuilds, so TCC's
-    // Accessibility + Input Monitoring grants persist instead of
-    // burning on every install-app. Runs after install_name_tool so
-    // the signature covers the rpath fix.
+    // designated requirement constant across rebuilds. Global hotkey
+    // registration does not need that identity or privacy grants. Runs after all bundle
+    // installation steps so the signature covers all code and resources.
     const sign_cmd = b.addSystemCommand(&.{"scripts/codesign-bundle.sh"});
-    sign_cmd.addArg(b.pathJoin(&.{ b.install_path, "Djinn.app" }));
+    sign_cmd.addDirectoryArg2(.{ .relative = .{ .base = .install_prefix, .sub_path = "Djinn.app" } }, .{});
     sign_cmd.step.dependOn(bundle_step);
 
-    const bundle_sign_step = b.step("bundle-sign", "Build + ad-hoc sign Djinn.app");
+    const bundle_sign_step = b.step("bundle-sign", "Build and sign Djinn.app");
     bundle_sign_step.dependOn(&sign_cmd.step);
 
     // ─── Install to ~/Applications ────────────────────────────────────
@@ -281,136 +212,304 @@ pub fn build(b: *std.Build) void {
     // so we get clean replaces (no stale Resources/ or signature drift)
     // and so the install step works from any CWD.
     const install_app_cmd = b.addSystemCommand(&.{"scripts/install-app.sh"});
-    install_app_cmd.addArg(b.pathJoin(&.{ b.install_path, "Djinn.app" }));
+    install_app_cmd.addDirectoryArg2(.{ .relative = .{ .base = .install_prefix, .sub_path = "Djinn.app" } }, .{});
     install_app_cmd.step.dependOn(&sign_cmd.step);
 
     const install_app_step = b.step("install-app", "Install Djinn.app to ~/Applications");
     install_app_step.dependOn(&install_app_cmd.step);
+
+    // Analyze the complete native host without linking libghostty or invoking
+    // Metal. Unit tests don't otherwise reach all AppKit callback paths.
+    const check_mod = buildModule(b, .{
+        .target = target,
+        .optimize = optimize,
+        .objc_mod = objc_mod,
+        .ghostty_dep = ghostty_dep,
+        .link_ghostty_full = false,
+    });
+    const check = b.addExecutable(.{ .name = "djinn-check", .root_module = check_mod });
+    check.setLibCFile(darwin_libc);
+    const check_step = b.step("check", "Compile-check the complete host without linking or Metal");
+    check_step.dependOn(&check.step);
+
+    // Tests
+    const test_mod = buildModule(b, .{
+        .target = target,
+        .optimize = optimize,
+        .objc_mod = objc_mod,
+        .ghostty_dep = ghostty_dep,
+        .link_ghostty_full = false,
+    });
+
+    const exe_unit_tests = b.addTest(.{
+        .root_module = test_mod,
+    });
+    exe_unit_tests.setLibCFile(darwin_libc);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&b.addRunArtifact(exe_unit_tests).step);
+}
+
+/// Linux's handwritten C externs need no headers. The check module deliberately
+/// has no system-library entries: even pkg-config discovery would prevent a
+/// compile-only Linux check on a Mac without GTK installed.
+fn linuxModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    link_system: bool,
+) *std.Build.Module {
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/main_linux.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    mod.link_libc = true;
+    if (link_system) {
+        // Keep layer-shell first: its Wayland symbol interposition requires
+        // loading it before GTK's transitive libwayland dependency.
+        mod.linkSystemLibrary("gtk4-layer-shell-0", .{ .use_pkg_config = .force });
+        mod.linkSystemLibrary("gtk4", .{ .use_pkg_config = .force });
+        mod.linkSystemLibrary("vte-2.91-gtk4", .{ .use_pkg_config = .force });
+        mod.linkSystemLibrary("gobject-2.0", .{ .use_pkg_config = .force });
+        mod.linkSystemLibrary("glib-2.0", .{ .use_pkg_config = .force });
+        mod.linkSystemLibrary("gio-2.0", .{ .use_pkg_config = .force });
+    }
+    return mod;
+}
+
+fn buildSharedTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Step.Compile {
+    const tests = b.addTest(.{ .root_module = b.createModule(.{
+        .root_source_file = b.path("src/tests_shared.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    }) });
+    const run = b.addRunArtifact(tests);
+    b.step("test-shared", "Run shared config/session/persistence tests without native UI libraries").dependOn(&run.step);
+    return tests;
+}
+
+fn buildLinux(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const system_install = b.option(bool, "system-install", "Install optional desktop/user-unit packaging and documentation (Linux)") orelse false;
+    const exe = b.addExecutable(.{
+        .name = "djinn",
+        .root_module = linuxModule(b, target, optimize, true),
+    });
+    b.installArtifact(exe);
+    if (system_install) {
+        b.installFile("contrib/packaging/djinn.desktop", "share/applications/djinn.desktop");
+        // Installing this file does not enable or start the user service.
+        b.installFile("contrib/packaging/djinn.service", "lib/systemd/user/djinn.service");
+        b.installFile("LICENSE", "share/licenses/djinn/LICENSE");
+        b.installFile("README.md", "share/doc/djinn/README.md");
+        b.installFile("NOTICES.md", "share/doc/djinn/NOTICES.md");
+        b.installFile("contrib/packaging/README.md", "share/doc/djinn/packaging.md");
+    }
+
+    const run = b.addRunArtifact(exe);
+    run.step.dependOn(b.getInstallStep());
+    run.addPassthruArgs();
+    b.step("run", "Run djinn").dependOn(&run.step);
+
+    const check = b.addExecutable(.{
+        .name = "djinn-check",
+        .root_module = linuxModule(b, target, optimize, false),
+    });
+    // No emitted binary is requested: Zig performs semantic analysis only.
+    b.step("check", "Compile-check the Linux host without GTK linkage or pkg-config").dependOn(&check.step);
+
+    const tests = b.addTest(.{ .root_module = linuxModule(b, target, optimize, true) });
+    b.step("test", "Run Linux unit tests (no display required)").dependOn(&b.addRunArtifact(tests).step);
 }
 
 const ModuleOpts = struct {
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
-    /// Null on linux — zig-objc is darwin-only and isn't pulled into the
-    /// dependency graph on non-darwin targets.
-    objc_mod: ?*std.Build.Module,
+    objc_mod: *std.Build.Module,
     ghostty_dep: *std.Build.Dependency,
-    /// Link the full libghostty (ghostty_init, ghostty_surface_new …) on
-    /// top of the vt-static parser. Tests skip this — surface symbols
-    /// aren't reached from the unit tests today and the full lib link
-    /// triples test build time. Linux Phase 0 also skips: ghostty's GTK
-    /// apprt host shell isn't wired yet.
+    /// Link libghostty (ghostty_init, ghostty_surface_new …). Tests skip
+    /// this: their pure code paths don't reference Ghostty symbols.
     link_ghostty_full: bool,
-    is_darwin: bool,
-    is_linux: bool,
+    /// Avoid linkLibrary's unconditional build-directory rpath in bundles.
+    bundled_library: bool = false,
 };
 
 fn buildModule(b: *std.Build, opts: ModuleOpts) *std.Build.Module {
-    // Per-OS root source file. Darwin keeps the historical main.zig as
-    // its entry; linux uses main_linux.zig — a stub that grows into the
-    // GTK4 host shell over the next phases. Splitting roots (rather
-    // than gating every `@import("objc")` with `if (builtin.os.tag)`)
-    // keeps the darwin side untouched and confines linux-specific code
-    // to a single subtree.
-    const root_path = if (opts.is_linux) "src/main_linux.zig" else "src/main.zig";
-
     const mod = b.createModule(.{
-        .root_source_file = b.path(root_path),
+        .root_source_file = b.path("src/main.zig"),
         .target = opts.target,
         .optimize = opts.optimize,
     });
-    if (opts.objc_mod) |m| mod.addImport("objc", m);
+    // SDK paths are module-local; objc's translated-header module does not
+    // supply paths to the host module for our explicit deployment target.
+    @import("zig_objc").addAppleSDK(b, mod) catch @panic("Apple SDK not found");
+    mod.addImport("objc", opts.objc_mod);
+    mod.addImport("darwin-c", buildDarwinC(b, opts));
+    mod.link_libc = true; // Native host and test helpers call libSystem directly.
 
-    mod.linkLibrary(opts.ghostty_dep.artifact("ghostty-vt-static"));
     if (opts.link_ghostty_full) {
         // GhosttyLib.initShared doesn't add framework links for darwin —
         // its production path goes through xcframework wrapper which
         // handles frameworks at packaging time. For plain `dep.artifact`
-        // consumption we have to add Metal here on the Compile step.
+        // consumption we have to add Metal to the library's root module.
         const full = opts.ghostty_dep.artifact("ghostty");
-        if (opts.is_darwin) full.linkFramework("Metal");
-        mod.linkLibrary(full);
+        full.root_module.linkFramework("Metal", .{});
+        if (opts.bundled_library) {
+            mod.addObjectFile(full.getEmittedBin());
+        } else {
+            mod.linkLibrary(full);
+        }
     }
     mod.addIncludePath(opts.ghostty_dep.path("include"));
 
-    if (opts.is_darwin) {
-        // macOS frameworks
-        mod.linkFramework("AppKit", .{});
-        mod.linkFramework("CoreGraphics", .{});
-        mod.linkFramework("CoreFoundation", .{});
-        mod.linkFramework("Carbon", .{});
-        // SMAppService for login-item registration (requires .app bundle).
-        mod.linkFramework("ServiceManagement", .{});
-        // FSEventStream for live config reload.
-        mod.linkFramework("CoreServices", .{});
-        // Metal + QuartzCore for the GPU glyph atlas renderer.
-        mod.linkFramework("Metal", .{});
-        mod.linkFramework("QuartzCore", .{});
-    } else if (opts.is_linux) {
-        // libc is the floor for everything that talks D-Bus, dlopen, or
-        // pkg-config-discovered libraries. linkSystemLibrary pulls
-        // pkg-config metadata (cflags + libs) for the named module.
-        mod.link_libc = true;
-        // ORDER MATTERS — see linkLayerShellThenGtk's contract. Doing
-        // this via a helper instead of two adjacent linkSystemLibrary
-        // calls prevents a future refactor from quietly swapping the
-        // order: the helper owns both calls + the rationale, and an
-        // out-of-helper `linkSystemLibrary("gtk4", ...)` is greppable
-        // as a smell.
-        linkLayerShellThenGtk(mod);
-        // VTE: the terminal widget. djinn's macOS path uses ghostty's
-        // embeddable surface API; on Linux that API doesn't exist
-        // (ghostty's libghostty exports the surface API only for
-        // darwin/iOS — its Linux frontend is a full GtkApplication, not
-        // a library). VTE is the standard embeddable terminal on
-        // Linux — GNOME Terminal, xfce4-terminal, Tilix all use it.
-        // pkg-config name on GTK4 is "vte-2.91-gtk4".
-        mod.linkSystemLibrary("vte-2.91-gtk4", .{});
-        // glib pieces ride along (g_signal_connect, GMainLoop). gtk4's
-        // pkg-config already pulls these via Requires, but listing
-        // them explicitly keeps the dep graph readable when something
-        // doesn't link.
-        mod.linkSystemLibrary("gobject-2.0", .{});
-        mod.linkSystemLibrary("glib-2.0", .{});
-        // gio-2.0 carries GDBus (g_bus_get_sync, g_dbus_connection_call,
-        // signal subscribe). gtk4's pkg-config Requires pulls it in
-        // transitively today, but the portal-based hotkey module is the
-        // heavy gio consumer and the dependency is load-bearing for it
-        // — making the link explicit keeps the dep graph honest if the
-        // upstream gtk4 .pc ever drops the transitive Require.
-        mod.linkSystemLibrary("gio-2.0", .{});
-        // xkbcommon / libnotify / wayland-client get linked once the
-        // notifier / wayland-bound modules call into them.
-    }
+    // macOS frameworks
+    mod.linkFramework("AppKit", .{});
+    mod.linkFramework("CoreGraphics", .{});
+    mod.linkFramework("CoreFoundation", .{});
+    mod.linkFramework("Carbon", .{});
+    // SMAppService for login-item registration (requires .app bundle).
+    mod.linkFramework("ServiceManagement", .{});
+    // FSEventStream for live config reload.
+    mod.linkFramework("CoreServices", .{});
+    // Metal + QuartzCore for the GPU glyph atlas renderer.
+    mod.linkFramework("Metal", .{});
+    mod.linkFramework("QuartzCore", .{});
 
     return mod;
 }
 
-/// Link gtk4-layer-shell BEFORE gtk4 — this is a HARD requirement,
-/// not an optimization. Layer-shell works by interposing a symbol in
-/// libwayland-client; the interposition only takes effect when ld.so
-/// loads gtk4-layer-shell BEFORE libwayland (which gtk4 transitively
-/// pulls). The linker preserves command-line order in DT_NEEDED, so
-/// the `linkSystemLibrary` call order in this function IS the
-/// DT_NEEDED order in the final binary.
-///
-/// Encapsulating both calls in one helper makes the ordering
-/// inseparable: a refactor that touches the gtk4 link site (e.g.
-/// adding cflags, splitting into nativeBuildInputs) can't reorder
-/// the pair, because there is no second call site to reorder relative
-/// to. Verified empirically on KDE Wayland — flipping the order
-/// reproduces the "Failed to initialize layer surface" warning and
-/// the window opens as a plain toplevel.
-///
-/// libgtk4-layer-shell.so.0 is a hard runtime dep as a consequence.
-/// Package availability: Arch `gtk4-layer-shell`, Debian/Ubuntu
-/// `libgtk4-layer-shell-0`, nix `gtk4-layer-shell`. On compositors
-/// that don't advertise wlr-layer-shell (GNOME), the lib is still
-/// installable and `gtk_layer_is_supported()` returns false — the
-/// runtime falls through to a plain toplevel.
-fn linkLayerShellThenGtk(mod: *std.Build.Module) void {
-    mod.linkSystemLibrary("gtk4-layer-shell-0", .{});
-    mod.linkSystemLibrary("gtk4", .{});
+/// Pin libc as well as header/framework paths to the discovered SDK. Without
+/// --libc, Zig can reuse native-host libc discovery (and newer SDK metadata)
+/// even when the module's explicit include/library paths use the Nix SDK.
+fn buildDarwinLibC(b: *std.Build, target: std.Build.ResolvedTarget) std.Build.LazyPath {
+    var libc = std.zig.LibCInstallation.findNative(b.allocator, b.graph.io, .{
+        .environ_map = &b.graph.environ_map,
+        .target = &target.result,
+        .verbose = false,
+    }) catch @panic("Apple libc SDK not found");
+    var stream: std.Io.Writer.Allocating = .init(b.allocator);
+    defer stream.deinit();
+    libc.render(&stream.writer) catch @panic("OOM rendering Apple libc paths");
+    return b.addWriteFiles().add("darwin-libc.txt", stream.written());
+}
+
+/// Translate native headers once per target/optimization graph. Zig 0.17
+/// no longer supports in-source @cImport.
+fn buildDarwinC(b: *std.Build, opts: ModuleOpts) *std.Build.Module {
+    const source = b.addWriteFiles().add("darwin.h",
+        \\#include <Carbon/Carbon.h>
+        \\#include <CoreFoundation/CoreFoundation.h>
+        \\#include <CoreGraphics/CoreGraphics.h>
+        \\#include <CoreText/CoreText.h>
+        \\#include <CoreServices/CoreServices.h>
+        \\#include <dispatch/dispatch.h>
+        \\#include "ghostty.h"
+        \\
+    );
+    const translate = b.addTranslateC(.{
+        .root_source_file = source,
+        .target = opts.target,
+        .optimize = opts.optimize,
+    });
+    const sdk = std.zig.system.darwin.getSdk(b.allocator, b.graph.io, &opts.target.result) orelse
+        @panic("Apple SDK not found");
+    translate.addSystemIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "usr/include" }) });
+    translate.addSystemFrameworkPath(.{ .cwd_relative = b.pathJoin(&.{ sdk, "System/Library/Frameworks" }) });
+    translate.addIncludePath(opts.ghostty_dep.path("include"));
+    return translate.createModule();
+}
+
+const RuntimeResources = struct {
+    terminfo: std.Build.LazyPath,
+    shell_integration: std.Build.LazyPath,
+    themes: std.Build.LazyPath,
+};
+
+/// Generate only the runtime data, not Ghostty's app, docs, completions, or
+/// build-data CLI (which would pull in unrelated build-time dependencies).
+fn buildRuntimeResources(b: *std.Build, ghostty_dep: *std.Build.Dependency) ?RuntimeResources {
+    // Reuse Ghostty's existing theme pin. A null result requests its lazy
+    // dependency; Zig fetches it and reruns graph construction before building.
+    const themes = ghostty_dep.builder.lazyDependency("iterm2_themes", .{}) orelse return null;
+
+    const generator = b.addExecutable(.{
+        .name = "djinn-terminfo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("scripts/terminfo.zig"),
+            .target = b.graph.host,
+            .optimize = .ReleaseSafe,
+        }),
+    });
+    generator.root_module.link_libc = true;
+    generator.root_module.addImport("ghostty_terminfo", b.createModule(.{
+        .root_source_file = ghostty_dep.path("src/terminfo/ghostty.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    }));
+    const generate = b.addRunArtifact(generator);
+    // Give tic a named input file; it is generated from the same pinned
+    // Ghostty source as the library, never copied from an installed app.
+    const source_files = b.addWriteFiles();
+    const source = source_files.addCopyFile(generate.captureStdOut(.{}), "ghostty.terminfo");
+
+    // Use Apple's tic deliberately: its hexadecimal directory layout is
+    // required by Ghostty's macOS sentinel (terminfo/78/xterm-ghostty).
+    // An arbitrary ncurses tic from PATH can instead produce x/xterm-ghostty.
+    const tic = b.addSystemCommand(&.{ "/usr/bin/tic", "-x", "-o" });
+    const terminfo = tic.addOutputDirectoryArg("terminfo");
+    tic.addFileArg(source);
+
+    return .{
+        .terminfo = terminfo,
+        .shell_integration = ghostty_dep.path("src/shell-integration"),
+        .themes = themes.path(""),
+    };
+}
+
+/// Install the same minimal runtime tree into either share/ or the bundle.
+fn installRuntimeResources(
+    b: *std.Build,
+    resources: RuntimeResources,
+    subdir: []const u8,
+) *std.Build.Step {
+    const group = b.allocator.create(std.Build.Step.TopLevel) catch @panic("OOM");
+    group.* = .{
+        .step = .init(.{
+            .tag = .top_level,
+            .name = b.fmt("install runtime resources to {s}", .{subdir}),
+            .owner = b,
+        }),
+        .description = "Install runtime resources",
+    };
+    const step = &group.step;
+
+    const shell = b.addInstallDirectory(.{
+        .source_dir = resources.shell_integration,
+        .install_dir = .prefix,
+        .install_subdir = b.pathJoin(&.{ subdir, "ghostty/shell-integration" }),
+        .exclude_extensions = &.{".md"},
+    });
+    step.dependOn(&shell.step);
+    const themes = b.addInstallDirectory(.{
+        .source_dir = resources.themes,
+        .install_dir = .prefix,
+        .install_subdir = b.pathJoin(&.{ subdir, "ghostty/themes" }),
+        .exclude_extensions = &.{".md"},
+    });
+    step.dependOn(&themes.step);
+
+    // InstallDir doesn't preserve symlinks reliably. Keep tic's aliases,
+    // just as upstream GhosttyResources does. Precreate the directory so repeated
+    // installs merge into terminfo rather than changing the copy layout.
+    const destination: std.Build.LazyPath = .{ .relative = .{ .base = .install_prefix, .sub_path = subdir } };
+    const mkdir = b.addSystemCommand(&.{ "mkdir", "-p" });
+    mkdir.addDirectoryArg2(destination.path(b, "terminfo"), .{});
+    const copy = b.addSystemCommand(&.{ "cp", "-R", "-P" });
+    copy.addDirectoryArg(resources.terminfo);
+    copy.addDirectoryArg2(destination, .{});
+    copy.step.dependOn(&mkdir.step);
+    step.dependOn(&copy.step);
+    return step;
 }
 
 /// Minimal Info.plist for djinn.

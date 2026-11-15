@@ -1,7 +1,7 @@
 //! Tab strip for multi-profile sessions.
 //!
-//! Thin row of profile name "chips" anchored above the terminal/log
-//! area. Reads the session manager for names + active index, paints
+//! Thin row of static profile labels anchored above the terminal.
+//! Reads the session manager for labels + active index, paints
 //! each tab inline (no per-tab NSView), routes mouseDown to
 //! `activateSession(idx)`. Hidden / not added when sessions.len < 2.
 
@@ -37,11 +37,8 @@ pub fn create(width: f64, container_h: f64) objc.Object {
     view.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, (1 << 1) | (1 << 5))});
     view.msgSend(void, "setWantsLayer:", .{@as(c_int, 1)});
 
-    // Bottom hairline as a CALayer-backed subview pinned to the
-    // bottom edge. Same construction as `LogView`'s left separator
-    // so both surfaces' borders render through identical paint paths
-    // — sharp 1px on @1x, 2 device pixels on @2x, no antialias drift
-    // from `NSBezierPath.fillRect` rounding.
+    // CALayer-backed bottom hairline keeps the border crisp without
+    // NSBezierPath fill rounding.
     const NSView = objc.getClass("NSView") orelse return view;
     const sep_alloc = NSView.msgSend(objc.Object, "alloc", .{});
     const sep = sep_alloc.msgSend(objc.Object, "initWithFrame:", .{NSRect{
@@ -112,7 +109,6 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
     const NSBezierPath = objc.getClass("NSBezierPath") orelse return;
     const NSString = objc.getClass("NSString") orelse return;
     const NSFont = objc.getClass("NSFont") orelse return;
-    const NSDictionary = objc.getClass("NSDictionary") orelse return;
     const NSMutableDictionary = objc.getClass("NSMutableDictionary") orelse return;
 
     // Strip background: terminal bg, same as the surface below.
@@ -126,15 +122,14 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
     const tab_count: f64 = @floatFromInt(sm.sessions.items.len);
     const tab_w = bounds.size.width / tab_count;
 
-    const font = chrome.chromeFont(NSFont, style.font_family, style.font_size_chip);
+    const font = chrome.chromeFont(NSFont, style.font_size_chip);
     const font_key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "NSFont")});
     const fg_key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "NSColor")});
 
     // Minimal indicator: shared chip.bg for the whole strip; active
     // vs inactive carried entirely by label color (fg vs chip.dim).
     // No fills, no underlines — the strip recedes into chrome and
-    // the active tab reads via contrast alone. Same idiom as the log
-    // pane's per-entry header (`{client} · HH:MM` in dim, body in fg).
+    // the active tab reads via contrast alone.
     for (sm.sessions.items, 0..) |sess, i| {
         const x = @as(f64, @floatFromInt(i)) * tab_w;
         const is_active = i == sm.active_idx;
@@ -144,10 +139,14 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
         attrs.msgSend(void, "setObject:forKey:", .{ font, font_key });
         attrs.msgSend(void, "setObject:forKey:", .{ text_color, fg_key });
 
-        const label = sess.profile.label();
-        var name_buf: [128]u8 = undefined;
-        const z_label = std.fmt.bufPrintZ(&name_buf, "{s}", .{label}) catch continue;
-        const ns_label = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, z_label.ptr)});
+        const label = sess.label();
+        var name_buf: [512]u8 = undefined;
+        var length = @min(label.len, name_buf.len - 1);
+        while (length > 0 and !std.unicode.utf8ValidateSlice(label[0..length])) length -= 1;
+        @memcpy(name_buf[0..length], label[0..length]);
+        name_buf[length] = 0;
+        const ns_label = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, &name_buf)});
+        if (ns_label.value == null) continue;
 
         const text_size = ns_label.msgSend(NSSize, "sizeWithAttributes:", .{attrs});
         // Left-align the label inside its tab cell with a fixed
@@ -157,46 +156,14 @@ fn drawRectImpl(self_id: objc.c.id, _: objc.c.SEL, _: NSRect) callconv(.c) void 
         const tab_pad: f64 = 12;
         const text_x = x + tab_pad;
         const text_y = (bounds.size.height - text_size.height) / 2.0;
-        ns_label.msgSend(void, "drawAtPoint:withAttributes:", .{ NSPoint{ .x = text_x, .y = text_y }, attrs });
-
-        _ = NSDictionary; // keep import live for future attribute dicts
+        ns_label.msgSend(void, "drawInRect:withAttributes:", .{ NSRect{
+            .origin = .{ .x = text_x, .y = text_y },
+            .size = .{ .width = @max(0.0, tab_w - 2 * tab_pad), .height = text_size.height },
+        }, attrs });
     }
 
-    // Bottom hairline is a CALayer-backed subview created in
-    // `create()` so it shares the log pane's separator paint path.
-    // Color is set on applyStyle + refreshed on theme reload.
-
-    // Trailing-edge agent-state dot. Mirrors the menubar SF Symbol
-    // coloring so the user has a near-eye-line indicator while focused
-    // on the panel — without it the only "agent busy / waiting on me"
-    // cue lives in the menu bar, which sits far above the panel during
-    // active terminal work.
-    //
-    // A single global dot (not per-tab) because MCP agent state is
-    // process-global today — clients aren't bound to specific profile
-    // tabs. Per-tab status would need per-profile client routing
-    // first (recorded as deferred in TODO.md).
-    if (app.g.agent.state) |st| {
-        const snap = st.snapshot();
-        const dot_rgb_opt: ?chrome.Rgb = switch (snap.state) {
-            .idle, .done => null,
-            .working => style.info,
-            .attention => style.warn,
-            .@"error" => style.err,
-        };
-        if (dot_rgb_opt) |rgb| {
-            const dot_d: f64 = 7;
-            const dot_x = bounds.size.width - dot_d - 12;
-            const dot_y = (bounds.size.height - dot_d) / 2.0;
-            const path = NSBezierPath.msgSend(objc.Object, "bezierPathWithOvalInRect:", .{NSRect{
-                .origin = .{ .x = dot_x, .y = dot_y },
-                .size = .{ .width = dot_d, .height = dot_d },
-            }});
-            const dot_color = chrome.nsColorFromRgb(NSColor, rgb);
-            dot_color.msgSend(void, "set", .{});
-            path.msgSend(void, "fill", .{});
-        }
-    }
+    // Bottom hairline is a CALayer-backed subview created in create().
+    // Color is set on applyStyle and refreshed on theme reload.
 }
 
 fn mouseDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callconv(.c) void {
@@ -209,6 +176,7 @@ fn mouseDownImpl(self_id: objc.c.id, _: objc.c.SEL, event_id: objc.c.id) callcon
     const local = view.msgSend(NSPoint, "convertPoint:fromView:", .{ win_pt, @as(?*anyopaque, null) });
     const bounds = view.msgSend(NSRect, "bounds", .{});
 
+    if (bounds.size.width <= 0 or local.x < 0 or local.x >= bounds.size.width) return;
     const tab_count: f64 = @floatFromInt(sm.sessions.items.len);
     const tab_w = bounds.size.width / tab_count;
     const idx_f = local.x / tab_w;

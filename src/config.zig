@@ -1,27 +1,26 @@
 const std = @import("std");
+const platform = @import("io/platform.zig");
 
 pub const Config = struct {
     window: WindowConfig = .{},
     terminal: TerminalConfig = .{},
     theme: ThemeConfig = .{},
     hotkey: HotkeyConfig = .{},
-    provider: ProviderConfig = .{},
-    mcp: McpConfig = .{},
     notifications: NotifyConfig = .{},
     scrollback: ScrollbackConfig = .{},
-    log_pane: LogPaneConfig = .{},
     system: SystemConfig = .{},
     bell: BellConfig = .{},
     keymap: KeymapConfig = .{},
     profiles: ProfilesConfig = .{},
-    clients: ClientsConfig = .{},
-    /// Owns every duped string + every ArrayList backing buffer this
-    /// Config produced. Heap-allocated so the Allocator vtable produced
-    /// by `.allocator()` stays valid across moves of the Config value
-    /// (return-by-value, assignment into another struct slot, etc.).
-    /// Null on default-constructed `Config{}` — `deinit` is a no-op in
-    /// that case, so callers can defer-deinit unconditionally.
-    arena: ?*std.heap.ArenaAllocator = null,
+    /// Parsed configs own their strings and entry slices in this arena.
+    /// Defaults and manually constructed configs borrow their values. Do not
+    /// deinit multiple copies of a parsed Config.
+    arena: ?std.heap.ArenaAllocator = null,
+
+    pub fn deinit(self: *Config) void {
+        if (self.arena) |*arena| arena.deinit();
+        self.* = .{};
+    }
 
     pub const WindowConfig = struct {
         /// Optional so the runtime can tell "user set this explicitly"
@@ -48,11 +47,6 @@ pub const Config = struct {
         /// e.g. user invokes Raycast/Spotlight. Off by default because users
         /// who toggle frequently typically want the popup to stay put.
         hide_on_blur: bool = false,
-        /// Linux-only: when true, Escape hides the panel (Raycast/Spotlight
-        /// muscle memory). Off by default because intercepting Esc breaks
-        /// every TUI that uses it (vim insert-mode exit, less quit, htop
-        /// quit, …). Users who don't run TUIs in djinn can opt in.
-        hide_on_escape: bool = false,
 
         pub const Position = enum {
             top_left,
@@ -87,74 +81,34 @@ pub const Config = struct {
     };
 
     pub const HotkeyConfig = struct {
-        toggle: []const u8 = "ctrl+space",
+        toggle: []const u8 = "ctrl+shift+space",
     };
 
-    pub const ProviderConfig = struct {
-        name: []const u8 = "generic",
-        command: ?[]const u8 = null,
-    };
-
-    /// One named profile = one provider instance. The session layer
-    /// (`src/session/manager.zig`) consumes these and binds each to a
-    /// ghostty surface; UI layers (keybind switcher today, tab strip
-    /// or palette later) sit above the session manager and don't see
-    /// this struct directly.
+    /// One static configured terminal profile. The session manager copies
+    /// these strings so a config reload cannot invalidate launch state.
     pub const ProfileEntry = struct {
         name: []const u8,
-        provider: ?[]const u8 = null,
+        /// Shell expression: preserve executable/argument quotes verbatim.
         command: ?[]const u8 = null,
         cwd: ?[]const u8 = null,
         title: ?[]const u8 = null,
-        /// Path to an executable user script that constructs the
-        /// agentic shell. When set, takes precedence over `command`
-        /// and `provider`. Script must `exec` the agent at the end —
-        /// otherwise the PTY child exits and djinn shows an empty
-        /// terminal. `~`-relative paths are expanded at SessionManager
-        /// resolve time.
+        /// Executable script; takes precedence over command. Invalid scripts
+        /// fail session initialization instead of silently spawning a shell.
+        /// Leading `~/` is expanded by SessionManager.
         script: ?[]const u8 = null,
         /// Per-profile bell overrides. null = inherit the global
-        /// `bell.*` config. Lets the user silence chatter profiles
-        /// (a working Claude session) while keeping the bell on for
-        /// interactive shells.
+        /// `bell.*` config.
         bell_audible: ?bool = null,
         bell_visual: ?bool = null,
         bell_sound: ?[]const u8 = null,
     };
 
-    /// User-set per-client identity. The key matches the 6-hex client
-    /// label that `mcp/server.zig:shortClientId` derives from the
-    /// request User-Agent. Add `client.<hash>.name = "review-bot"` to
-    /// give a memorable label; `client.<hash>.mute = true` suppresses
-    /// banner delivery from that client without dropping log entries.
-    pub const ClientEntry = struct {
-        /// 6-hex client id from User-Agent SHA-256 (stable across
-        /// requests from the same client).
-        id: []const u8,
-        /// Display nickname shown in log headers + menubar surfaces in
-        /// place of the raw hash. Null = fall through to the raw hash.
-        name: ?[]const u8 = null,
-        /// When true, MCP-driven banners from this client are dropped
-        /// (the log still records the entry).
-        mute: bool = false,
-    };
-
-    pub const ClientsConfig = struct {
-        entries: []const ClientEntry = &.{},
-    };
-
     pub const ProfilesConfig = struct {
         /// Name of the profile that's active at startup. Falls back to
         /// the first parsed profile if unset; falls back to a synthesized
-        /// "default" profile (built from flat `provider` / `provider-
-        /// command`) if no profile lines were configured.
+        /// "default" ordinary-shell profile if none were configured.
         default: ?[]const u8 = null,
         entries: []const ProfileEntry = &.{},
-    };
-
-    pub const McpConfig = struct {
-        enabled: bool = true,
-        socket_path: ?[]const u8 = null,
     };
 
     pub const ScrollbackConfig = struct {
@@ -163,21 +117,6 @@ pub const Config = struct {
         /// Cost is roughly `size * cols * sizeof(cell)` of resident
         /// memory in the ghostty page list.
         size: ?u32 = null,
-    };
-
-    pub const LogPaneConfig = struct {
-        /// Hidden by default — most users only want the log surface
-        /// on demand (debugging an MCP client, watching agent state).
-        /// Toggle via Cmd+/ (`toggle_log_pane` action). When false at
-        /// startup, the log view is still built so toggling is just a
-        /// frame change; MCP `djinn_log` calls always update state.
-        enabled: bool = false,
-        /// Fraction of total panel width allocated to the log column.
-        /// Clamped against `width_min` and `width_max` so tiny + huge
-        /// panels still get a legible / non-crowding pane.
-        width_fraction: f64 = 0.28,
-        width_min: f64 = 220,
-        width_max: f64 = 360,
     };
 
     pub const SystemConfig = struct {
@@ -191,9 +130,8 @@ pub const Config = struct {
     };
 
     pub const BellConfig = struct {
-        /// Play a sound on BEL (0x07). Same playback path as
-        /// notifications.attention_sound — afplay subprocess against a
-        /// /System/Library/Sounds/<name>.aiff or absolute path.
+        /// Play a sound on BEL (0x07) via afplay using a system sound
+        /// name or an absolute path.
         audible: bool = true,
         /// Flash the terminal background briefly on BEL — like ghostty's
         /// "audible-bell off" + "visual-bell on" behavior. Useful when
@@ -217,8 +155,7 @@ pub const Config = struct {
         /// Action names match Action.name in view.zig (copy, paste,
         /// scroll_page_up, scroll_page_down, font_inc, font_dec,
         /// font_reset, clear_scrollback, open_settings,
-        /// toggle_log_pane, palette_open, tab_1..tab_9, next_tab,
-        /// prev_tab, etc.).
+        /// tab_1..tab_9, next_tab, prev_tab, etc.).
         /// Bindings parse via hotkey.parseKeybinding ("cmd+k", etc.).
         entries: []const KeymapEntry = &.{},
     };
@@ -226,32 +163,12 @@ pub const Config = struct {
     pub const NotifyConfig = struct {
         system_notifications: bool = true,
         menubar_icon: bool = true,
-        /// Sound played when djinn_attention fires. null/"" = silent.
-        /// "default" = Funk (system default). Absolute path = play that
-        /// file via afplay. Anything else = /System/Library/Sounds/<n>.aiff.
-        /// Defaults to "Glass" so the surface ships audibly out of the box;
-        /// users can opt out by setting null.
-        attention_sound: ?[]const u8 = "Glass",
-        /// Per-state banner gates. Each MCP tool only delivers an
-        /// NSUserNotification banner when its gate is true. Defaults
-        /// chosen to surface user-facing events (attention, error) and
-        /// stay silent on chatter (progress, per-completion summaries
-        /// that already have the menubar as their primary surface).
-        notify_on_attention: bool = true,
-        notify_on_error: bool = true,
-        notify_on_done: bool = false,
-        notify_on_progress: bool = false,
-        /// Minimum interval between banners from the same client. Kills
-        /// banner-storm scenarios where a chatty agent calls
-        /// `djinn_attention` faster than the user can dismiss. Per
-        /// (client_label, state) tuple — different agents or different
-        /// states still get their own first banner immediately.
+        /// Minimum interval between terminal notifications.
         rate_limit_ms: u64 = 30_000,
     };
 
-    /// Load config from ~/.config/djinn/config (ghostty key=value format),
-    /// falling back to defaults.
-    /// Read + parse the config file. Errors propagate so callers can
+    /// Strictly load ~/.config/djinn/config (ghostty key=value format).
+    /// Read, syntax and known-setting errors propagate so callers can
     /// distinguish "no config, use defaults" from "transient read
     /// failure, keep the previous config." Atomic-write editors (vim,
     /// VS Code, Helix) save by renaming a tmp file over the target;
@@ -262,13 +179,10 @@ pub const Config = struct {
         const path = try defaultConfigPath(allocator);
         defer allocator.free(path);
 
-        const file = try std.fs.openFileAbsolute(path, .{});
-        defer file.close();
-
-        const contents = try file.readToEndAlloc(allocator, 64 * 1024);
+        const contents = try std.Io.Dir.cwd().readFileAlloc(platform.io(), path, allocator, .limited(64 * 1024));
         defer allocator.free(contents);
 
-        return parse(allocator, contents);
+        return parseStrict(allocator, contents);
     }
 
     /// First-launch convenience: load the config or fall back to
@@ -284,26 +198,28 @@ pub const Config = struct {
 
     /// Parse config in ghostty's `key = value` format. Comments start with
     /// `#` at column 0 (inline `#` is reserved for hex colors). Unknown
-    /// keys log a warning and continue. All duped strings and ArrayList
-    /// backing buffers are owned by an internal arena; call `deinit` to
-    /// release them as a single transaction.
-    pub fn parse(parent: std.mem.Allocator, contents: []const u8) !Config {
-        const arena = try parent.create(std.heap.ArenaAllocator);
-        arena.* = std.heap.ArenaAllocator.init(parent);
-        errdefer {
-            arena.deinit();
-            parent.destroy(arena);
-        }
-        const alloc = arena.allocator();
+    /// keys log a warning and continue. String values are duped with the
+    /// allocator; release them with Config.deinit, including on reload.
+    pub fn parse(backing_allocator: std.mem.Allocator, contents: []const u8) !Config {
+        return parseWithMode(backing_allocator, contents, false);
+    }
 
+    /// Reject malformed syntax and known settings atomically. Unknown and
+    /// removed keys still warn for migration compatibility. Hotkey/binding
+    /// grammar is checked by the runtime before it installs this candidate.
+    pub fn parseStrict(backing_allocator: std.mem.Allocator, contents: []const u8) !Config {
+        return parseWithMode(backing_allocator, contents, true);
+    }
+
+    fn parseWithMode(backing_allocator: std.mem.Allocator, contents: []const u8, strict: bool) !Config {
+        var arena = std.heap.ArenaAllocator.init(backing_allocator);
+        errdefer arena.deinit();
+        const allocator = arena.allocator();
         var config = Config{};
-        // No `defer .deinit` on the ArrayLists: on success they end up
-        // `.empty` after toOwnedSlice (empty-slice free is a vtable
-        // no-op); on error the arena reclaims their backing storage in
-        // a single sweep.
-        var keymap_list: std.ArrayList(KeymapEntry) = .{};
-        var profile_list: std.ArrayList(ProfileEntry) = .{};
-        var client_list: std.ArrayList(ClientEntry) = .{};
+        var keymap_list: std.ArrayList(KeymapEntry) = .empty;
+        defer keymap_list.deinit(allocator);
+        var profile_list: std.ArrayList(ProfileEntry) = .empty;
+        defer profile_list.deinit(allocator);
 
         var lines = std.mem.splitScalar(u8, contents, '\n');
         var line_no: u32 = 0;
@@ -314,58 +230,53 @@ pub const Config = struct {
 
             const eq_idx = std.mem.indexOfScalar(u8, line, '=') orelse {
                 std.debug.print("warning: config:{d}: missing '=' in '{s}'\n", .{ line_no, line });
+                if (strict) return error.MalformedSetting;
                 continue;
             };
             const key = std.mem.trim(u8, line[0..eq_idx], " \t");
-            const val = unquote(std.mem.trim(u8, line[eq_idx + 1 ..], " \t"));
+            const raw_val = std.mem.trim(u8, line[eq_idx + 1 ..], " \t");
+            if (strict and (key.len == 0 or std.mem.indexOfScalar(u8, line, 0) != null or
+                !validQuotedValue(key, raw_val)))
+            {
+                std.debug.print("warning: config:{d}: malformed key/value syntax\n", .{line_no});
+                return error.MalformedSetting;
+            }
+            // Commands are shell expressions, not quoted scalar strings: even
+            // an executable-only quoted path needs its quotes at launch.
+            const val = if (isProfileCommand(key)) raw_val else unquote(raw_val);
 
-            applyKey(&config, &keymap_list, &profile_list, &client_list, alloc, key, val) catch |err| {
-                std.debug.print("warning: config:{d}: '{s}' = '{s}' ({})\n", .{ line_no, key, val, err });
+            if (removedKeyHelp(key)) |help| {
+                std.debug.print("warning: config:{d}: removed key '{s}'; {s}\n", .{ line_no, key, help });
+                continue;
+            }
+            applyKey(&config, &keymap_list, &profile_list, allocator, key, val) catch |err| {
+                if (err == error.OutOfMemory) return error.OutOfMemory;
+                std.debug.print("warning: config:{d}: '{s}' = '{s}' ({}); check this setting in ~/.config/djinn/config\n", .{ line_no, key, val, err });
+                if (strict and err != error.UnknownProfileField) return err;
             };
         }
 
-        config.keymap.entries = try keymap_list.toOwnedSlice(alloc);
-        config.profiles.entries = try profile_list.toOwnedSlice(alloc);
-        config.clients.entries = try client_list.toOwnedSlice(alloc);
+        config.keymap.entries = try keymap_list.toOwnedSlice(allocator);
+        config.profiles.entries = try profile_list.toOwnedSlice(allocator);
         config.arena = arena;
         return config;
-    }
-
-    /// Release every string and ArrayList buffer this Config allocated.
-    /// Safe to call on a default-constructed Config (no-op when
-    /// `arena == null`). After deinit the Config is no longer
-    /// usable — any slice that was reachable through the freed arena
-    /// is now dangling.
-    pub fn deinit(self: *Config) void {
-        if (self.arena) |a| {
-            const parent = a.child_allocator;
-            a.deinit();
-            parent.destroy(a);
-        }
-        self.arena = null;
     }
 
     fn applyKey(
         config: *Config,
         keymap_list: *std.ArrayList(KeymapEntry),
         profile_list: *std.ArrayList(ProfileEntry),
-        client_list: *std.ArrayList(ClientEntry),
         allocator: std.mem.Allocator,
         key: []const u8,
         val: []const u8,
     ) !void {
-        // Per-client identity overrides: `client.<id>.name = ...`,
-        // `client.<id>.mute = true`. Dotted path mirrors profile.*.
-        if (std.mem.startsWith(u8, key, "client.")) {
-            try applyClientKey(client_list, allocator, key["client.".len..], val);
-            return;
-        }
         // Profiles --------------------------------------------------------
         // `default-profile = name` selects which profile is active at
         // startup. `profile.<name>.<field> = value` defines per-profile
         // overrides. Both come BEFORE the flat-key fallthrough so the
         // dotted path wins over any later collision.
         if (eq(key, "default-profile")) {
+            try requireNonempty(val);
             config.profiles.default = try allocator.dupe(u8, val);
             return;
         }
@@ -376,9 +287,9 @@ pub const Config = struct {
 
         // Window ----------------------------------------------------------
         if (eq(key, "window-width")) {
-            config.window.width = try std.fmt.parseInt(u32, val, 10);
+            config.window.width = try parseDimension(val);
         } else if (eq(key, "window-height")) {
-            config.window.height = try std.fmt.parseInt(u32, val, 10);
+            config.window.height = try parseDimension(val);
         } else if (eq(key, "window-position")) {
             // Two accepted forms: a named enum (e.g. `top_center`) or an
             // `X,Y` coord pair in NSScreen units. The pair form sets
@@ -393,13 +304,15 @@ pub const Config = struct {
             } else if (std.mem.indexOfScalar(u8, val, ',')) |idx| {
                 const xs = std.mem.trim(u8, val[0..idx], " \t");
                 const ys = std.mem.trim(u8, val[idx + 1 ..], " \t");
-                config.window.position_x = try std.fmt.parseFloat(f64, xs);
-                config.window.position_y = try std.fmt.parseFloat(f64, ys);
+                const x = try parseFloatRange(xs, -max_position, max_position);
+                const y = try parseFloatRange(ys, -max_position, max_position);
+                config.window.position_x = x;
+                config.window.position_y = y;
             } else return error.UnknownEnum;
         } else if (eq(key, "window-position-x")) {
-            config.window.position_x = try std.fmt.parseFloat(f64, val);
+            config.window.position_x = try parseFloatRange(val, -max_position, max_position);
         } else if (eq(key, "window-position-y")) {
-            config.window.position_y = try std.fmt.parseFloat(f64, val);
+            config.window.position_y = try parseFloatRange(val, -max_position, max_position);
         } else if (eq(key, "window-toggle-style")) {
             var ts_buf: [64]u8 = undefined;
             config.window.toggle_style = std.meta.stringToEnum(WindowConfig.ToggleStyle, dashToUnder(val, &ts_buf)) orelse return error.UnknownEnum;
@@ -407,72 +320,40 @@ pub const Config = struct {
             config.window.topmost = try parseBool(val);
         } else if (eq(key, "hide-on-blur")) {
             config.window.hide_on_blur = try parseBool(val);
-        } else if (eq(key, "hide-on-escape")) {
-            config.window.hide_on_escape = try parseBool(val);
         } else if (eq(key, "window-opacity")) {
             // Legacy. Prefer `opacity` (theme-level). Kept for back-compat.
-            config.window.opacity = try std.fmt.parseFloat(f64, val);
+            config.window.opacity = try parseFloatRange(val, 0, 1);
         } else if (eq(key, "window-font-size")) {
             // Legacy. Prefer `font-size`.
-            config.window.font_size = try std.fmt.parseFloat(f64, val);
+            config.window.font_size = try parseFloatRange(val, 1, max_dimension);
         }
         // Hotkey ----------------------------------------------------------
         else if (eq(key, "hotkey")) {
+            try requireNonempty(val);
             config.hotkey.toggle = try allocator.dupe(u8, val);
-        }
-        // Provider --------------------------------------------------------
-        else if (eq(key, "provider")) {
-            config.provider.name = try allocator.dupe(u8, val);
-        } else if (eq(key, "provider-command")) {
-            config.provider.command = try allocator.dupe(u8, val);
-        }
-        // MCP -------------------------------------------------------------
-        else if (eq(key, "mcp-enabled")) {
-            config.mcp.enabled = try parseBool(val);
-        } else if (eq(key, "mcp-socket-path")) {
-            config.mcp.socket_path = try allocator.dupe(u8, val);
         }
         // Notifications ---------------------------------------------------
         else if (eq(key, "system-notifications")) {
             config.notifications.system_notifications = try parseBool(val);
         } else if (eq(key, "menubar-icon")) {
             config.notifications.menubar_icon = try parseBool(val);
-        } else if (eq(key, "attention-sound")) {
-            config.notifications.attention_sound = try allocator.dupe(u8, val);
-        } else if (eq(key, "notify-attention")) {
-            config.notifications.notify_on_attention = try parseBool(val);
-        } else if (eq(key, "notify-error")) {
-            config.notifications.notify_on_error = try parseBool(val);
-        } else if (eq(key, "notify-done")) {
-            config.notifications.notify_on_done = try parseBool(val);
-        } else if (eq(key, "notify-progress")) {
-            config.notifications.notify_on_progress = try parseBool(val);
         } else if (eq(key, "notify-rate-limit-ms")) {
             config.notifications.rate_limit_ms = try std.fmt.parseInt(u64, val, 10);
         }
         // Terminal --------------------------------------------------------
         else if (eq(key, "font-family")) {
+            try requireNonempty(val);
             config.terminal.font_family = try allocator.dupe(u8, val);
         } else if (eq(key, "font-size")) {
-            config.terminal.font_size = try std.fmt.parseFloat(f64, val);
+            config.terminal.font_size = try parseFloatRange(val, 1, max_dimension);
         } else if (eq(key, "padding-x")) {
-            config.terminal.padding_x = try std.fmt.parseFloat(f64, val);
+            config.terminal.padding_x = try parseFloatRange(val, 0, max_dimension);
         } else if (eq(key, "padding-y")) {
-            config.terminal.padding_y = try std.fmt.parseFloat(f64, val);
+            config.terminal.padding_y = try parseFloatRange(val, 0, max_dimension);
         }
         // Scrollback ------------------------------------------------------
         else if (eq(key, "scrollback-size")) {
             config.scrollback.size = try std.fmt.parseInt(u32, val, 10);
-        }
-        // Log pane --------------------------------------------------------
-        else if (eq(key, "log-pane-enabled")) {
-            config.log_pane.enabled = try parseBool(val);
-        } else if (eq(key, "log-pane-width-fraction")) {
-            config.log_pane.width_fraction = try std.fmt.parseFloat(f64, val);
-        } else if (eq(key, "log-pane-width-min")) {
-            config.log_pane.width_min = try std.fmt.parseFloat(f64, val);
-        } else if (eq(key, "log-pane-width-max")) {
-            config.log_pane.width_max = try std.fmt.parseFloat(f64, val);
         }
         // System ----------------------------------------------------------
         else if (eq(key, "open-at-login")) {
@@ -490,12 +371,15 @@ pub const Config = struct {
         else if (eq(key, "inherit-ghostty")) {
             config.theme.inherit_ghostty = try parseBool(val);
         } else if (eq(key, "opacity")) {
-            config.theme.opacity = try std.fmt.parseFloat(f64, val);
+            config.theme.opacity = try parseFloatRange(val, 0, 1);
         } else if (eq(key, "background")) {
+            try validateColor(val);
             config.theme.background = try allocator.dupe(u8, val);
         } else if (eq(key, "foreground")) {
+            try validateColor(val);
             config.theme.foreground = try allocator.dupe(u8, val);
         } else if (eq(key, "cursor-color")) {
+            try validateColor(val);
             config.theme.cursor = try allocator.dupe(u8, val);
         }
         // Keybinds — `keybind = action=trigger` (ghostty syntax) ---------
@@ -503,6 +387,7 @@ pub const Config = struct {
             const sub_eq = std.mem.indexOfScalar(u8, val, '=') orelse return error.MalformedKeybind;
             const action = std.mem.trim(u8, val[0..sub_eq], " \t");
             const trigger = std.mem.trim(u8, val[sub_eq + 1 ..], " \t");
+            if (action.len == 0 or trigger.len == 0) return error.MalformedKeybind;
             try keymap_list.append(allocator, .{
                 .name = try allocator.dupe(u8, action),
                 .binding = try allocator.dupe(u8, trigger),
@@ -526,6 +411,19 @@ pub const Config = struct {
         const name = tail[0..dot];
         const field = tail[dot + 1 ..];
         if (name.len == 0 or field.len == 0) return error.MalformedProfileKey;
+
+        // Validate first: unsupported fields must not create shell profiles.
+        const supported = [_][]const u8{ "command", "cwd", "title", "script", "bell-audible", "bell-visual", "bell-sound" };
+        var known = false;
+        for (supported) |candidate| {
+            if (eq(field, candidate)) known = true;
+        }
+        if (!known) return error.UnknownProfileField;
+        if (eq(field, "command") or eq(field, "script") or eq(field, "cwd")) {
+            const empty = if (eq(field, "command")) emptyCommand(val) else std.mem.trim(u8, val, " \t\r\n").len == 0;
+            if (empty) return error.EmptyLaunchValue;
+            if (std.mem.indexOfScalar(u8, val, 0) != null) return error.InvalidLaunchValue;
+        }
 
         // Find or insert the named entry.
         var idx: ?usize = null;
@@ -553,9 +451,7 @@ pub const Config = struct {
         }
 
         const dup = try allocator.dupe(u8, val);
-        if (eq(field, "provider")) {
-            entry.provider = dup;
-        } else if (eq(field, "command")) {
+        if (eq(field, "command")) {
             entry.command = dup;
         } else if (eq(field, "cwd")) {
             entry.cwd = dup;
@@ -571,83 +467,8 @@ pub const Config = struct {
         }
     }
 
-    fn applyClientKey(
-        client_list: *std.ArrayList(ClientEntry),
-        allocator: std.mem.Allocator,
-        tail: []const u8,
-        val: []const u8,
-    ) !void {
-        const dot = std.mem.indexOfScalar(u8, tail, '.') orelse return error.MalformedClientKey;
-        const id = tail[0..dot];
-        const field = tail[dot + 1 ..];
-        if (id.len == 0 or field.len == 0) return error.MalformedClientKey;
-
-        var idx: ?usize = null;
-        for (client_list.items, 0..) |e, i| {
-            if (std.mem.eql(u8, e.id, id)) {
-                idx = i;
-                break;
-            }
-        }
-        if (idx == null) {
-            try client_list.append(allocator, .{ .id = try allocator.dupe(u8, id) });
-            idx = client_list.items.len - 1;
-        }
-
-        const entry = &client_list.items[idx.?];
-        if (eq(field, "name")) {
-            entry.name = try allocator.dupe(u8, val);
-        } else if (eq(field, "mute")) {
-            entry.mute = try parseBool(val);
-        } else {
-            return error.UnknownClientField;
-        }
-    }
-
-    /// Find the per-client config entry for a runtime client label
-    /// (the 6-hex hash produced by `shortClientId`). Returns null when
-    /// the user hasn't configured an override.
-    pub fn findClient(self: *const Config, id: []const u8) ?ClientEntry {
-        for (self.clients.entries) |e| {
-            if (std.mem.eql(u8, e.id, id)) return e;
-        }
-        return null;
-    }
-
-    /// Get the effective command to spawn for the configured provider.
-    pub fn getProviderCommand(self: *const Config) []const u8 {
-        if (self.provider.command) |cmd| return cmd;
-
-        // Default commands per provider name. Each shortcut maps to the
-        // exact CLI binary name shipped by that project; anything else
-        // falls through to /bin/zsh. Match is case-insensitive so
-        // `provider = Claude` resolves to `claude`, matching user
-        // intuition (config keys themselves are lowercase + hyphenated
-        // but provider VALUES are user-typed names).
-        const map = .{
-            .{ "claude", "claude" },
-            .{ "codex", "codex" },
-            .{ "aider", "aider" },
-            .{ "gemini", "gemini" },
-            .{ "opencode", "opencode" },
-            .{ "crush", "crush" }, // charmbracelet/crush
-            .{ "pi", "pi" }, // Pi AI CLI
-        };
-        inline for (map) |entry| {
-            if (eqIgnoreCase(self.provider.name, entry[0])) return entry[1];
-        }
-
-        // Generic: prefer macOS system zsh over $SHELL.
-        // $SHELL inherited from `nix develop` (or other dev shells) often
-        // points at /nix/store/.../bash with broken terminfo lookup, which
-        // breaks readline arrow keys / Ctrl-bindings in the spawned PTY.
-        // /bin/zsh has been macOS's default since 10.15 and ships with
-        // working ncurses — use it unconditionally.
-        return "/bin/zsh";
-    }
-
     pub fn defaultConfigPath(allocator: std.mem.Allocator) ![]const u8 {
-        const home = std.posix.getenv("HOME") orelse return error.NoHome;
+        const home = platform.getenv("HOME") orelse return error.NoHome;
         return std.fmt.allocPrint(allocator, "{s}/.config/djinn/config", .{home});
     }
 };
@@ -658,12 +479,52 @@ fn eq(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
-fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
-    }
-    return true;
+/// Migration diagnostics for removed infrastructure.
+fn removedKeyHelp(key: []const u8) ?[]const u8 {
+    if (eq(key, "provider") or eq(key, "provider-command") or
+        (std.mem.startsWith(u8, key, "profile.") and std.mem.endsWith(u8, key, ".provider")))
+        return "use profile.<name>.command = <executable> (or .script); omit both for your default shell";
+    if (std.mem.startsWith(u8, key, "mcp-") or std.mem.startsWith(u8, key, "client.") or
+        std.mem.startsWith(u8, key, "log-pane-"))
+        return "remove this setting; MCP, client identities and the log pane are no longer supported";
+    if (eq(key, "attention-sound") or eq(key, "notify-attention") or eq(key, "notify-error") or
+        eq(key, "notify-done") or eq(key, "notify-progress"))
+        return "remove this agent notification setting; terminal bells use bell-audible, bell-visual and bell-sound";
+    return null;
+}
+
+// Bound sizes before they reach native geometry, font, and integer casts.
+// Zero padding/opacity is useful; fonts and window dimensions must be positive.
+const max_dimension = std.math.maxInt(u16);
+const max_position = std.math.maxInt(i32);
+
+fn parseDimension(val: []const u8) !u32 {
+    const value = try std.fmt.parseInt(u32, val, 10);
+    if (value == 0 or value > max_dimension) return error.OutOfRange;
+    return value;
+}
+
+fn parseFiniteFloat(val: []const u8) !f64 {
+    const value = try std.fmt.parseFloat(f64, val);
+    if (!std.math.isFinite(value)) return error.OutOfRange;
+    return value;
+}
+
+fn parseFloatRange(val: []const u8, min: f64, max: f64) !f64 {
+    const value = try parseFiniteFloat(val);
+    if (value < min or value > max) return error.OutOfRange;
+    return value;
+}
+
+fn requireNonempty(val: []const u8) !void {
+    if (std.mem.trim(u8, val, " \t\r\n").len == 0) return error.EmptyValue;
+}
+
+// Match the theme parser's supported #rrggbb, 0xrrggbb, and rrggbb forms.
+fn validateColor(val: []const u8) !void {
+    const digits = if (std.mem.startsWith(u8, val, "#")) val[1..] else if (std.mem.startsWith(u8, val, "0x") or std.mem.startsWith(u8, val, "0X")) val[2..] else val;
+    if (digits.len != 6) return error.InvalidColor;
+    _ = std.fmt.parseInt(u24, digits, 16) catch return error.InvalidColor;
 }
 
 fn parseBool(val: []const u8) !bool {
@@ -680,8 +541,45 @@ fn stripComment(s: []const u8) []const u8 {
     return s;
 }
 
+/// Find the closing quote paired with an opening double quote, not a later
+/// shell argument's quote. Leave escaping intact, as in permissive parsing.
+fn closingQuote(s: []const u8) ?usize {
+    if (s.len == 0 or s[0] != '"') return null;
+    var i: usize = 1;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '\\') {
+            i += 1;
+        } else if (s[i] == '"') return i;
+    }
+    return null;
+}
+
+fn isProfileCommand(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "profile.") and std.mem.endsWith(u8, key, ".command");
+}
+
+/// Validate without removing shell quoting from the stored expression.
+fn emptyCommand(value: []const u8) bool {
+    const s = std.mem.trim(u8, value, " \t\r\n");
+    if (s.len == 0) return true;
+    if (s.len >= 2 and (s[0] == '"' or s[0] == '\'') and s[s.len - 1] == s[0]) {
+        return std.mem.trim(u8, s[1 .. s.len - 1], " \t\r\n").len == 0;
+    }
+    return false;
+}
+
+fn validQuotedValue(key: []const u8, s: []const u8) bool {
+    if (s.len == 0 or s[0] != '"') return true;
+    const end = closingQuote(s) orelse return false;
+    // A quoted executable followed by shell arguments is a command, not a
+    // malformed quoted config string. Shell grammar belongs to the shell.
+    return end == s.len - 1 or isProfileCommand(key);
+}
+
 fn unquote(s: []const u8) []const u8 {
-    if (s.len >= 2 and s[0] == '"' and s[s.len - 1] == '"') return s[1 .. s.len - 1];
+    if (closingQuote(s)) |end| {
+        if (end == s.len - 1) return s[1..end];
+    }
     return s;
 }
 
@@ -701,8 +599,7 @@ test "Config: parse defaults from empty input" {
     defer config.deinit();
     try std.testing.expect(config.window.width == null);
     try std.testing.expect(config.window.height == null);
-    try std.testing.expectEqualStrings("ctrl+space", config.hotkey.toggle);
-    try std.testing.expectEqualStrings("generic", config.provider.name);
+    try std.testing.expectEqualStrings("ctrl+shift+space", config.hotkey.toggle);
 }
 
 test "Config: parse window settings" {
@@ -719,77 +616,48 @@ test "Config: parse window settings" {
     try std.testing.expect(config.window.opacity < 0.91 and config.window.opacity > 0.89);
 }
 
-test "Config: parse provider" {
-    const src =
-        \\provider = claude
-        \\provider-command = /usr/local/bin/claude
-    ;
-    var config = try Config.parse(std.testing.allocator, src);
-    defer config.deinit();
-    try std.testing.expectEqualStrings("claude", config.provider.name);
-    try std.testing.expectEqualStrings("/usr/local/bin/claude", config.provider.command.?);
-}
-
 test "Config: parse hotkey" {
-    var config = try Config.parse(std.testing.allocator, "hotkey = cmd+grave\n");
-    defer config.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const config = try Config.parse(arena.allocator(), "hotkey = cmd+grave\n");
     try std.testing.expectEqualStrings("cmd+grave", config.hotkey.toggle);
 }
 
 test "Config: comments + blank lines + unknown keys" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     const src =
         \\# comment
         \\
         \\hotkey = ctrl+space
         \\unknown-key = whatever
     ;
-    var config = try Config.parse(std.testing.allocator, src);
-    defer config.deinit();
+    const config = try Config.parse(arena.allocator(), src);
     try std.testing.expectEqualStrings("ctrl+space", config.hotkey.toggle);
 }
 
 test "Config: keybind syntax" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     const src =
         \\keybind = clear_scrollback=cmd+l
         \\keybind = copy=cmd+c
     ;
-    var config = try Config.parse(std.testing.allocator, src);
-    defer config.deinit();
+    const config = try Config.parse(arena.allocator(), src);
     try std.testing.expectEqual(@as(usize, 2), config.keymap.entries.len);
     try std.testing.expectEqualStrings("clear_scrollback", config.keymap.entries[0].name);
     try std.testing.expectEqualStrings("cmd+l", config.keymap.entries[0].binding);
 }
 
-test "Config: getProviderCommand default mapping" {
-    var config = Config{};
-    config.provider.name = "claude";
-    try std.testing.expectEqualStrings("claude", config.getProviderCommand());
-}
-
-test "Config: getProviderCommand case-insensitive" {
-    var c = Config{};
-    c.provider.name = "Claude";
-    try std.testing.expectEqualStrings("claude", c.getProviderCommand());
-    c.provider.name = "CRUSH";
-    try std.testing.expectEqualStrings("crush", c.getProviderCommand());
-    c.provider.name = "Pi";
-    try std.testing.expectEqualStrings("pi", c.getProviderCommand());
-}
-
-test "Config: getProviderCommand explicit override" {
-    var config = Config{};
-    config.provider.command = "/opt/bin/my-claude";
-    try std.testing.expectEqualStrings("/opt/bin/my-claude", config.getProviderCommand());
-}
-
 test "Config: parse bell settings" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     const src =
         \\bell-audible = false
         \\bell-visual = on
         \\bell-sound = Glass
     ;
-    var config = try Config.parse(std.testing.allocator, src);
-    defer config.deinit();
+    const config = try Config.parse(arena.allocator(), src);
     try std.testing.expect(!config.bell.audible);
     try std.testing.expect(config.bell.visual);
     try std.testing.expectEqualStrings("Glass", config.bell.sound.?);
@@ -806,21 +674,6 @@ test "Config: parse scrollback + system" {
     try std.testing.expect(config.system.open_at_login);
 }
 
-test "Config: parse log pane" {
-    const src =
-        \\log-pane-enabled = true
-        \\log-pane-width-fraction = 0.4
-        \\log-pane-width-min = 180
-        \\log-pane-width-max = 420
-    ;
-    var config = try Config.parse(std.testing.allocator, src);
-    defer config.deinit();
-    try std.testing.expect(config.log_pane.enabled);
-    try std.testing.expect(config.log_pane.width_fraction > 0.39 and config.log_pane.width_fraction < 0.41);
-    try std.testing.expectEqual(@as(f64, 180), config.log_pane.width_min);
-    try std.testing.expectEqual(@as(f64, 420), config.log_pane.width_max);
-}
-
 test "Config: window-position dash → enum" {
     var config = try Config.parse(std.testing.allocator, "window-position = top-left\n");
     defer config.deinit();
@@ -833,7 +686,7 @@ test "Config: window-position 9-grid arms" {
     inline for ([_][]const u8{ "bottom_right", "center_left", "center", "bottom-center" }) |name| {
         const src = "window-position = " ++ name ++ "\n";
         var config = try Config.parse(std.testing.allocator, src);
-        config.deinit();
+        defer config.deinit();
     }
 }
 
@@ -871,48 +724,51 @@ test "Config: window-toggle-style enum" {
 }
 
 test "Config: quoted string value" {
-    var config = try Config.parse(std.testing.allocator, "font-family = \"JetBrains Mono\"\n");
-    defer config.deinit();
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const config = try Config.parse(arena.allocator(), "font-family = \"JetBrains Mono\"\n");
     try std.testing.expectEqualStrings("JetBrains Mono", config.terminal.font_family.?);
 }
 
 test "Config: theme hex value preserved (inline # not a comment)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     const src =
         \\background = #112233
         \\foreground = #aabbcc
     ;
-    var config = try Config.parse(std.testing.allocator, src);
-    defer config.deinit();
+    const config = try Config.parse(arena.allocator(), src);
     try std.testing.expectEqualStrings("#112233", config.theme.background.?);
     try std.testing.expectEqualStrings("#aabbcc", config.theme.foreground.?);
 }
 
 test "Config: malformed keybind warns but parse succeeds" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     const src =
         \\keybind = no_equals_here
         \\hotkey = ctrl+space
     ;
-    var config = try Config.parse(std.testing.allocator, src);
-    defer config.deinit();
+    const config = try Config.parse(arena.allocator(), src);
     try std.testing.expectEqual(@as(usize, 0), config.keymap.entries.len);
     try std.testing.expectEqualStrings("ctrl+space", config.hotkey.toggle);
 }
 
 test "Config: parse profile entries" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     const src =
         \\default-profile = main
-        \\profile.main.provider = claude
+        \\profile.main.command = /bin/sh
         \\profile.main.cwd = ~/projects/main
         \\profile.main.title = main repo
-        \\profile.codex.provider = codex
         \\profile.codex.command = /opt/bin/codex
     ;
-    var config = try Config.parse(std.testing.allocator, src);
-    defer config.deinit();
+    const config = try Config.parse(arena.allocator(), src);
     try std.testing.expectEqualStrings("main", config.profiles.default.?);
     try std.testing.expectEqual(@as(usize, 2), config.profiles.entries.len);
     try std.testing.expectEqualStrings("main", config.profiles.entries[0].name);
-    try std.testing.expectEqualStrings("claude", config.profiles.entries[0].provider.?);
+    try std.testing.expectEqualStrings("/bin/sh", config.profiles.entries[0].command.?);
     try std.testing.expectEqualStrings("~/projects/main", config.profiles.entries[0].cwd.?);
     try std.testing.expectEqualStrings("main repo", config.profiles.entries[0].title.?);
     try std.testing.expectEqualStrings("codex", config.profiles.entries[1].name);
@@ -920,23 +776,25 @@ test "Config: parse profile entries" {
 }
 
 test "Config: malformed profile key warns + skips" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     const src =
         \\profile.no_field = whatever
-        \\profile..provider = bogus
-        \\profile.good.provider = claude
+        \\profile..command = bogus
+        \\profile.good.command = /bin/sh
     ;
-    var config = try Config.parse(std.testing.allocator, src);
-    defer config.deinit();
+    const config = try Config.parse(arena.allocator(), src);
     try std.testing.expectEqual(@as(usize, 1), config.profiles.entries.len);
     try std.testing.expectEqualStrings("good", config.profiles.entries[0].name);
 }
 
 test "Config: profile.script parses + survives roundtrip" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     const src =
         \\profile.main.script = ~/.config/djinn/profiles/main.sh
     ;
-    var config = try Config.parse(std.testing.allocator, src);
-    defer config.deinit();
+    const config = try Config.parse(arena.allocator(), src);
     try std.testing.expectEqual(@as(usize, 1), config.profiles.entries.len);
     try std.testing.expectEqualStrings(
         "~/.config/djinn/profiles/main.sh",
@@ -945,15 +803,15 @@ test "Config: profile.script parses + survives roundtrip" {
 }
 
 test "Config: unknown profile field warns + skips" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
     const src =
-        \\profile.main.provider = claude
         \\profile.main.bogus_field = nope
+        \\profile.main.title = Shell
     ;
-    var config = try Config.parse(std.testing.allocator, src);
-    defer config.deinit();
-    // The "bogus_field" warning fires but the provider field stuck.
+    const config = try Config.parse(arena.allocator(), src);
     try std.testing.expectEqual(@as(usize, 1), config.profiles.entries.len);
-    try std.testing.expectEqualStrings("claude", config.profiles.entries[0].provider.?);
+    try std.testing.expectEqualStrings("Shell", config.profiles.entries[0].title.?);
 }
 
 test "Config: parseBool variants" {
@@ -968,56 +826,218 @@ test "Config: parseBool variants" {
     try std.testing.expectError(error.NotABool, parseBool("maybe"));
 }
 
-test "Config: parse client entries + findClient" {
-    const src =
-        \\client.abc123.name = review-bot
-        \\client.abc123.mute = true
-        \\client.deadbe.name = main
-    ;
-    var config = try Config.parse(std.testing.allocator, src);
+test "Config: removed keys have migration diagnostics and do not create profiles" {
+    const removed = [_][]const u8{
+        "provider",           "provider-command", "profile.old.provider", "mcp-enabled",      "mcp-socket-path",
+        "client.abc123.name", "log-pane-enabled", "attention-sound",      "notify-attention", "notify-error",
+        "notify-done",        "notify-progress",
+    };
+    for (removed) |key| try std.testing.expect(removedKeyHelp(key) != null);
+    try std.testing.expect(removedKeyHelp("notify-rate-limit-ms") == null);
+    var config = try Config.parse(std.testing.allocator,
+        \\profile.old.provider = old-agent
+        \\mcp-enabled = true
+        \\log-pane-enabled = true
+        \\system-notifications = false
+        \\menubar-icon = false
+        \\notify-rate-limit-ms = 123
+    );
     defer config.deinit();
-    try std.testing.expectEqual(@as(usize, 2), config.clients.entries.len);
-    const c1 = config.findClient("abc123") orelse return error.MissingClient;
-    try std.testing.expectEqualStrings("review-bot", c1.name.?);
-    try std.testing.expect(c1.mute);
-    const c2 = config.findClient("deadbe") orelse return error.MissingClient;
-    try std.testing.expect(!c2.mute);
-    try std.testing.expectEqual(@as(?Config.ClientEntry, null), config.findClient("nope"));
+    try std.testing.expectEqual(@as(usize, 0), config.profiles.entries.len);
+    try std.testing.expect(!config.notifications.system_notifications);
+    try std.testing.expect(!config.notifications.menubar_icon);
+    try std.testing.expectEqual(@as(u64, 123), config.notifications.rate_limit_ms);
 }
 
-test "Config: default Config{} deinit is a no-op" {
-    var config = Config{};
-    config.deinit();
-    config.deinit(); // idempotent
-    try std.testing.expectEqual(@as(?*std.heap.ArenaAllocator, null), config.arena);
-}
-
-test "Config: parse + deinit round-trip on every duped field" {
-    const src =
-        \\hotkey = ctrl+grave
-        \\provider = claude
-        \\provider-command = /opt/bin/claude
-        \\mcp-socket-path = /tmp/test.sock
-        \\font-family = "JetBrains Mono"
-        \\attention-sound = Glass
-        \\bell-sound = Tink
-        \\background = #112233
-        \\foreground = #aabbcc
-        \\cursor-color = #ff00ff
+test "Config: parsed strings and repeated keys are owned until deinit" {
+    var config = try Config.parse(std.testing.allocator,
+        \\hotkey = cmd+k
+        \\hotkey = ctrl+space
+        \\font-family = Mono
+        \\background = #123456
+        \\foreground = #abcdef
+        \\cursor-color = #aaaaaa
         \\default-profile = main
-        \\profile.main.provider = claude
-        \\profile.main.command = /opt/bin/claude
-        \\profile.main.cwd = ~/repo
-        \\profile.main.title = Main
-        \\profile.main.script = ~/.config/djinn/profiles/main.sh
+        \\profile.main.command = old
+        \\profile.main.command = /bin/sh
+        \\profile.main.cwd = /tmp
+        \\profile.main.title = Shell
+        \\profile.main.script = /tmp/shell.sh
         \\profile.main.bell-sound = Glass
-        \\client.abc123.name = review-bot
+        \\profile.main.bell-audible = false
+        \\profile.main.bell-visual = true
+        \\bell-sound = Tink
         \\keybind = copy=cmd+c
-        \\keybind = paste=cmd+v
+    );
+    defer config.deinit();
+    try std.testing.expectEqualStrings("/bin/sh", config.profiles.entries[0].command.?);
+    try std.testing.expectEqualStrings("Glass", config.profiles.entries[0].bell_sound.?);
+    try std.testing.expectEqual(@as(?bool, false), config.profiles.entries[0].bell_audible);
+    try std.testing.expectEqual(@as(?bool, true), config.profiles.entries[0].bell_visual);
+}
+
+test "Config: strict parser rejects malformed syntax and known settings" {
+    const cases = [_]struct { text: []const u8, err: anyerror }{
+        .{ .text = "window-width 800", .err = error.MalformedSetting },
+        .{ .text = "= value", .err = error.MalformedSetting },
+        .{ .text = "font-family = \"unterminated", .err = error.MalformedSetting },
+        .{ .text = "font-family = \"Mono\" trailing", .err = error.MalformedSetting },
+        .{ .text = "hotkey = \x00bad", .err = error.MalformedSetting },
+        .{ .text = "window-width = wide", .err = error.InvalidCharacter },
+        .{ .text = "notify-rate-limit-ms = fast", .err = error.InvalidCharacter },
+        .{ .text = "opacity = opaque", .err = error.InvalidCharacter },
+        .{ .text = "bell-audible = maybe", .err = error.NotABool },
+        .{ .text = "profile.main.bell-visual = maybe", .err = error.NotABool },
+        .{ .text = "window-position = diagonal", .err = error.UnknownEnum },
+        .{ .text = "window-toggle-style = fade", .err = error.UnknownEnum },
+        .{ .text = "keybind = no_equals", .err = error.MalformedKeybind },
+        .{ .text = "keybind = =cmd+c", .err = error.MalformedKeybind },
+        .{ .text = "keybind = copy=", .err = error.MalformedKeybind },
+        .{ .text = "profile..title = main", .err = error.MalformedProfileKey },
+        .{ .text = "profile.main = main", .err = error.MalformedProfileKey },
+        .{ .text = "font-family = \"\"", .err = error.EmptyValue },
+        .{ .text = "default-profile =", .err = error.EmptyValue },
+        .{ .text = "hotkey =", .err = error.EmptyValue },
+        .{ .text = "background = not-a-color", .err = error.InvalidColor },
+        .{ .text = "profile.main.command =", .err = error.EmptyLaunchValue },
+        .{ .text = "profile.main.script = \" \"", .err = error.EmptyLaunchValue },
+        .{ .text = "profile.main.cwd = \"\"", .err = error.EmptyLaunchValue },
+    };
+    for (cases) |case| {
+        try std.testing.expectError(case.err, Config.parseStrict(std.testing.allocator, case.text));
+    }
+}
+
+test "Config: strict numeric ranges reject nonfinite and unsafe geometry" {
+    const invalid = [_][]const u8{
+        "window-width = 0",          "window-height = 65536",
+        "font-size = 0",             "font-size = 0.000001",
+        "font-size = 65536",         "window-font-size = -1",
+        "font-size = nan",           "font-size = inf",
+        "font-size = 1e999",         "padding-x = -1",
+        "padding-y = nan",           "padding-x = 1e100",
+        "window-position-x = nan",   "window-position-y = inf",
+        "window-position = 100,nan", "window-position-x = 1e100",
+        "opacity = 1.1",             "opacity = -0.1",
+        "window-opacity = inf",      "window-opacity = nan",
+    };
+    for (invalid) |src| {
+        try std.testing.expectError(error.OutOfRange, Config.parseStrict(std.testing.allocator, src));
+    }
+    var config = try Config.parseStrict(std.testing.allocator,
+        \\window-width = 1
+        \\window-height = 65535
+        \\font-size = 1
+        \\padding-x = 0
+        \\padding-y = 65535
+        \\opacity = 0
+        \\window-opacity = 1
+        \\window-position = -100,200
+        \\scrollback-size = 0
+        \\notify-rate-limit-ms = 0
+    );
+    defer config.deinit();
+    try std.testing.expectEqual(@as(?f64, 0), config.terminal.padding_x);
+    try std.testing.expectEqual(@as(?f64, 0), config.theme.opacity);
+}
+
+test "Config: strict mode accepts unknown and removed keys without creating profiles" {
+    var config = try Config.parseStrict(std.testing.allocator,
+        \\unknown-key = future-setting
+        \\provider = removed
+        \\profile.old.provider = removed
+        \\profile.unknown.future-field = value
+        \\mcp-enabled = true
+        \\profile.main.title = Shell
+    );
+    defer config.deinit();
+    try std.testing.expectEqual(@as(usize, 1), config.profiles.entries.len);
+    try std.testing.expectEqualStrings("main", config.profiles.entries[0].name);
+}
+
+test "Config: strict candidate failure leaves previous valid config untouched" {
+    var current = try Config.parseStrict(std.testing.allocator, "font-size = 18\nhotkey = cmd+k\n");
+    defer current.deinit();
+    try std.testing.expectError(error.NotABool, Config.parseStrict(std.testing.allocator, "font-size = 24\nwindow-topmost = maybe\n"));
+    try std.testing.expectEqual(@as(?f64, 18), current.terminal.font_size);
+    try std.testing.expectEqualStrings("cmd+k", current.hotkey.toggle);
+}
+
+test "Config: strict parsing preserves shell syntax within explicit commands" {
+    var config = try Config.parseStrict(std.testing.allocator,
+        \\profile.main.command = "/some path/tool" --arg='literal $HOME'
+        \\profile.quoted.command = "/some path/tool" --arg="literal $HOME"
+    );
+    defer config.deinit();
+    try std.testing.expectEqualStrings("\"/some path/tool\" --arg='literal $HOME'", config.profiles.entries[0].command.?);
+    try std.testing.expectEqualStrings("\"/some path/tool\" --arg=\"literal $HOME\"", config.profiles.entries[1].command.?);
+}
+
+test "Config: command expressions keep quotes while profile scalars unquote" {
+    const source =
+        \\profile.only.command = "/tmp/my tool"
+        \\profile.args.command = "/tmp/my tool" --arg="value"
+        \\profile.normal.command = /bin/tool --flag
+        \\profile.single.command = '/tmp/my tool'
+        \\profile.only.script = "/tmp/my script"
+        \\profile.only.cwd = "/tmp/my directory"
+        \\profile.only.title = "My title"
+        \\font-family = "My font"
     ;
-    var config = try Config.parse(std.testing.allocator, src);
-    config.deinit();
-    // testing.allocator reports leaks at test exit; success here
-    // means every duped string + every ArrayList buffer rode the
-    // arena to free.
+    // Both parsing modes must agree; only scalar values lose their quotes.
+    for ([_]bool{ false, true }) |strict| {
+        var config = try Config.parseWithMode(std.testing.allocator, source, strict);
+        defer config.deinit();
+        try std.testing.expectEqualStrings("\"/tmp/my tool\"", config.profiles.entries[0].command.?);
+        try std.testing.expectEqualStrings("\"/tmp/my tool\" --arg=\"value\"", config.profiles.entries[1].command.?);
+        try std.testing.expectEqualStrings("/bin/tool --flag", config.profiles.entries[2].command.?);
+        try std.testing.expectEqualStrings("'/tmp/my tool'", config.profiles.entries[3].command.?);
+        try std.testing.expectEqualStrings("/tmp/my script", config.profiles.entries[0].script.?);
+        try std.testing.expectEqualStrings("/tmp/my directory", config.profiles.entries[0].cwd.?);
+        try std.testing.expectEqualStrings("My title", config.profiles.entries[0].title.?);
+        try std.testing.expectEqualStrings("My font", config.terminal.font_family.?);
+    }
+}
+
+test "Config: empty and whitespace command expressions remain invalid" {
+    const sources = [_][]const u8{
+        "profile.work.command =",
+        "profile.work.command = \t ",
+        "profile.work.command = \"\"",
+        "profile.work.command = \" \t \"",
+        "profile.work.command = ''",
+        "profile.work.command = ' \t '",
+    };
+    for (sources) |source| {
+        try std.testing.expectError(error.EmptyLaunchValue, Config.parseStrict(std.testing.allocator, source));
+        var permissive = try Config.parse(std.testing.allocator, source);
+        defer permissive.deinit();
+        try std.testing.expectEqual(@as(usize, 0), permissive.profiles.entries.len);
+    }
+}
+
+test "Config: strict allocation failures clean up successful and rejected candidates" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(allocator: std.mem.Allocator) !void {
+            var config = try Config.parseStrict(allocator, "profile.main.command = /bin/sh\nkeybind = copy=cmd+c\n");
+            defer config.deinit();
+            if (Config.parseStrict(allocator, "profile.main.command = /bin/sh\nbell-audible = invalid\n")) |candidate| {
+                var unexpected = candidate;
+                unexpected.deinit();
+                return error.ExpectedInvalidConfig;
+            } else |err| switch (err) {
+                error.NotABool => {},
+                else => return err,
+            }
+        }
+    }.check, .{});
+}
+
+test "Config: allocation failures clean up" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(allocator: std.mem.Allocator) !void {
+            var config = try Config.parse(allocator, "profile.main.command = /bin/sh\nkeybind = copy=cmd+c\n");
+            defer config.deinit();
+        }
+    }.check, .{});
 }

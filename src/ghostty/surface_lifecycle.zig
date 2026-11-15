@@ -1,285 +1,269 @@
-//! Per-session ghostty surface lifecycle: bind / activate / restart.
-//!
-//! `bindGhosttySurface` calls into libghostty to create + foreground
-//! a surface attached to a host NSView. `activateSession` flips the
-//! visible session, lazy-spawning the surface on first activate.
-//! `restartActiveSession` re-spawns the active session's child
-//! process via a one-runloop-turn deferred re-bind so ghostty's IO
-//! mailbox can unwind between surface_free + newSurface.
-//!
-//! Cocoa-bound: every entry point dispatches NSView messages on the
-//! main thread. Reads `app.g.ghostty.app`, `app.g.session_manager`,
-//! `app.g.allocator`, `app.g.layout.*`, `app.g.term.view_id`,
-//! `app.g.agent.*`.
-
+//! Static-session surface ownership. All entry points run on the main thread.
 const std = @import("std");
 const objc = @import("objc");
 const app = @import("../app.zig");
-const ghostty_runtime = @import("runtime.zig");
+const runtime = @import("runtime.zig");
 const Session = @import("../session/manager.zig").Session;
 const tab_strip = @import("../session/tab_strip.zig");
-
-const c_dispatch = @cImport({
-    @cInclude("dispatch/dispatch.h");
-});
-
-extern "c" fn dispatch_async_f(
-    queue: ?*anyopaque,
-    ctx: ?*anyopaque,
-    work: *const fn (?*anyopaque) callconv(.c) void,
-) void;
-
+const c_dispatch = @import("darwin-c");
+extern "c" fn dispatch_async_f(queue: ?*anyopaque, ctx: ?*anyopaque, work: *const fn (?*anyopaque) callconv(.c) void) void;
 const NSRect = extern struct {
     origin: extern struct { x: f64, y: f64 },
     size: extern struct { width: f64, height: f64 },
 };
 
-/// Switch the visible session. Hides the previous active surface_host,
-/// shows the target one, lazy-spawns its ghostty surface on first use,
-/// and re-anchors the keyboard focus. Called by the `tab_N` / `next_tab`
-/// / `prev_tab` action handlers in view.zig.
-pub fn activateSession(idx: usize) bool {
+/// A deferred request belongs to one incarnation, never to the active tab.
+pub const Ticket = struct {
+    session_id: u64,
+    generation: u64,
+
+    pub fn matches(self: Ticket, session: *const Session) bool {
+        return self.session_id == session.id and self.generation == session.surface_generation;
+    }
+};
+
+fn findSession(id: u64) ?*Session {
+    const sm = app.g.session_manager orelse return null;
+    for (sm.sessions.items) |*session| {
+        if (session.id == id) return session;
+    }
+    return null;
+}
+
+fn refresh() void {
+    tab_strip.refresh();
+    if (app.g.menubar) |mb| mb.refresh();
+}
+
+const InitialSurfaceState = struct { focused: bool, visible: bool };
+
+fn initialSurfaceState(active: bool, visible: bool, key: bool) InitialSurfaceState {
+    return .{ .focused = active and visible and key, .visible = active and visible };
+}
+
+/// A failed explicit cwd must be visible even for lazy/restart launches with
+/// no terminal yet. Never let Ghostty silently choose a different directory.
+fn reportLaunchFailure(session: *const Session, err: anyerror) void {
+    var buffer: [2048]u8 = undefined;
+    const message = std.fmt.bufPrint(&buffer, "Cannot start profile '{s}': working directory '{s}' is unavailable ({s}). Restore it or fix the profile, then retry.", .{
+        session.profile.name, session.profile.cwd orelse "", @errorName(err),
+    }) catch "Cannot start terminal: the configured working directory is unavailable. Fix the profile and retry.";
+    std.debug.print("djinn: {s}\n", .{message});
+    const NSString = objc.getClass("NSString") orelse return;
+    const NSAlert = objc.getClass("NSAlert") orelse return;
+    const text = NSString.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "initWithBytes:length:encoding:", .{ message.ptr, @as(c_ulong, message.len), @as(c_ulong, 4) });
+    if (text.value == null) return;
+    defer text.msgSend(void, "release", .{});
+    const alert = NSAlert.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "init", .{});
+    if (alert.value == null) return;
+    defer alert.msgSend(void, "release", .{});
+    alert.msgSend(void, "setMessageText:", .{text});
+    _ = alert.msgSend(c_long, "runModal", .{});
+}
+
+/// Session-owned C strings remain valid through surface destruction.
+pub fn bindGhosttySurface(allocator: std.mem.Allocator, ga: *runtime.App, host: objc.Object, session: *Session) ?runtime.c.ghostty_surface_t {
+    session.validateLaunch() catch |err| {
+        reportLaunchFailure(session, err);
+        return null;
+    };
+    std.debug.assert(session.surface == null);
+    runtime.releaseSessionInput(session);
+    session.terminal_title_len = 0;
+    const command = if (session.profile.command) |cmd| allocator.dupeSentinel(u8, cmd, 0) catch return null else null;
+    const cwd = if (session.profile.cwd) |dir| allocator.dupeSentinel(u8, dir, 0) catch {
+        if (command) |s| allocator.free(s);
+        return null;
+    } else null;
+    const window = host.msgSend(objc.Object, "window", .{});
+    const scale: f64 = if (window.value != null) window.msgSend(f64, "backingScaleFactor", .{}) else 1.0;
+    session.surface_generation +%= 1;
+    const surface = ga.newSurface(host.value, scale, if (command) |s| s.ptr else null, if (cwd) |s| s.ptr else null, session) orelse {
+        if (command) |s| allocator.free(s);
+        if (cwd) |s| allocator.free(s);
+        session.terminal_title_len = 0;
+        return null;
+    };
+    session.command_z = command;
+    session.cwd_z = cwd;
+    session.surface = @ptrCast(surface);
+    session.spawned = true;
+    session.exited = false;
+    // Ghostty starts surfaces focused. Reset EVERY incarnation first, including
+    // the initial hidden binding and inactive surfaces created before switching.
+    runtime.surfaceSetFocus(surface, false);
+    runtime.surfaceSetOcclusion(surface, false);
+    const active = if (app.g.session_manager) |sm| sm.active() == session else false;
+    const state = if (app.g.window.panel) |panel|
+        initialSurfaceState(active, panel.visible, panel.ns_panel.msgSend(bool, "isKeyWindow", .{}))
+    else
+        initialSurfaceState(active, false, false);
+    runtime.surfaceSetOcclusion(surface, state.visible);
+    runtime.surfaceSetFocus(surface, state.focused);
+    const bounds = host.msgSend(NSRect, "bounds", .{});
+    runtime.surfaceSetContentScale(surface, scale);
+    runtime.surfaceSetSize(surface, @intFromFloat(@max(1.0, bounds.size.width * scale)), @intFromFloat(@max(1.0, bounds.size.height * scale)));
+    return surface;
+}
+
+pub fn destroySession(session: *Session) void {
+    if (app.g.session_manager) |sm| {
+        if (sm.active().id == session.id) @import("../terminal/find.zig").endSearch();
+    }
+    // Balance host-owned Secure Input / cursor hide before removing the source.
+    runtime.releaseSessionInput(session);
+    // Invalidate deferred requests and clear lookup BEFORE destruction callbacks.
+    session.surface_generation +%= 1;
+    const surface = session.surface;
+    session.surface = null;
+    session.spawned = false;
+    session.exited = false;
+    session.terminal_title_len = 0;
+    if (surface) |sp| {
+        if (app.g.ghostty.surface == sp) app.g.ghostty.surface = null;
+        if (app.g.ghostty.app) |ga| ga.surfaceFree(@ptrCast(sp));
+    }
+    if (app.g.allocator) |allocator| {
+        if (session.command_z) |s| allocator.free(s);
+        if (session.cwd_z) |s| allocator.free(s);
+    }
+    session.command_z = null;
+    session.cwd_z = null;
+}
+
+/// Called on show as well as selection: a closed profile is still selectable.
+pub fn ensureActiveSession() bool {
     const sm = app.g.session_manager orelse return false;
-    if (idx >= sm.sessions.items.len) return false;
-    if (idx == sm.active_idx) return false;
-
-    // Capture the old index up front + index by slot so the `old` /
-    // `new` references don't shift under our feet when `switchTo`
-    // flips `active_idx`. Both slots are reached via explicit array
-    // index, never via `sm.active()` after the switch.
-    const old_idx = sm.active_idx;
-    const old_sess: *Session = &sm.sessions.items[old_idx];
-    if (old_sess.surface_host) |host| {
-        objc.Object.fromId(host).msgSend(void, "setHidden:", .{@as(c_int, 1)});
-    }
-    if (old_sess.surface) |sp| {
-        ghostty_runtime.surfaceSetFocus(@ptrCast(sp), false);
-    }
-
-    _ = sm.switchTo(idx);
-    const new_sess: *Session = &sm.sessions.items[idx];
-    const new_host = objc.Object.fromId(new_sess.surface_host orelse return false);
-    new_host.msgSend(void, "setHidden:", .{@as(c_int, 0)});
-
-    // Lazy spawn — only the active-at-startup session was bound during
-    // boot. Secondary profiles get their surface here on first activate.
-    if (!new_sess.spawned) {
+    const session = sm.active();
+    if (session.surface == null) {
         const ga = app.g.ghostty.app orelse return false;
         const allocator = app.g.allocator orelse return false;
-        const surf = bindGhosttySurface(allocator, new_sess, ga, new_host, new_sess.profile.command, new_sess.profile.cwd) orelse {
-            std.debug.print("error: lazy surface spawn failed for profile '{s}'\n", .{new_sess.profile.name});
+        const host = objc.Object.fromId(session.surface_host orelse return false);
+        _ = bindGhosttySurface(allocator, ga, host, session) orelse {
+            std.debug.print("djinn: cannot start profile '{s}'\n", .{session.profile.name});
             return false;
         };
-        new_sess.surface = @ptrCast(surf);
-        new_sess.spawned = true;
     }
-
-    // Update the global pointer + AppState slot BEFORE re-focus so any
-    // re-entrant Cocoa callback fired during setFocus sees the new
-    // surface in app.g (reapplyTheme + updateSearchCountLabel both
-    // read app.g.ghostty.surface).
-    app.g.ghostty.surface = new_sess.surface;
-    app.g.layout.surface_host_id = if (new_sess.surface_host) |h| @ptrCast(@alignCast(h)) else null;
-    if (new_sess.surface) |sp| {
-        ghostty_runtime.surfaceSetFocus(@ptrCast(sp), true);
-    }
-
-    // Per-profile window size memory. State.json may carry a
-    // per-profile width/height — restore it here so log-heavy profiles
-    // stay tall+wide while shell profiles stay compact. Skip when the
-    // user pinned `window-width` / `window-height` explicitly in
-    // config (config wins so editing the file takes effect immediately).
-    applyProfileWindowSize(new_sess.profile.name);
-
-    // Trigger menubar redraw — its dropdown subtitle reflects the
-    // active profile name.
-    if (app.g.agent.menubar) |mb| {
-        if (app.g.agent.state) |st| {
-            const snap = st.snapshot();
-            mb.updateState(@enumFromInt(@intFromEnum(snap.state)), snap.message);
-        }
-    }
-    // Tab strip highlights the active idx; redraw to follow.
-    tab_strip.refresh();
+    app.g.ghostty.surface = session.surface;
+    app.g.layout.surface_host_id = @ptrCast(@alignCast(session.surface_host));
+    if (session.surface_host) |host| objc.Object.fromId(host).msgSend(void, "setHidden:", .{@as(c_int, 0)});
     return true;
 }
 
-/// Context for deferred surface re-spawn. Heap-allocated by
-/// `restartActiveSession` and freed by `restartSurfaceCallback` —
-/// the slices it carries are *borrowed*: cmd is either
-/// `active.profile.command` (owned by SessionManager for the
-/// program lifetime) or a static literal like "/bin/zsh"; cwd is
-/// owned by SessionManager. No string lifetime to manage here.
-const RestartCtx = struct {
-    cmd: []const u8,
-    cwd: ?[]const u8,
-};
-
-/// Re-spawn the active session's child process. When `override_cmd` is
-/// non-null it replaces the profile's command (used by `shell_session`
-/// to force /bin/zsh). The old surface is freed synchronously and the
-/// new surface is bound on the next main-queue iteration so ghostty's
-/// IO mailbox has a runloop turn to unwind.
-pub fn restartActiveSession(override_cmd: ?[]const u8) void {
-    const sm = app.g.session_manager orelse return;
-    const ga = app.g.ghostty.app orelse return;
-    const allocator = app.g.allocator orelse return;
-    const active = sm.active();
-
-    // Free the old surface. Null the session slot + global pointer so
-    // nothing tries to use a stale handle between now and when the
-    // re-spawn callback runs.
-    if (active.surface) |sp| {
-        ga.surfaceFree(@ptrCast(sp));
-        active.surface = null;
-        active.spawned = false;
-        active.exited = false;
-        app.g.ghostty.surface = null;
+pub fn activateSession(idx: usize) bool {
+    const sm = app.g.session_manager orelse return false;
+    if (idx >= sm.sessions.items.len) return false;
+    const previous = sm.active_idx;
+    if (idx != previous) {
+        // Spawn before switching so a failure leaves the old session usable.
+        const target = &sm.sessions.items[idx];
+        if (target.surface == null) {
+            const ga = app.g.ghostty.app orelse return false;
+            const allocator = app.g.allocator orelse return false;
+            const host = objc.Object.fromId(target.surface_host orelse return false);
+            _ = bindGhosttySurface(allocator, ga, host, target) orelse return false;
+        }
+        @import("../terminal/find.zig").endSearch();
+        const old = sm.active();
+        if (old.surface) |sp| {
+            runtime.surfaceSetFocus(@ptrCast(sp), false);
+            runtime.surfaceSetOcclusion(@ptrCast(sp), false);
+        }
+        if (old.surface_host) |host| objc.Object.fromId(host).msgSend(void, "setHidden:", .{@as(c_int, 1)});
+        _ = sm.switchTo(idx);
     }
-
-    const ctx = allocator.create(RestartCtx) catch return;
-    ctx.* = .{
-        .cmd = override_cmd orelse active.profile.command,
-        .cwd = active.profile.cwd,
-    };
-
-    // Schedule re-spawn on the next main-queue iteration. The
-    // one-turn gap is load-bearing: ghostty's IO mailbox needs a
-    // runloop cycle to unwind after surface_free before the same
-    // NSView can host a fresh surface.
-    const main_queue = c_dispatch.dispatch_get_main_queue();
-    dispatch_async_f(@ptrCast(main_queue), ctx, &restartSurfaceCallback);
-}
-
-/// Callback fired by dispatch_async_f after a runloop turn. Recovers
-/// the active session from global state, re-binds a ghostty surface
-/// to its surface_host NSView, and refreshes tab strip + menubar.
-fn restartSurfaceCallback(ctx_opaque: ?*anyopaque) callconv(.c) void {
-    const ctx: *RestartCtx = @ptrCast(@alignCast(ctx_opaque orelse return));
-    const allocator = app.g.allocator orelse return;
-    defer allocator.destroy(ctx);
-
-    const ga = app.g.ghostty.app orelse return;
-    const sm = app.g.session_manager orelse return;
-    const active = sm.active();
-
-    const host_raw = active.surface_host orelse return;
-    const host = objc.Object.fromId(host_raw);
-
-    const surf = bindGhosttySurface(allocator, active, ga, host, ctx.cmd, ctx.cwd) orelse {
-        std.debug.print("error: restart surface spawn failed for profile '{s}'\n", .{active.profile.name});
-        return;
-    };
-
-    active.surface = @ptrCast(surf);
-    active.spawned = true;
-    active.exited = false;
-    app.g.ghostty.surface = active.surface;
-    app.g.layout.surface_host_id = if (active.surface_host) |h| @ptrCast(@alignCast(h)) else null;
-
-    // Re-anchor keyboard focus on the new surface's view. Without
-    // this, AppKit may have lost the responder chain during the
-    // surface_free → newSurface gap.
+    if (!ensureActiveSession()) return false;
+    const current = sm.active();
+    if (current.surface_host) |host| objc.Object.fromId(host).msgSend(void, "setHidden:", .{@as(c_int, 0)});
+    const visible = if (app.g.window.panel) |p| p.visible else false;
+    const focused = if (app.g.window.panel) |p| visible and p.ns_panel.msgSend(bool, "isKeyWindow", .{}) else false;
+    runtime.surfaceSetFocus(@ptrCast(current.surface.?), focused);
+    runtime.surfaceSetOcclusion(@ptrCast(current.surface.?), visible);
+    applyProfileWindowSize(current.profile.name);
+    @import("../terminal/view.zig").syncResize();
     if (app.g.term.view_id) |vid| {
-        const term = objc.Object.fromId(vid);
-        const window = term.msgSend(objc.Object, "window", .{});
-        if (window.value != null) {
-            _ = window.msgSend(c_int, "makeFirstResponder:", .{term});
-        }
+        if (app.g.window.panel) |p| _ = p.ns_panel.msgSend(c_int, "makeFirstResponder:", .{objc.Object.fromId(vid)});
     }
-
-    // Tab strip + menubar refresh.
-    tab_strip.refresh();
-    if (app.g.agent.menubar) |mb| {
-        if (app.g.agent.state) |st| {
-            const snap = st.snapshot();
-            mb.updateState(@enumFromInt(@intFromEnum(snap.state)), snap.message);
-        }
-    }
+    refresh();
+    return true;
 }
 
-/// Bind a persistent ghostty surface to `surface_host`. Returns null on
-/// failure (caller logs + bails — host can't run without a surface).
-/// Provider override flows through as argv[0]; a shell command (`zsh`,
-/// `bash`, …) maps to null so ghostty applies its own `-i / -l` logic.
-/// `cwd` overrides the spawn working directory; null = ghostty default.
-///
-/// `sess.spawn_arena` owns the dupeZ'd cmd + cwd buffers handed to
-/// ghostty. Lazily created on first bind; reset on every re-bind so
-/// restart traffic doesn't leak prior spawn args across the program
-/// lifetime. Bounded at "active sessions × current spawn args".
-pub fn bindGhosttySurface(
-    allocator: std.mem.Allocator,
-    sess: *Session,
-    ga: *ghostty_runtime.App,
-    surface_host: objc.Object,
-    cmd: []const u8,
-    cwd: ?[]const u8,
-) ?ghostty_runtime.c.ghostty_surface_t {
-    const window_obj = surface_host.msgSend(objc.Object, "window", .{});
-    const surface_scale: f64 = if (window_obj.value != null)
-        window_obj.msgSend(f64, "backingScaleFactor", .{})
-    else
-        1.0;
-
-    // Lazily create + reset the per-session spawn arena. Arena is the
-    // right shape here: the buffers live exactly as long as the surface
-    // binding does, and every re-bind frees the previous batch wholesale.
-    const arena_ptr = sess.spawn_arena orelse blk: {
-        const a = allocator.create(std.heap.ArenaAllocator) catch return null;
-        a.* = std.heap.ArenaAllocator.init(allocator);
-        sess.spawn_arena = a;
-        break :blk a;
-    };
-    _ = arena_ptr.reset(.retain_capacity);
-    const spawn_alloc = arena_ptr.allocator();
-
-    const surface_cmd: ?[*:0]const u8 = if (isShell(cmd)) null else blk: {
-        const dup = spawn_alloc.dupeZ(u8, cmd) catch break :blk null;
-        break :blk dup.ptr;
-    };
-    const surface_cwd: ?[*:0]const u8 = if (cwd) |w| blk: {
-        const dup = spawn_alloc.dupeZ(u8, w) catch break :blk null;
-        break :blk dup.ptr;
-    } else null;
-
-    const surf = ga.newSurface(@ptrCast(surface_host.value), surface_scale, surface_cmd, surface_cwd) orelse return null;
-
-    surface_host.msgSend(void, "setHidden:", .{@as(c_int, 0)});
-    const host_bounds = surface_host.msgSend(NSRect, "bounds", .{});
-    const px_w: u32 = @intFromFloat(host_bounds.size.width * surface_scale);
-    const px_h: u32 = @intFromFloat(host_bounds.size.height * surface_scale);
-    ghostty_runtime.surfaceSetContentScale(surf, surface_scale);
-    ghostty_runtime.surfaceSetSize(surf, px_w, px_h);
-    ghostty_runtime.surfaceSetFocus(surf, true);
-    std.debug.print("ghostty: surface bound + foregrounded ({d}x{d}px @ {d:.1}x)\n", .{ px_w, px_h, surface_scale });
-    return surf;
+pub fn closeActiveSession() void {
+    const sm = app.g.session_manager orelse return;
+    destroySession(sm.active());
+    if (app.g.window.panel) |p| p.hide();
+    refresh();
 }
 
-/// Look up the persisted size for `profile_name` in state.json and
-/// resize the panel to match. Config-pinned dims short-circuit — when
-/// the user wrote `window-width = N` they want the same N across all
-/// profiles. State.json holds *implicit* sizes from the user dragging
-/// the edge; the per-profile override only matters when the user
-/// hasn't pinned a global size.
-fn applyProfileWindowSize(profile_name: []const u8) void {
+pub fn restartActiveSession(_: ?[]const u8) void {
+    const sm = app.g.session_manager orelse return;
+    const allocator = app.g.allocator orelse return;
+    const context = allocator.create(Ticket) catch return;
+    const session = sm.active();
+    destroySession(session);
+    context.* = .{ .session_id = session.id, .generation = session.surface_generation };
+    dispatch_async_f(@ptrCast(c_dispatch.dispatch_get_main_queue()), context, &restartCallback);
+}
+
+fn restartCallback(raw: ?*anyopaque) callconv(.c) void {
+    const ticket: *Ticket = @ptrCast(@alignCast(raw orelse return));
+    const allocator = app.g.allocator orelse return;
+    defer allocator.destroy(ticket);
+    const session = findSession(ticket.session_id) orelse return;
+    if (!ticket.matches(session) or session.surface != null) return;
+    const ga = app.g.ghostty.app orelse return;
+    const host = objc.Object.fromId(session.surface_host orelse return);
+    _ = bindGhosttySurface(allocator, ga, host, session) orelse return;
+    const sm = app.g.session_manager orelse return;
+    if (sm.active().id == session.id) _ = activateSession(sm.active_idx);
+    refresh();
+}
+
+/// Close callbacks are deferred to avoid freeing a surface inside its callback.
+pub fn closeRequested(ticket: Ticket) void {
+    const session = findSession(ticket.session_id) orelse return;
+    if (!ticket.matches(session)) return;
+    const sm = app.g.session_manager orelse return;
+    const is_active = sm.active().id == session.id;
+    destroySession(session);
+    if (is_active) {
+        if (app.g.window.panel) |p| p.hide();
+    }
+    refresh();
+}
+
+fn applyProfileWindowSize(name: []const u8) void {
     const cfg = app.g.config orelse return;
     if (cfg.window.width != null and cfg.window.height != null) return;
     const allocator = app.g.allocator orelse return;
     const panel = app.g.window.panel orelse return;
-
     const persist = @import("../state/persist.zig");
-    var maybe_state = persist.load(allocator);
-    defer if (maybe_state) |*st| st.deinit(allocator);
-    const st = maybe_state orelse return;
-    const dims = st.profileSize(profile_name) orelse return;
-
-    panel.setSize(@as(f64, @floatFromInt(dims.w)), @as(f64, @floatFromInt(dims.h)));
+    var state = persist.load(allocator) orelse return;
+    defer state.deinit(allocator);
+    const dims = state.profileSize(name) orelse return;
+    panel.setSize(@floatFromInt(cfg.window.width orelse dims.w), @floatFromInt(cfg.window.height orelse dims.h));
 }
 
-fn isShell(cmd: []const u8) bool {
-    const base = std.fs.path.basename(cmd);
-    const shells = [_][]const u8{ "bash", "zsh", "fish", "sh", "dash", "tcsh", "csh", "ksh" };
-    for (shells) |s| if (std.mem.eql(u8, base, s)) return true;
-    return false;
+test "new surfaces inherit only active visible key state, never Ghostty defaults" {
+    for ([_]bool{ false, true }) |active| {
+        for ([_]bool{ false, true }) |visible| {
+            for ([_]bool{ false, true }) |key| {
+                const state = initialSurfaceState(active, visible, key);
+                try std.testing.expectEqual(active and visible, state.visible);
+                try std.testing.expectEqual(active and visible and key, state.focused);
+            }
+        }
+    }
+}
+
+test "deferred tickets preserve source identity and reject stale generations" {
+    var session: Session = .{ .id = 7, .profile = .{ .name = "shell", .command = null } };
+    session.surface_generation = 3;
+    const ticket: Ticket = .{ .session_id = 7, .generation = 3 };
+    try std.testing.expect(ticket.matches(&session));
+    var other = session;
+    other.id = 8;
+    try std.testing.expect(!ticket.matches(&other));
+    session.surface_generation += 1;
+    try std.testing.expect(!ticket.matches(&session));
 }

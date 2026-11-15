@@ -1,9 +1,8 @@
 const std = @import("std");
 const objc = @import("objc");
 
-const c_dispatch = @cImport({
-    @cInclude("dispatch/dispatch.h");
-});
+const c_dispatch = @import("darwin-c");
+const platform = @import("../io/platform.zig");
 
 // libdispatch's typed wrappers stumble over the transparent-union dispatch
 // types when called from zig (same dance io/dispatch.zig already plays for
@@ -17,29 +16,17 @@ extern "c" fn dispatch_async_f(
     work: *const fn (?*anyopaque) callconv(.c) void,
 ) void;
 
-/// State a notification carries. Mirrors `agent.state.Agent` minus
-/// `idle`. Used as the rate-limit bucket key alongside client label
-/// so different states from the same client get their own first
-/// banner immediately (an `attention` doesn't suppress a follow-up
-/// `error` even within the rate window).
-pub const Kind = enum { attention, working, done, @"error" };
-
 const RateEntry = struct {
-    /// Hash of `client_label` (0 for anonymous / null) + Kind tag.
-    /// Combined into one u64 so the lookup is a flat scan over a tiny
-    /// fixed array — no allocator, no eviction policy beyond LRU on
-    /// the ring.
-    key: u64 = 0,
-    /// Wall-clock ms of last banner delivery for this bucket.
+    occupied: bool = false,
+    source_id: u64 = 0,
     last_ms: i64 = 0,
 };
 
-/// Per-(client, kind) rate-limit ring. Sized for the realistic upper
-/// bound (a handful of agents × four kinds) — overflow falls through
-/// to the LRU slot with no warning, which just means the oldest
-/// bucket's rate-limit memory is wiped. Cheaper than a hash table for
-/// the expected ≤16 active entries.
+/// Bounded per-source history. New sources FIFO-evict once full; an
+/// evicted source may deliver again before its previous window expires.
 const rate_buckets: usize = 16;
+
+var audio_workers: platform.Workers = .{};
 
 /// macOS notification sender via NSUserNotification (deprecated in 10.14
 /// but functional through current macOS; UNUserNotificationCenter is the
@@ -49,20 +36,15 @@ const rate_buckets: usize = 16;
 /// behavior is identical.
 pub const Notifier = struct {
     enabled: bool = true,
-    /// Minimum interval between banners for the same (client, kind)
-    /// tuple. Set from `notifications.rate_limit_ms`.
+    /// Minimum interval between banners from the same terminal session.
     rate_limit_ms: u64 = 30_000,
-    rate_mutex: std.Thread.Mutex = .{},
-    rate_ring: [rate_buckets]RateEntry = [_]RateEntry{.{}} ** rate_buckets,
-    /// Next slot to overwrite on miss-after-full. Wraps mod
-    /// rate_buckets — pure FIFO eviction; good enough for ≤16
-    /// concurrent clients.
+    rate_mutex: std.Io.Mutex = .init,
+    rate_ring: [rate_buckets]RateEntry = @splat(.{}),
+    /// Next FIFO slot to overwrite when all buckets are occupied.
     rate_next_slot: usize = 0,
 
-    /// Play a system sound. Always runs via `afplay` in a detached thread
-    /// — NSSound's msgSend chain is documented as main-thread-only and
-    /// crashes when called from the MCP HTTP thread. afplay has no such
-    /// constraint and stays out of AppKit entirely.
+    /// Play a system sound through an owned background task. NSSound's
+    /// AppKit calls must stay on main; afplay avoids AppKit entirely.
     /// `name` semantics:
     ///   - "" or null → no-op
     ///   - "default" → /System/Library/Sounds/Funk.aiff
@@ -101,133 +83,107 @@ pub const Notifier = struct {
             break :blk std.fmt.allocPrint(allocator, "/System/Library/Sounds/{s}.aiff", .{stem}) catch return;
         };
 
-        // execAfplay owns `path` and frees it after the subprocess exits.
-        if (std.Thread.spawn(.{}, execAfplay, .{path})) |t| {
-            t.detach();
-        } else |_| {
-            allocator.free(path);
-        }
+        // execAfplay owns the path after a successful spawn.
+        audio_workers.spawn(execAfplay, .{path}) catch allocator.free(path);
     }
 
-    /// Backwards-compatible send: no rate limit, no kind/client
-    /// bucketing. Internal hosts (config-reload warnings, etc.) use
-    /// this path. MCP tool handlers should call `sendKind` so the
-    /// rate-limit ring engages.
-    pub fn send(self: *const Notifier, title: []const u8, body: []const u8) void {
+    /// Main calls this after native callback producers stop, before the
+    /// process IO backend goes away. Long sounds must not delay shutdown.
+    pub fn shutdownSounds() void {
+        audio_workers.finish(.cancel);
+    }
+
+    /// Generic terminal notification. Callers own visibility policy; this
+    /// transport only gates enabled/rate, copies text, and queues AppKit.
+    /// source_id is a stable session ID (all u64 values, including 0, work).
+    pub fn send(self: *Notifier, source_id: u64, title: []const u8, body: []const u8) void {
         if (!self.enabled) return;
+        if (!self.checkAndBumpRate(source_id, platform.milliTimestamp())) return;
         deliver(title, body);
     }
 
-    /// Rate-limited variant for agent-driven notifications. Returns
-    /// true when a banner was delivered; false when the rate window
-    /// for this (client, kind) tuple is still cooling down. The
-    /// menubar + log surfaces always update regardless — this gate is
-    /// purely about the noisy OS-level banner.
-    pub fn sendKind(self: *Notifier, kind: Kind, client_label: ?[]const u8, title: []const u8, body: []const u8) bool {
-        if (!self.enabled) return false;
-        if (!self.checkAndBumpRate(kind, client_label)) return false;
-        deliver(title, body);
-        return true;
-    }
+    /// Explicit timestamps keep rate-policy tests independent of clocks
+    /// and sleeps. A backwards wall-clock jump starts a fresh window.
+    fn checkAndBumpRate(self: *Notifier, source_id: u64, now: i64) bool {
+        const io = platform.io();
+        self.rate_mutex.lockUncancelable(io);
+        defer self.rate_mutex.unlock(io);
 
-    fn checkAndBumpRate(self: *Notifier, kind: Kind, client_label: ?[]const u8) bool {
-        const now = std.time.milliTimestamp();
-        const key = makeRateKey(kind, client_label);
-
-        self.rate_mutex.lock();
-        defer self.rate_mutex.unlock();
-
-        // Hit: existing bucket — bump only when the window expired.
         for (&self.rate_ring) |*entry| {
-            if (entry.key == key) {
-                if (now - entry.last_ms < @as(i64, @intCast(self.rate_limit_ms))) return false;
+            if (entry.occupied and entry.source_id == source_id) {
+                const elapsed = @as(i128, now) - @as(i128, entry.last_ms);
+                if (elapsed >= 0 and elapsed < @as(i128, self.rate_limit_ms)) return false;
                 entry.last_ms = now;
                 return true;
             }
         }
-        // Miss: claim a free slot, else FIFO-evict.
         for (&self.rate_ring) |*entry| {
-            if (entry.key == 0) {
-                entry.key = key;
-                entry.last_ms = now;
+            if (!entry.occupied) {
+                entry.* = .{ .occupied = true, .source_id = source_id, .last_ms = now };
                 return true;
             }
         }
         const slot = self.rate_next_slot;
         self.rate_next_slot = (slot + 1) % rate_buckets;
-        self.rate_ring[slot] = .{ .key = key, .last_ms = now };
+        self.rate_ring[slot] = .{ .occupied = true, .source_id = source_id, .last_ms = now };
         return true;
     }
 };
 
-fn makeRateKey(kind: Kind, client_label: ?[]const u8) u64 {
-    var h: u64 = std.hash.Wyhash.hash(0xD711, client_label orelse "");
-    h ^= @as(u64, @intFromEnum(kind)) << 56;
-    // Reserve 0 as the "empty slot" sentinel — flip away from it if
-    // we land there exactly.
-    if (h == 0) h = 1;
-    return h;
-}
-
 fn deliver(title: []const u8, body: []const u8) void {
     const allocator = std.heap.page_allocator;
     const payload = allocator.create(Payload) catch return;
-    payload.title = nulDupe(allocator, title) catch {
-        allocator.destroy(payload);
-        return;
-    };
-    payload.body = nulDupe(allocator, body) catch {
-        allocator.free(payload.title);
-        allocator.destroy(payload);
-        return;
-    };
+    // Never retain caller slices across dispatch. Copy bounded, valid
+    // UTF-8 prefixes now, including terminators for NSString below.
+    copyUtf8Z(&payload.title, title);
+    copyUtf8Z(&payload.body, body);
 
-    // Hot path called from MCP HTTP worker threads; AppKit /
-    // NSUserNotificationCenter must run on main. dispatch_async_f
-    // posts work to the main queue, which the AppKit run loop
-    // drains. Payload is freed inside deliverOnMain.
+    // NSUserNotificationCenter must run on main, even when the caller
+    // is a background terminal callback. deliverOnMain owns the payload.
     const main_queue = c_dispatch.dispatch_get_main_queue();
     dispatch_async_f(@ptrCast(main_queue), payload, &deliverOnMain);
 }
 
 const Payload = struct {
-    /// NUL-terminated UTF-8 — stringWithUTF8String: requires that.
-    title: []u8,
-    body: []u8,
+    /// Content caps in bytes, plus one NUL. No unbounded text allocation.
+    title: [257]u8,
+    body: [4097]u8,
 };
 
-/// Allocate `bytes.len + 1`, copy in, write a trailing NUL. Returns a slice
-/// of length `bytes.len + 1` (the NUL is included so free() sees the right
-/// size; AppKit only reads up to the first NUL).
-fn nulDupe(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    const buf = try allocator.alloc(u8, bytes.len + 1);
-    @memcpy(buf[0..bytes.len], bytes);
-    buf[bytes.len] = 0;
-    return buf;
+/// Stop before a partial codepoint, malformed UTF-8, or embedded NUL.
+fn copyUtf8Z(dest: []u8, bytes: []const u8) void {
+    std.debug.assert(dest.len > 0);
+    const limit = @min(bytes.len, dest.len - 1);
+    var end: usize = 0;
+    while (end < limit and bytes[end] != 0) {
+        const len = std.unicode.utf8ByteSequenceLength(bytes[end]) catch break;
+        if (len > limit - end) break;
+        _ = std.unicode.utf8Decode(bytes[end..][0..len]) catch break;
+        end += len;
+    }
+    @memcpy(dest[0..end], bytes[0..end]);
+    dest[end] = 0;
 }
 
 fn deliverOnMain(ctx: ?*anyopaque) callconv(.c) void {
     const opaque_ptr = ctx orelse return;
     const payload: *Payload = @ptrCast(@alignCast(opaque_ptr));
     const allocator = std.heap.page_allocator;
-    defer {
-        allocator.free(payload.title);
-        allocator.free(payload.body);
-        allocator.destroy(payload);
-    }
+    defer allocator.destroy(payload);
 
     const NSString = objc.getClass("NSString") orelse return;
     const NSUserNotification = objc.getClass("NSUserNotification") orelse return;
     const NSUserNotificationCenter = objc.getClass("NSUserNotificationCenter") orelse return;
 
-    const ns_title = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, @ptrCast(payload.title.ptr))});
+    const ns_title = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, @ptrCast(&payload.title))});
     if (ns_title.value == null) return;
-    const ns_body = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, @ptrCast(payload.body.ptr))});
+    const ns_body = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, @ptrCast(&payload.body))});
     if (ns_body.value == null) return;
 
     const note_alloc = NSUserNotification.msgSend(objc.Object, "alloc", .{});
     const note = note_alloc.msgSend(objc.Object, "init", .{});
     if (note.value == null) return;
+    defer note.msgSend(void, "release", .{});
 
     note.msgSend(void, "setTitle:", .{ns_title});
     note.msgSend(void, "setInformativeText:", .{ns_body});
@@ -253,7 +209,7 @@ fn isAllowedSoundPath(path: []const u8) bool {
     if (std.mem.indexOf(u8, path, "/../") != null) return false;
     if (std.mem.endsWith(u8, path, "/..")) return false;
     if (std.mem.startsWith(u8, path, "/System/Library/Sounds/")) return true;
-    const home = std.posix.getenv("HOME") orelse return false;
+    const home = platform.getenv("HOME") orelse return false;
     var buf: [512]u8 = undefined;
     const user_prefix = std.fmt.bufPrint(&buf, "{s}/Library/Sounds/", .{home}) catch return false;
     return std.mem.startsWith(u8, path, user_prefix);
@@ -261,32 +217,110 @@ fn isAllowedSoundPath(path: []const u8) bool {
 
 fn execAfplay(path: []const u8) void {
     defer std.heap.page_allocator.free(path);
-    var child = std.process.Child.init(
-        &.{ "/usr/bin/afplay", path },
-        std.heap.page_allocator,
-    );
-    child.spawn() catch return;
-    _ = child.wait() catch {};
+    const io = platform.io();
+    var child = std.process.spawn(io, .{
+        .argv = &.{ "/usr/bin/afplay", path },
+    }) catch return;
+    waitOwnedChild(&child, io);
 }
 
-test "Notifier: rate limit blocks repeat within window" {
-    var n = Notifier{ .enabled = true, .rate_limit_ms = 60_000 };
-    // First call for (client=A, kind=attention) passes the gate.
-    try std.testing.expect(n.checkAndBumpRate(.attention, "A"));
-    // Repeat within window blocked.
-    try std.testing.expect(!n.checkAndBumpRate(.attention, "A"));
-    // Different kind for same client gets its own bucket.
-    try std.testing.expect(n.checkAndBumpRate(.@"error", "A"));
-    // Different client also passes.
-    try std.testing.expect(n.checkAndBumpRate(.attention, "B"));
-    // Null client (= internal hosts) has its own bucket distinct
-    // from any labeled client.
-    try std.testing.expect(n.checkAndBumpRate(.attention, null));
+fn waitOwnedChild(child: anytype, io: std.Io) void {
+    const id = child.id;
+    defer child.kill(io);
+    _ = child.wait(io) catch |err| {
+        // Zig 0.17.1's POSIX wait clears id even on Canceled, without
+        // reaping or killing the process. Only that path retains ownership:
+        // cancellation happens before a successful wait syscall. Never
+        // restore an id after success/other errors, where it could be reused.
+        if (err == error.Canceled) child.id = id;
+        return;
+    };
 }
 
-test "Notifier: rate limit clears after window" {
-    var n = Notifier{ .enabled = true, .rate_limit_ms = 1 };
-    try std.testing.expect(n.checkAndBumpRate(.attention, "X"));
-    std.Thread.sleep(5 * std.time.ns_per_ms);
-    try std.testing.expect(n.checkAndBumpRate(.attention, "X"));
+test "Notifier: canceled POSIX wait preserves child ownership for cleanup" {
+    const Child = struct {
+        id: ?i32 = 42,
+        killed_id: ?i32 = null,
+        outcome: enum { success, canceled, failed },
+
+        fn wait(self: *@This(), _: std.Io) error{ Canceled, Unexpected }!void {
+            self.id = null; // Zig 0.17.1 consumes the handle on every path.
+            switch (self.outcome) {
+                .success => {},
+                .canceled => return error.Canceled,
+                .failed => return error.Unexpected,
+            }
+        }
+
+        fn kill(self: *@This(), _: std.Io) void {
+            self.killed_id = self.id;
+            self.id = null;
+        }
+    };
+    var canceled: Child = .{ .outcome = .canceled };
+    waitOwnedChild(&canceled, std.testing.io);
+    try std.testing.expectEqual(@as(?i32, 42), canceled.killed_id);
+    try std.testing.expect(canceled.id == null);
+    var completed: Child = .{ .outcome = .success };
+    waitOwnedChild(&completed, std.testing.io);
+    try std.testing.expect(completed.killed_id == null);
+    var failed: Child = .{ .outcome = .failed };
+    waitOwnedChild(&failed, std.testing.io);
+    try std.testing.expect(failed.killed_id == null);
+}
+
+test "Notifier: per-source window, exact boundary, and zero source ID" {
+    var n = Notifier{ .rate_limit_ms = 100 };
+    try std.testing.expect(n.checkAndBumpRate(0, 0));
+    try std.testing.expect(!n.checkAndBumpRate(0, 0));
+    try std.testing.expect(!n.checkAndBumpRate(0, 99));
+    try std.testing.expect(n.checkAndBumpRate(1, 99));
+    // Blocked attempts do not extend the window.
+    try std.testing.expect(n.checkAndBumpRate(0, 100));
+    try std.testing.expect(!n.checkAndBumpRate(1, 100));
+}
+
+test "Notifier: zero interval and backwards clock" {
+    var n = Notifier{ .rate_limit_ms = 0 };
+    try std.testing.expect(n.checkAndBumpRate(42, 100));
+    try std.testing.expect(n.checkAndBumpRate(42, 100));
+    n.rate_limit_ms = 100;
+    try std.testing.expect(n.checkAndBumpRate(42, 50));
+    try std.testing.expect(!n.checkAndBumpRate(42, 51));
+    try std.testing.expect(n.checkAndBumpRate(42, 150));
+}
+
+test "Notifier: bounded history FIFO-evicts without colliding source IDs" {
+    var n = Notifier{ .rate_limit_ms = 1000 };
+    for (0..rate_buckets) |id| try std.testing.expect(n.checkAndBumpRate(id, 0));
+    try std.testing.expect(!n.checkAndBumpRate(0, 1));
+    try std.testing.expect(n.checkAndBumpRate(std.math.maxInt(u64), 1));
+    try std.testing.expect(!n.checkAndBumpRate(1, 1));
+    try std.testing.expect(n.checkAndBumpRate(0, 1));
+    try std.testing.expect(!n.checkAndBumpRate(std.math.maxInt(u64), 2));
+}
+
+test "Notifier: full-width timestamp and interval arithmetic" {
+    var n = Notifier{ .rate_limit_ms = std.math.maxInt(u64) };
+    try std.testing.expect(n.checkAndBumpRate(1, std.math.minInt(i64)));
+    try std.testing.expect(!n.checkAndBumpRate(1, std.math.maxInt(i64) - 1));
+    try std.testing.expect(n.checkAndBumpRate(1, std.math.maxInt(i64)));
+}
+
+test "notification text: bounded UTF-8, malformed input, and owned copy" {
+    var buf: [5]u8 = undefined;
+    copyUtf8Z(&buf, "a€z");
+    try std.testing.expectEqualStrings("a€", std.mem.sliceTo(&buf, 0));
+    copyUtf8Z(buf[0..4], "a€");
+    try std.testing.expectEqualStrings("a", std.mem.sliceTo(&buf, 0));
+    copyUtf8Z(&buf, "ok\xffbad");
+    try std.testing.expectEqualStrings("ok", std.mem.sliceTo(&buf, 0));
+    copyUtf8Z(&buf, "x\x00y");
+    try std.testing.expectEqualStrings("x", std.mem.sliceTo(&buf, 0));
+    copyUtf8Z(&buf, "");
+    try std.testing.expectEqualStrings("", std.mem.sliceTo(&buf, 0));
+    var source = [_]u8{ 'o', 'k' };
+    copyUtf8Z(&buf, &source);
+    source[0] = 'x';
+    try std.testing.expectEqualStrings("ok", std.mem.sliceTo(&buf, 0));
 }

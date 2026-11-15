@@ -43,6 +43,16 @@ pub const Theme = struct {
     owned_font_family: bool = false,
     allocator: ?std.mem.Allocator = null,
 
+    /// Duplicate before changing either the pointer or its ownership. On OOM,
+    /// borrowed defaults and any previously owned family remain valid.
+    fn setFontFamily(self: *Theme, allocator: std.mem.Allocator, family: []const u8) !void {
+        const owned = try allocator.dupe(u8, family);
+        if (self.owned_font_family) self.allocator.?.free(self.font_family);
+        self.font_family = owned;
+        self.owned_font_family = true;
+        self.allocator = allocator;
+    }
+
     pub fn deinit(self: *Theme) void {
         if (self.owned_font_family) {
             if (self.allocator) |a| a.free(self.font_family);
@@ -103,12 +113,12 @@ pub fn pickThemeName(spec: []const u8, appearance: Appearance) []const u8 {
 /// via the Overrides struct).
 pub fn resolve(allocator: std.mem.Allocator, overrides: Overrides) !Theme {
     var t = Theme{ .allocator = allocator };
+    errdefer t.deinit();
     t.appearance = detectSystemAppearance();
 
     // ghostty owns config resolution: it already merged the active
     // theme + finalized during App.init. We read the resolved Config
-    // via ghostty_config_get so the surface and the log_pane /
-    // menubar palettes can never diverge.
+    // via ghostty_config_get so the surface and host chrome share a palette.
     if (overrides.inherit_ghostty_config) {
         if (overrides.ghostty_cfg) |cfg_opaque| {
             const cfg: ghostty_runtime.c.ghostty_config_t = @ptrCast(cfg_opaque);
@@ -118,9 +128,7 @@ pub fn resolve(allocator: std.mem.Allocator, overrides: Overrides) !Theme {
 
     // Djinn-config overrides take precedence over ghostty.
     if (overrides.font_family) |s| {
-        if (t.owned_font_family) allocator.free(t.font_family);
-        t.font_family = try allocator.dupe(u8, s);
-        t.owned_font_family = true;
+        try t.setFontFamily(allocator, s);
     }
     if (overrides.font_size) |v| t.font_size = v;
     if (overrides.padding_x) |v| t.padding_x = v;
@@ -158,9 +166,7 @@ pub const Overrides = struct {
 fn applyFromGhostty(t: *Theme, cfg: ghostty_runtime.c.ghostty_config_t, allocator: std.mem.Allocator) void {
     if (ghostty_runtime.configString(cfg, "font-family")) |s| {
         if (s.len > 0) {
-            if (t.owned_font_family) allocator.free(t.font_family);
-            t.font_family = allocator.dupe(u8, s) catch t.font_family;
-            t.owned_font_family = true;
+            t.setFontFamily(allocator, s) catch {};
         }
     }
     // Type-strict reads: ghostty stores `font-size` as f32,
@@ -188,6 +194,32 @@ fn applyFromGhostty(t: *Theme, cfg: ghostty_runtime.c.ghostty_config_t, allocato
             t.palette[i] = .{ .r = c.r, .g = c.g, .b = c.b };
         }
     }
+}
+
+test "Theme: font allocation failure preserves borrowed default" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var theme = Theme{ .allocator = failing.allocator() };
+    defer theme.deinit();
+    const borrowed = theme.font_family;
+    try std.testing.expectError(error.OutOfMemory, theme.setFontFamily(failing.allocator(), "Monaco"));
+    try std.testing.expectEqualStrings("Menlo", theme.font_family);
+    try std.testing.expectEqual(borrowed.ptr, theme.font_family.ptr);
+    try std.testing.expect(!theme.owned_font_family);
+}
+
+test "Theme: font allocation failure preserves previously owned family" {
+    var theme = Theme{};
+    defer theme.deinit();
+    try theme.setFontFamily(std.testing.allocator, "Monaco");
+    const owned = theme.font_family;
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, theme.setFontFamily(failing.allocator(), "Other"));
+    try std.testing.expectEqualStrings("Monaco", theme.font_family);
+    try std.testing.expectEqual(owned.ptr, theme.font_family.ptr);
+    try std.testing.expect(theme.owned_font_family);
+    // Replacement can even borrow the old family; it is copied before free.
+    try theme.setFontFamily(std.testing.allocator, theme.font_family);
+    try std.testing.expectEqualStrings("Monaco", theme.font_family);
 }
 
 test "pickThemeName: light/dark variants" {

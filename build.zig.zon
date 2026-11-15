@@ -28,7 +28,7 @@
 
     // Tracks the earliest Zig version that the package considers to be a
     // supported use case.
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.17.1",
 
     // This field is optional.
     // Each dependency must either provide a `url` and `hash`, or a `path`.
@@ -37,20 +37,25 @@
     // internet connectivity.
     .dependencies = .{
         .zig_objc = .{
-            .url = "git+https://github.com/mitchellh/zig-objc#27d0e03242e7ee6842bf8a86d2e0bb1f586a9847",
-            .hash = "zig_objc-0.0.0-Ir_Sp7oUAQC3JpeR9EGUFGcHRSx_33IehitnjBCy-CwD",
+            .url = "https://deps.files.ghostty.org/zig_objc-3352c12a868f8787ab71bf2ca6eab9fcfb635c52.tar.gz",
+            .hash = "zig_objc-0.0.0-Ir_Sp_4tAQDXtPi51nW_jD9LOEzBvU9lofwO9Pzi6IB4",
         },
         .ghostty = .{
-            .url = "git+https://github.com/ghostty-org/ghostty#fdb6e3d2c8543e2e756b7e07f44372efbc0fba4b",
-            .hash = "ghostty-1.3.2-dev-5UdBCx38BQW4V7wU7EIInkclON7q7a8bElNtNMPukli_",
+            .url = "git+https://github.com/ghostty-org/ghostty#83fb95624b0439ee660c2679b43b38c8b63769cd",
+            .hash = "ghostty-1.4.0-5UdBC-qohwWqLS0BImOz05t4hVyTwbaKslyTPvKYvAtE",
         },
     },
     .paths = .{
         "build.zig",
         "build.zig.zon",
         "src",
-        // For example...
-        //"LICENSE",
-        //"README.md",
+        "scripts",
+        "patches",
+        "assets",
+        "config",
+        "contrib",
+        "README.md",
+        "LICENSE",
+        "NOTICES.md",
     },
 }

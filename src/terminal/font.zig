@@ -11,10 +11,7 @@
 
 const std = @import("std");
 
-pub const cg = @cImport({
-    @cInclude("CoreGraphics/CoreGraphics.h");
-    @cInclude("CoreText/CoreText.h");
-});
+pub const cg = @import("darwin-c");
 
 /// Successful-resolution log fires once per process. buildFont gets
 /// called from TerminalView.init + Cmd+/- font zoom + theme reload —

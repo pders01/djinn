@@ -1,14 +1,10 @@
 const std = @import("std");
 const objc = @import("objc");
-const AgentState = @import("agent/state.zig").AgentState;
-const Agent = @import("agent/state.zig").Agent;
 const Menubar = @import("notify/menubar.zig").Menubar;
-const LogView = @import("agent/log_view.zig").LogView;
 const Panel = @import("window/panel.zig").Panel;
 const Config = @import("config.zig").Config;
 const Notifier = @import("notify/darwin.zig").Notifier;
 const Hotkey = @import("hotkey/darwin.zig").Hotkey;
-const ToolTable = @import("mcp/tools.zig").ToolTable;
 
 /// Single app-level state container. Cocoa method callbacks can't capture
 /// Zig context, so the canonical pattern across the codebase was a sea of
@@ -23,8 +19,8 @@ pub const AppState = struct {
     // Terminal view + font/cell metrics ------------------------------
     term: Term = .{},
 
-    // Agent surface observers ----------------------------------------
-    agent: AgentSurface = .{},
+    // Native status item ---------------------------------------------
+    menubar: ?*Menubar = null,
 
     // Allocator + config pointer used by the theme reloader on
     // system appearance changes. The Config lives in main()'s stack
@@ -43,43 +39,35 @@ pub const AppState = struct {
     // Window / panel -------------------------------------------------
     window: Window = .{},
 
-    // Live-reload targets — set by main() so the FSEvent watcher can
-    // mutate runtime state without taking a closure (Cocoa callbacks
-    // don't capture). hotkey rebinds via setBinding; tool_table updates
-    // its attention_sound slice on notifications.attention_sound flip.
-    hotkey: ?*Hotkey = null,
-    tool_table: ?*ToolTable = null,
+    // Own the global registration so config reload can also recover a
+    // failed startup binding. Native handler userdata is separately stable.
+    hotkey: ?Hotkey = null,
+    hotkey_override: ?[]const u8 = null,
 
     // Find on page ----------------------------------------------------
     find: FindState = .{},
 
-    // Tier-5 surface migration --------------------------------------
+    // Native layout and Ghostty --------------------------------------
     layout: Layout = .{},
     ghostty: Ghostty = .{},
 
     // Sessions -------------------------------------------------------
     /// Multi-profile session manager. Holds one Session per declared
-    /// profile (or a single synthesized "default" for legacy configs).
+    /// profile (or a single default shell when none are configured).
     /// Switching tabs flips `active_idx` + setHidden on each session's
     /// surface_host. Action handlers in view.zig reach this through
     /// app.g + call back into main.zig for the spawn / focus glue.
     session_manager: ?*@import("session/manager.zig").SessionManager = null,
-    // Palette switcher (Cmd+Shift+P) ---------------------------------
-    palette: PaletteState = .{},
-    log_filter: LogFilterState = .{},
-    cheatsheet: CheatsheetState = .{},
-
 
     // ─── Sub-state types ───────────────────────────────────────────
     // Declared after fields per Zig's container layout rule. Each
-    // group is opt-in: callers reach `app.g.find.*`, `app.g.palette.*`,
-    // etc. instead of the flat field sea this struct used to be.
+    // group is opt-in: callers reach `app.g.find.*`, `app.g.theme.*`,
+    // etc. instead of a flat field sea.
 
     pub const Theme = struct {
         /// Active chrome style — derived from theme on startup + every
         /// reapplyTheme. Find overlay + future host UI surfaces read
-        /// this for colors / fonts so they reskin in lockstep with
-        /// the log pane on appearance flips.
+        /// this for colors / fonts so host chrome reskins together.
         chrome_style: ?@import("chrome.zig").Style = null,
         /// Cached effective appearance from the last reapplyTheme run.
         /// AppKit calls viewDidChangeEffectiveAppearance at moments
@@ -107,14 +95,6 @@ pub const AppState = struct {
         resize_handler: ?*const fn (u32, u32) void = null,
     };
 
-    pub const AgentSurface = struct {
-        state: ?*AgentState = null,
-        menubar: ?*Menubar = null,
-        log_view: ?*LogView = null,
-        last_state: Agent = .idle,
-        tick_count: u32 = 0,
-    };
-
     pub const Term = struct {
         /// NSView pointer for the terminal surface. Stored as raw id
         /// since callbacks reach for it via objc message dispatch.
@@ -136,26 +116,16 @@ pub const AppState = struct {
     };
 
     pub const Layout = struct {
-        /// Outer container NSView holding terminal / log / divider /
-        /// surface_host(s) / tab strip. Stashed for hot-reload's
-        /// runtime profile add path so `addSessionLive` can attach a
-        /// new surface_host without threading the container reference
-        /// through every caller. Set once in main() after
-        /// `buildContainer`.
+        /// Outer container NSView holding terminal, surface hosts, and
+        /// the optional static profile tab strip. Set by buildContainer.
         container_id: ?objc.c.id = null,
         /// Sibling NSView of `view_id` reserved for ghostty's surface.
         /// ghostty owns this view's CAMetalLayer once a surface is
         /// bound.
         surface_host_id: ?objc.c.id = null,
-        /// Thin vertical divider between terminal and log pane.
-        /// Stashed here so the log-toggle path can resize/hide it
-        /// without going through container.subviews[idx], which is
-        /// fragile (the index shifts whenever buildContainer's
-        /// subview order changes).
-        divider_view_id: ?objc.c.id = null,
         /// Optional NSView pointer for the multi-profile tab strip.
         /// Present only when `session_manager.sessions.len >= 2`;
-        /// null otherwise. Action handlers + applyLogLayout consult
+        /// null otherwise. Layout consults
         /// this to decide whether to reserve `tab_strip.tab_h` at
         /// the top.
         tab_strip_id: ?objc.c.id = null,
@@ -182,57 +152,6 @@ pub const AppState = struct {
         config: ?*anyopaque = null,
     };
 
-    pub const PaletteState = struct {
-        /// True while the palette overlay is up. Routes printable keys
-        /// from `keyDownImpl` into the palette's filter buffer instead of
-        /// the ghostty surface (same idiom as `find.mode`).
-        mode: bool = false,
-        /// Live filter buffer + length. Indexed against
-        /// `session_manager.sessions[*].profile.label()` to derive the
-        /// shown rows.
-        query_buf: [128]u8 = [_]u8{0} ** 128,
-        query_len: usize = 0,
-        /// Selected row in the *filtered* list. Up/Down move it; Return
-        /// activates the underlying session.
-        selected: usize = 0,
-        /// Overlay NSView. Stashed so close() can pull it from the view
-        /// tree without indexing into `container.subviews`.
-        view_id: ?objc.c.id = null,
-    };
-
-    pub const LogFilterState = struct {
-        /// True while the log filter chip has focus. Routes printable
-        /// keys from `keyDownImpl` into `query_buf` instead of the
-        /// ghostty surface. Pattern mirrors `find.mode` /
-        /// `palette.mode`.
-        mode: bool = false,
-        /// Live filter needle. Even when `mode = false` the buffer
-        /// can hold a non-empty needle — the log view stays filtered
-        /// after the user exits the chip; clearing requires opening
-        /// the chip again + Esc (or typing a different needle).
-        query_buf: [128]u8 = [_]u8{0} ** 128,
-        query_len: usize = 0,
-        /// Inline chip NSTextField. Hidden via frame-to-zero when
-        /// neither `mode` is true nor `query_len > 0` — once a filter
-        /// is active the chip stays visible as the "filter on"
-        /// indicator even after the user moves focus back to the
-        /// terminal.
-        field_id: ?objc.c.id = null,
-        /// `DjinnLevelPills` NSView — three click-toggle pills (i/w/e)
-        /// sitting to the left of the chip. mouseDown rewrites the
-        /// `level:` portion of `query_buf` so pill state + chip text
-        /// stay in sync (single source of truth = the needle string).
-        pill_view_id: ?objc.c.id = null,
-    };
-
-    pub const CheatsheetState = struct {
-        /// True while the keymap cheatsheet overlay is up. Routes
-        /// printable keys / Esc into `cheatsheet.handleKey` (which
-        /// dismisses on any input — the overlay is read-only).
-        mode: bool = false,
-        view_id: ?objc.c.id = null,
-    };
-
     pub const FindState = struct {
         /// True while Cmd+F is active. Routes keystrokes from keyDownImpl
         /// into the needle buffer instead of the ghostty surface. Borderless
@@ -240,7 +159,7 @@ pub const AppState = struct {
         /// working field editor — we own input anyway, so just intercept.
         mode: bool = false,
         /// Current needle. Empty = no active search.
-        query_buf: [128]u8 = [_]u8{0} ** 128,
+        query_buf: [128]u8 = @splat(0),
         query_len: usize = 0,
         /// Total match count + current selected index, both reported by
         /// ghostty via the search_total / search_selected actions.

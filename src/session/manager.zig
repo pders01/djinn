@@ -1,25 +1,16 @@
 const std = @import("std");
+const platform = @import("../io/platform.zig");
 const Config = @import("../config.zig").Config;
 
-/// Resolved profile — config defaults applied, ready to spawn. The
-/// session layer hands one of these to the Cocoa wiring (in main.zig)
-/// when a surface needs to be created. UI layers (keybind switcher
-/// today, tab strip / palette later) only see profile names + active
-/// index; they don't reach into the spawn payload.
+/// Resolved launch state, owned by SessionManager independently of Config.
 pub const Profile = struct {
     name: []const u8,
-    /// Effective command to spawn. Already resolved through the
-    /// `script` > `command` > `provider` shortcut chain, so the
-    /// caller hands this to ghostty without further interpretation.
-    command: []const u8,
-    /// Working directory for the spawned process. Null = inherit
-    /// caller's cwd (typically $HOME after djinn's startup chdir).
+    /// script > command > null. Null asks ghostty to launch the user's
+    /// ordinary default shell; it is not an empty or hardcoded command.
+    command: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
-    /// Display label for the menubar / log-pane indicator. Falls back
-    /// to `name` when unset.
     title: ?[]const u8 = null,
-    /// Per-profile bell overrides. null = inherit global `bell.*`.
-    /// handleRingBell consults these before the global fallback.
+    /// null = inherit the current global bell setting.
     bell_audible: ?bool = null,
     bell_visual: ?bool = null,
     bell_sound: ?[]const u8 = null,
@@ -29,85 +20,76 @@ pub const Profile = struct {
     }
 };
 
-/// One running (or pending) provider instance. The opaque handles let
-/// this module stay free of Cocoa + ghostty.h imports — the caller in
-/// main.zig casts them back when binding / hiding the surface.
+/// A configured terminal, pending until first activation. The caller owns
+/// all Cocoa/ghostty handles and their destruction, not this module.
 pub const Session = struct {
+    /// Stable, nonzero identity for this manager's lifetime. Never changes
+    /// when the active tab changes or a surface is restarted.
+    id: u64,
+    /// Caller increments before each surface creation/replacement and when
+    /// invalidating callbacks. Pair with id to reject stale surface events.
+    surface_generation: u64 = 0,
+    /// Sentinel buffers are owned by the caller's surface lifecycle. Keep
+    /// them alive through surface destruction; SessionManager never frees them.
+    command_z: ?[:0]u8 = null,
+    cwd_z: ?[:0]u8 = null,
+    terminal_title: [256]u8 = @splat(0),
+    terminal_title_len: usize = 0,
     profile: Profile,
-    /// `?*anyopaque` slot for the ghostty surface (`ghostty_surface_t`).
-    /// Null until the session is first activated (lazy spawn).
     surface: ?*anyopaque = null,
-    /// `?*anyopaque` slot for the surface_host NSView. Always non-null
-    /// after `init` — the host view is created eagerly so layout math
-    /// can size it before the surface binds.
     surface_host: ?*anyopaque = null,
-    /// True after the first `activate(idx)` call wired a surface to the
-    /// host. The caller checks this and only spawns once.
     spawned: bool = false,
-    /// True after the child process exits. The tab strip can use this
-    /// to show a restart hint; Cmd+R / Cmd+Shift+R restarts the session.
     exited: bool = false,
-    /// Per-session arena for spawn-time string dupes (cmd + cwd handed
-    /// to ghostty as `[*:0]`). Created lazily on first `bindGhosttySurface`
-    /// and `reset(.retain_capacity)`-ed on every re-bind so the prior
-    /// dupes free without growing forever across restarts. Destroyed by
-    /// `SessionManager.deinit` for the program-exit path and by
-    /// `removeSessionLive` for the live-removal path.
-    spawn_arena: ?*std.heap.ArenaAllocator = null,
+    // Host input requests belong to this incarnation, not to process-global
+    // Secure Input / NSCursor state. Only the active visible focused source wins.
+    surface_focused: bool = false,
+    surface_visible: bool = false,
+    requested_secure_input: bool = false,
+    requested_cursor_hidden: bool = false,
+    requested_cursor_shape: [:0]const u8 = "IBeamCursor",
+    mouse_over_link: bool = false,
+
+    /// Recheck retained explicit cwd at EVERY launch, including lazy starts and
+    /// restarts: Ghostty otherwise silently falls back when it disappears.
+    pub fn validateLaunch(self: *const Session) !void {
+        if (self.profile.cwd) |cwd| try validateCwd(cwd);
+    }
+
+    pub fn label(self: *const Session) []const u8 {
+        if (self.profile.title) |title| return title;
+        if (self.terminal_title_len != 0) return self.terminal_title[0..@min(self.terminal_title_len, self.terminal_title.len)];
+        return self.profile.name;
+    }
 };
 
 pub const SessionManager = struct {
     allocator: std.mem.Allocator,
-    /// Backing list. Iterate via `.items`; mutate via the public
-    /// `appendEntry` / `removeAt` methods so active_idx stays in sync.
-    sessions: std.ArrayList(Session) = .{},
-    /// Index into `sessions.items` for the currently visible surface.
-    /// Never out of bounds — `init` ensures at least one session exists.
+    /// Fixed membership after init. This module never reallocates the list
+    /// after returning it; surface lifecycle is managed by the caller.
+    sessions: std.ArrayList(Session) = .empty,
     active_idx: usize = 0,
-    /// Strings the manager allocated during resolve (e.g. tilde-
-    /// expanded script paths). Freed in `deinit` so callers don't
-    /// have to track each allocation separately.
-    owned_strings: std.ArrayList([]u8) = .{},
+    owned_strings: std.ArrayList([]u8) = .empty,
 
-    /// Build a SessionManager from the parsed config. When the config
-    /// declares no profiles, synthesize a single profile from the flat
-    /// `provider` / `provider-command` keys so legacy configs keep
-    /// working unchanged.
+    /// No configured profiles means one lazy, ordinary shell. Every retained
+    /// config string is copied so Config.deinit/reload cannot dangle it.
     pub fn init(allocator: std.mem.Allocator, cfg: *const Config) !SessionManager {
-        var sessions: std.ArrayList(Session) = .{};
-        errdefer sessions.deinit(allocator);
-
-        var owned: std.ArrayList([]u8) = .{};
-        errdefer {
-            for (owned.items) |s| allocator.free(s);
-            owned.deinit(allocator);
-        }
+        var mgr = SessionManager{ .allocator = allocator };
+        errdefer mgr.deinit();
 
         if (cfg.profiles.entries.len == 0) {
-            // Legacy single-profile path. Synthesize "default" from the
-            // flat keys; matches today's behavior bit-for-bit.
-            try sessions.append(allocator, .{
-                .profile = .{
-                    .name = "default",
-                    .command = cfg.getProviderCommand(),
-                },
+            try mgr.sessions.append(allocator, .{
+                .id = 1,
+                .profile = .{ .name = try own(allocator, &mgr.owned_strings, "default") },
             });
         } else {
-            for (cfg.profiles.entries) |e| {
-                try sessions.append(allocator, .{ .profile = resolveEntry(allocator, &e, &owned) });
+            for (cfg.profiles.entries, 0..) |entry, i| {
+                try mgr.sessions.append(allocator, .{
+                    .id = @as(u64, @intCast(i)) + 1,
+                    .profile = try resolveEntry(allocator, &entry, &mgr.owned_strings),
+                });
             }
         }
 
-        var mgr: SessionManager = .{
-            .allocator = allocator,
-            .sessions = sessions,
-            .active_idx = 0,
-            .owned_strings = owned,
-        };
-
-        // Resolve `default-profile` into an index. Unknown names fall
-        // through to index 0 with a warning so the user gets feedback
-        // instead of a silent fallback.
         if (cfg.profiles.default) |name| {
             if (mgr.indexOf(name)) |idx| {
                 mgr.active_idx = idx;
@@ -115,75 +97,13 @@ pub const SessionManager = struct {
                 std.debug.print("warning: default-profile '{s}' not defined; using '{s}'\n", .{ name, mgr.sessions.items[0].profile.name });
             }
         }
-
         return mgr;
     }
 
     pub fn deinit(self: *SessionManager) void {
-        for (self.sessions.items) |sess| {
-            if (sess.spawn_arena) |a| {
-                a.deinit();
-                self.allocator.destroy(a);
-            }
-        }
         self.sessions.deinit(self.allocator);
         for (self.owned_strings.items) |s| self.allocator.free(s);
         self.owned_strings.deinit(self.allocator);
-    }
-
-    /// Append a new Session resolved from `entry`. Returns the index
-    /// of the newly-appended session in `sessions.items`. Used by
-    /// hot-config-reload's profile diff to add a profile at runtime.
-    /// Callers should re-fetch via index (`&sm.sessions.items[idx]`)
-    /// for any subsequent access — appending again may reallocate the
-    /// backing buffer and invalidate prior pointers.
-    pub fn appendEntry(self: *SessionManager, entry: Config.ProfileEntry) !usize {
-        const profile = resolveEntry(self.allocator, &entry, &self.owned_strings);
-        try self.sessions.append(self.allocator, .{ .profile = profile });
-        return self.sessions.items.len - 1;
-    }
-
-    /// Pop the session at `idx`, shifting tail entries down. Returns
-    /// the removed Session by value so the caller can free its
-    /// ghostty surface + surface_host NSView outside this module
-    /// (lifecycle of those handles isn't owned here).
-    ///
-    /// active_idx tracking:
-    ///   - idx <  active_idx → tail shifted down by 1, decrement
-    ///   - idx >  active_idx → no change
-    ///   - idx == active_idx → the entry under active_idx was removed;
-    ///     caller is expected to have switched to a neighbor *before*
-    ///     calling removeAt. As a last-resort safety net we clamp
-    ///     active_idx to a valid index (or 0 when the list emptied),
-    ///     so callers that skipped the switch don't index out of
-    ///     bounds — but the now-active session won't match what the
-    ///     UI was showing.
-    pub fn removeAt(self: *SessionManager, idx: usize) ?Session {
-        if (idx >= self.sessions.items.len) return null;
-        const removed = self.sessions.orderedRemove(idx);
-
-        if (idx < self.active_idx) {
-            self.active_idx -= 1;
-        } else if (idx == self.active_idx) {
-            if (self.sessions.items.len == 0) {
-                self.active_idx = 0;
-            } else if (self.active_idx >= self.sessions.items.len) {
-                self.active_idx = self.sessions.items.len - 1;
-            }
-        }
-        return removed;
-    }
-
-    /// Re-point a profile's display fields (`title`, `cwd`) without
-    /// touching the spawn-side state. Used by hot-config-reload when
-    /// a matched-by-name profile entry has only display-affecting
-    /// changes — no surface restart needed. The slices must outlive
-    /// the SessionManager (config strings leak on reload, so pointers
-    /// into the new Config remain valid for the process).
-    pub fn updateProfileDisplay(self: *SessionManager, idx: usize, title: ?[]const u8, cwd: ?[]const u8) void {
-        if (idx >= self.sessions.items.len) return;
-        self.sessions.items[idx].profile.title = title;
-        self.sessions.items[idx].profile.cwd = cwd;
     }
 
     pub fn active(self: *SessionManager) *Session {
@@ -201,32 +121,21 @@ pub const SessionManager = struct {
         return null;
     }
 
-    /// Switch to the session at `idx`. No-op if `idx` is out of bounds
-    /// or already active. Returns true when a switch actually
-    /// happened — callers use this to gate the (expensive) Cocoa
-    /// reflow + setHidden setHidden:0 work.
     pub fn switchTo(self: *SessionManager, idx: usize) bool {
-        if (idx >= self.sessions.items.len) return false;
-        if (idx == self.active_idx) return false;
+        if (idx >= self.sessions.items.len or idx == self.active_idx) return false;
         self.active_idx = idx;
         return true;
     }
 
     pub fn next(self: *SessionManager) bool {
-        const idx = self.peekNext() orelse return false;
-        return self.switchTo(idx);
+        return self.switchTo(self.peekNext() orelse return false);
     }
 
     pub fn prev(self: *SessionManager) bool {
-        const idx = self.peekPrev() orelse return false;
-        return self.switchTo(idx);
+        return self.switchTo(self.peekPrev() orelse return false);
     }
 
-    /// Index of the would-be active session after `next()` / `prev()`,
-    /// without mutating state. Returns null when there's nothing to
-    /// cycle to (single-session setup). UI layers use these to compute
-    /// a target index, then hand it to the Cocoa-side `activateSession`
-    /// so the modular arithmetic lives in one place.
+    /// Inspect a navigation target without spawning or changing active state.
     pub fn peekNext(self: *const SessionManager) ?usize {
         if (self.sessions.items.len <= 1) return null;
         return (self.active_idx + 1) % self.sessions.items.len;
@@ -238,346 +147,416 @@ pub const SessionManager = struct {
     }
 };
 
-/// Resolve a `ProfileEntry` (parsed from config) into a runtime
-/// `Profile`. Spawn-command precedence: `script` > `command` >
-/// `provider` shortcut > /bin/zsh fallback. Script paths run through
-/// `resolveScript` which expands `~/` and verifies execute-bit; on
-/// failure the resolution warns and falls through, so a typo in
-/// `script` doesn't break the whole profile — the user still gets a
-/// working terminal. Tilde-expanded paths are appended to `owned`
-/// so the manager frees them on deinit.
-fn resolveEntry(
-    allocator: std.mem.Allocator,
-    e: *const Config.ProfileEntry,
-    owned: *std.ArrayList([]u8),
-) Profile {
-    const cmd = blk: {
-        if (e.script) |s| {
-            if (resolveScript(allocator, s, owned)) |path| break :blk path else |err| {
-                std.debug.print(
-                    "warning: profile '{s}' script '{s}' unusable ({}); falling back\n",
-                    .{ e.name, s, err },
-                );
-            }
+fn own(allocator: std.mem.Allocator, owned: *std.ArrayList([]u8), value: []const u8) ![]const u8 {
+    return retain(allocator, owned, try allocator.dupe(u8, value));
+}
+
+fn retain(allocator: std.mem.Allocator, owned: *std.ArrayList([]u8), value: []u8) ![]const u8 {
+    errdefer allocator.free(value);
+    try owned.append(allocator, value);
+    return value;
+}
+
+fn ownOptional(allocator: std.mem.Allocator, owned: *std.ArrayList([]u8), value: ?[]const u8) !?[]const u8 {
+    return if (value) |s| try own(allocator, owned, s) else null;
+}
+
+fn resolveEntry(allocator: std.mem.Allocator, e: *const Config.ProfileEntry, owned: *std.ArrayList([]u8)) !Profile {
+    // Validate even shadowed explicit settings: a script must not hide an
+    // accidentally empty command. Manually constructed Configs use this too.
+    for ([_]?[]const u8{ e.command, e.script, e.cwd }) |value| {
+        if (value) |s| try validateLaunchValue(s);
+    }
+    const command = if (e.script) |script|
+        resolveScript(allocator, script, owned) catch |err| {
+            std.debug.print("error: profile '{s}' script '{s}' cannot launch ({}); fix the path/execute permission or remove profile.{s}.script\n", .{ e.name, script, err, e.name });
+            return err;
         }
-        if (e.command) |c| break :blk c;
-        break :blk providerCommand(e.provider orelse "generic");
-    };
+    else
+        try ownOptional(allocator, owned, e.command);
     return .{
-        .name = e.name,
-        .command = cmd,
-        .cwd = e.cwd,
-        .title = e.title,
+        .name = try own(allocator, owned, e.name),
+        .command = command,
+        .cwd = if (e.cwd) |cwd| try resolveCwd(allocator, cwd, owned) else null,
+        .title = try ownOptional(allocator, owned, e.title),
         .bell_audible = e.bell_audible,
         .bell_visual = e.bell_visual,
-        .bell_sound = e.bell_sound,
+        .bell_sound = try ownOptional(allocator, owned, e.bell_sound),
     };
 }
 
-/// Expand a leading `~/` against `$HOME`, then stat the file and
-/// verify it's executable. Returns the resolved (possibly newly
-/// allocated) path on success; the path is appended to `owned` so
-/// SessionManager.deinit can free it. On any failure (missing $HOME
-/// for tilde, file not found, not executable) returns the underlying
-/// error and the caller falls through to the next spawn-command
-/// layer.
-fn resolveScript(
-    allocator: std.mem.Allocator,
-    raw: []const u8,
-    owned: *std.ArrayList([]u8),
-) ![]const u8 {
-    const path: []const u8 = if (std.mem.startsWith(u8, raw, "~/")) blk: {
-        const home = std.posix.getenv("HOME") orelse return error.NoHome;
-        const expanded = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, raw[2..] });
-        // Hand off ownership to `owned` immediately. A function-scope
-        // `errdefer allocator.free(expanded)` would still fire after
-        // a later error (e.g. statFile below), and the caller's
-        // errdefer drains `owned` on the same error → double-free.
-        owned.append(allocator, expanded) catch |e| {
-            allocator.free(expanded);
-            return e;
-        };
-        break :blk expanded;
-    } else raw;
+fn validateLaunchValue(value: []const u8) !void {
+    if (std.mem.trim(u8, value, " \t\r\n").len == 0) return error.EmptyLaunchValue;
+    if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidLaunchValue;
+}
 
-    // Stat checks both existence and accessibility. The `IXUSR | IXGRP
-    // | IXOTH` mask catches "file is there but the user forgot
-    // chmod +x" — the most common script setup mistake.
-    const stat = try std.fs.cwd().statFile(path);
-    if (stat.kind != .file) return error.NotARegularFile;
-    if (stat.mode & 0o111 == 0) return error.NotExecutable;
+fn expandHome(allocator: std.mem.Allocator, raw: []const u8, owned: *std.ArrayList([]u8)) ![]const u8 {
+    if (std.mem.startsWith(u8, raw, "~/")) {
+        const home = platform.getenv("HOME") orelse return error.NoHome;
+        return retain(allocator, owned, try std.fmt.allocPrint(allocator, "{s}/{s}", .{ home, raw[2..] }));
+    }
+    return own(allocator, owned, raw);
+}
+
+/// Ghostty silently ignores invalid working directories. Validate explicitly
+/// so a configured launch cannot run somewhere else without the user's consent.
+fn resolveCwd(allocator: std.mem.Allocator, raw: []const u8, owned: *std.ArrayList([]u8)) ![]const u8 {
+    const path = try expandHome(allocator, raw, owned);
+    try validateCwd(path);
     return path;
 }
 
-/// Map provider name → spawn command. Mirrors `Config.getProviderCommand`'s
-/// table; broken out so SessionManager can resolve per-profile providers
-/// without going through the Config singleton.
-fn providerCommand(name: []const u8) []const u8 {
-    const map = .{
-        .{ "claude", "claude" },
-        .{ "codex", "codex" },
-        .{ "aider", "aider" },
-        .{ "gemini", "gemini" },
-        .{ "opencode", "opencode" },
-        .{ "crush", "crush" }, // charmbracelet/crush
-        .{ "pi", "pi" }, // Pi AI CLI
-    };
-    inline for (map) |entry| {
-        if (eqIgnoreCase(name, entry[0])) return entry[1];
-    }
-    // Same fallback rationale as Config.getProviderCommand: prefer
-    // /bin/zsh over $SHELL; nix dev shells set $SHELL to a sandboxed
-    // bash with broken terminfo.
-    return "/bin/zsh";
+fn validateCwd(path: []const u8) !void {
+    try validateLaunchValue(path);
+    if (!std.fs.path.isAbsolute(path)) return error.NotAbsolutePath;
+    const dir = try std.Io.Dir.openDirAbsolute(platform.io(), path, .{});
+    defer dir.close(platform.io());
+    try checkExecuteAccess(path);
 }
 
-fn eqIgnoreCase(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        if (std.ascii.toLower(ca) != std.ascii.toLower(cb)) return false;
+/// Retain the libc access check in addition to mode bits: ACLs and mount
+/// permissions can prohibit execution even when a file has executable bits.
+fn checkExecuteAccess(path: []const u8) !void {
+    var buffer: [std.Io.Dir.max_path_bytes:0]u8 = undefined;
+    if (path.len >= buffer.len) return error.NameTooLong;
+    @memcpy(buffer[0..path.len], path);
+    buffer[path.len] = 0;
+    switch (std.c.errno(std.c.access(buffer[0..path.len :0].ptr, std.c.X_OK))) {
+        .SUCCESS => {},
+        .ACCES => return error.PermissionDenied,
+        .NOENT => return error.FileNotFound,
+        .NOTDIR => return error.NotDir,
+        .LOOP => return error.SymLinkLoop,
+        .NAMETOOLONG => return error.NameTooLong,
+        .IO => return error.InputOutput,
+        .NOMEM => return error.SystemResources,
+        .ROFS => return error.ReadOnlyFileSystem,
+        else => |err| return std.posix.unexpectedErrno(err),
     }
-    return true;
+}
+
+/// An explicitly configured script is a promise, not a shell fallback.
+/// Expand ~/ and validate both file type and effective execute permission.
+/// The embedded API treats .command as a SHELL command, not argv[0]. Resolve
+/// relative paths before changing cwd, then quote the entire literal path.
+fn resolveScript(allocator: std.mem.Allocator, raw: []const u8, owned: *std.ArrayList([]u8)) ![]const u8 {
+    const expanded = try expandHome(allocator, raw, owned);
+    const resolved = try std.Io.Dir.cwd().realPathFileAlloc(platform.io(), expanded, allocator);
+    defer allocator.free(resolved);
+    const path = try own(allocator, owned, resolved);
+    const stat = try std.Io.Dir.cwd().statFile(platform.io(), path, .{});
+    if (stat.kind != .file) return error.NotARegularFile;
+    if (stat.permissions.toMode() & 0o111 == 0) return error.NotExecutable;
+    checkExecuteAccess(path) catch |err| switch (err) {
+        error.PermissionDenied => return error.NotExecutable,
+        else => return err,
+    };
+    return quoteScriptPath(allocator, path, owned);
+}
+
+fn quoteScriptPath(allocator: std.mem.Allocator, path: []const u8, owned: *std.ArrayList([]u8)) ![]const u8 {
+    var quoted: std.ArrayList(u8) = .empty;
+    defer quoted.deinit(allocator);
+    try quoted.append(allocator, '\'');
+    for (path) |c| {
+        if (c == '\'') {
+            // End single quotes, emit one escaped apostrophe, resume quotes.
+            try quoted.appendSlice(allocator, "'\\''");
+        } else {
+            try quoted.append(allocator, c);
+        }
+    }
+    try quoted.append(allocator, '\'');
+    return retain(allocator, owned, try quoted.toOwnedSlice(allocator));
 }
 
 // Tests --------------------------------------------------------------
 
-test "SessionManager: legacy single-profile path" {
-    var cfg = Config{};
-    cfg.provider.name = "claude";
+test "SessionManager: no profiles means a lazy default shell" {
+    const cfg = Config{};
     var mgr = try SessionManager.init(std.testing.allocator, &cfg);
     defer mgr.deinit();
     try std.testing.expectEqual(@as(usize, 1), mgr.count());
     try std.testing.expectEqualStrings("default", mgr.active().profile.name);
-    try std.testing.expectEqualStrings("claude", mgr.active().profile.command);
+    try std.testing.expect(mgr.active().profile.command == null);
+    try std.testing.expect(mgr.active().surface == null);
+    try std.testing.expect(!mgr.active().spawned);
+    try std.testing.expectEqual(@as(u64, 1), mgr.active().id);
+    try std.testing.expectEqual(@as(u64, 0), mgr.active().surface_generation);
+    try std.testing.expect(mgr.active().command_z == null);
+    try std.testing.expect(mgr.active().cwd_z == null);
+    try std.testing.expectEqual(@as(usize, 0), mgr.active().terminal_title_len);
+    try std.testing.expectEqualSlices(u8, &@as([256]u8, @splat(0)), &mgr.active().terminal_title);
+    try std.testing.expect(mgr.peekNext() == null);
+    try std.testing.expect(mgr.peekPrev() == null);
 }
 
-test "SessionManager: profiles + default selection" {
+test "SessionManager: configured shell and explicit command" {
     const entries = [_]Config.ProfileEntry{
-        .{ .name = "main", .provider = "claude" },
-        .{ .name = "side", .provider = "codex" },
+        .{ .name = "shell" },
+        .{ .name = "tool", .command = "my-tool --interactive" },
     };
-    var cfg = Config{};
-    cfg.profiles.entries = &entries;
-    cfg.profiles.default = "side";
-
+    const cfg = Config{ .profiles = .{ .entries = &entries, .default = "tool" } };
     var mgr = try SessionManager.init(std.testing.allocator, &cfg);
     defer mgr.deinit();
-    try std.testing.expectEqual(@as(usize, 2), mgr.count());
-    try std.testing.expectEqualStrings("side", mgr.active().profile.name);
-    try std.testing.expectEqualStrings("codex", mgr.active().profile.command);
-}
-
-test "SessionManager: command override beats provider shortcut" {
-    const entries = [_]Config.ProfileEntry{
-        .{ .name = "x", .provider = "claude", .command = "/opt/bin/my-claude" },
-    };
-    var cfg = Config{};
-    cfg.profiles.entries = &entries;
-
-    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
-    defer mgr.deinit();
-    try std.testing.expectEqualStrings("/opt/bin/my-claude", mgr.active().profile.command);
-}
-
-test "SessionManager: unknown default-profile falls back to 0" {
-    const entries = [_]Config.ProfileEntry{
-        .{ .name = "main", .provider = "claude" },
-    };
-    var cfg = Config{};
-    cfg.profiles.entries = &entries;
-    cfg.profiles.default = "missing";
-
-    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
-    defer mgr.deinit();
-    try std.testing.expectEqual(@as(usize, 0), mgr.active_idx);
-}
-
-test "SessionManager: switchTo / next / prev arithmetic" {
-    const entries = [_]Config.ProfileEntry{
-        .{ .name = "a" },
-        .{ .name = "b" },
-        .{ .name = "c" },
-    };
-    var cfg = Config{};
-    cfg.profiles.entries = &entries;
-
-    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
-    defer mgr.deinit();
-    try std.testing.expect(mgr.switchTo(2));
-    try std.testing.expectEqualStrings("c", mgr.active().profile.name);
-    try std.testing.expect(!mgr.switchTo(2)); // already active
-    try std.testing.expect(!mgr.switchTo(99)); // out of bounds
-    try std.testing.expect(mgr.next()); // c -> a (wrap)
-    try std.testing.expectEqualStrings("a", mgr.active().profile.name);
-    try std.testing.expect(mgr.prev()); // a -> c (wrap)
-    try std.testing.expectEqualStrings("c", mgr.active().profile.name);
-}
-
-test "SessionManager: script wins over command + provider" {
-    // Use the build's own zig binary as a known-executable file.
-    // Picking something stable across nix shell + host shell so the
-    // test isn't sensitive to which env runs it.
-    const tmp_path = try makeTempExecutable(std.testing.allocator);
-    defer std.testing.allocator.free(tmp_path);
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
-
-    const entries = [_]Config.ProfileEntry{
-        .{
-            .name = "main",
-            .provider = "claude",
-            .command = "/opt/bin/my-claude",
-            .script = tmp_path,
-        },
-    };
-    var cfg = Config{};
-    cfg.profiles.entries = &entries;
-
-    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
-    defer mgr.deinit();
-    try std.testing.expectEqualStrings(tmp_path, mgr.active().profile.command);
-}
-
-test "SessionManager: missing script falls through to command" {
-    const entries = [_]Config.ProfileEntry{
-        .{
-            .name = "main",
-            .command = "/opt/bin/my-claude",
-            .script = "/nonexistent/path/that/should/not/be/here.sh",
-        },
-    };
-    var cfg = Config{};
-    cfg.profiles.entries = &entries;
-
-    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
-    defer mgr.deinit();
-    try std.testing.expectEqualStrings("/opt/bin/my-claude", mgr.active().profile.command);
-}
-
-test "SessionManager: non-executable script falls through to provider" {
-    // Create a regular file with no execute bit.
-    const tmp_path = try std.fmt.allocPrint(std.testing.allocator, "/tmp/djinn-test-script-{d}.txt", .{std.time.microTimestamp()});
-    defer std.testing.allocator.free(tmp_path);
-    {
-        const f = try std.fs.cwd().createFile(tmp_path, .{ .mode = 0o644 });
-        f.close();
-    }
-    defer std.fs.cwd().deleteFile(tmp_path) catch {};
-
-    const entries = [_]Config.ProfileEntry{
-        .{ .name = "main", .provider = "codex", .script = tmp_path },
-    };
-    var cfg = Config{};
-    cfg.profiles.entries = &entries;
-
-    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
-    defer mgr.deinit();
-    try std.testing.expectEqualStrings("codex", mgr.active().profile.command);
-}
-
-fn makeTempExecutable(allocator: std.mem.Allocator) ![]u8 {
-    const path = try std.fmt.allocPrint(allocator, "/tmp/djinn-test-script-{d}.sh", .{std.time.microTimestamp()});
-    errdefer allocator.free(path);
-    const f = try std.fs.cwd().createFile(path, .{ .mode = 0o755 });
-    defer f.close();
-    try f.writeAll("#!/bin/sh\nexec /bin/zsh\n");
-    return path;
-}
-
-test "SessionManager: profile.label falls back to name" {
-    var p = Profile{ .name = "main", .command = "claude" };
-    try std.testing.expectEqualStrings("main", p.label());
-    p.title = "Main Repo";
-    try std.testing.expectEqualStrings("Main Repo", p.label());
-}
-
-test "SessionManager: appendEntry grows list + resolves command" {
-    const entries = [_]Config.ProfileEntry{
-        .{ .name = "a", .provider = "claude" },
-    };
-    var cfg = Config{};
-    cfg.profiles.entries = &entries;
-    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
-    defer mgr.deinit();
-
-    const new_entry = Config.ProfileEntry{ .name = "b", .provider = "codex" };
-    const idx = try mgr.appendEntry(new_entry);
-    try std.testing.expectEqual(@as(usize, 1), idx);
-    try std.testing.expectEqual(@as(usize, 2), mgr.count());
-    try std.testing.expectEqualStrings("b", mgr.sessions.items[idx].profile.name);
-    try std.testing.expectEqualStrings("codex", mgr.sessions.items[idx].profile.command);
-}
-
-test "SessionManager: removeAt — caller switched first" {
-    const entries = [_]Config.ProfileEntry{
-        .{ .name = "a" },
-        .{ .name = "b" },
-        .{ .name = "c" },
-    };
-    var cfg = Config{};
-    cfg.profiles.entries = &entries;
-    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
-    defer mgr.deinit();
-
-    // Production caller switches off the to-be-removed entry first.
-    try std.testing.expect(mgr.switchTo(1));
-    const removed = mgr.removeAt(2) orelse return error.TestFailed;
-    try std.testing.expectEqualStrings("c", removed.profile.name);
-    try std.testing.expectEqual(@as(usize, 2), mgr.count());
+    try std.testing.expect(mgr.sessions.items[0].profile.command == null);
+    try std.testing.expectEqualStrings("my-tool --interactive", mgr.active().profile.command.?);
     try std.testing.expectEqual(@as(usize, 1), mgr.active_idx);
+    try std.testing.expectEqual(@as(?usize, 0), mgr.indexOf("shell"));
+    try std.testing.expect(mgr.indexOf("missing") == null);
+}
 
-    // Remove an entry below the active one: tail shifts, active_idx
-    // tracks down with it.
-    _ = mgr.removeAt(0) orelse return error.TestFailed;
-    try std.testing.expectEqual(@as(usize, 1), mgr.count());
+test "SessionManager: navigation preserves identity and lazy state" {
+    const entries = [_]Config.ProfileEntry{ .{ .name = "a" }, .{ .name = "b" }, .{ .name = "c" } };
+    const cfg = Config{ .profiles = .{ .entries = &entries, .default = "missing" } };
+    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
+    defer mgr.deinit();
     try std.testing.expectEqual(@as(usize, 0), mgr.active_idx);
-    try std.testing.expectEqualStrings("b", mgr.sessions.items[0].profile.name);
+    try std.testing.expectEqual(@as(?usize, 1), mgr.peekNext());
+    try std.testing.expectEqual(@as(?usize, 2), mgr.peekPrev());
+    try std.testing.expect(mgr.switchTo(2));
+    const id = mgr.active().id;
+    try std.testing.expect(!mgr.switchTo(2));
+    try std.testing.expect(!mgr.switchTo(99));
+    try std.testing.expect(mgr.next());
+    try std.testing.expectEqualStrings("a", mgr.active().profile.name);
+    try std.testing.expect(mgr.prev());
+    try std.testing.expectEqual(id, mgr.active().id);
+    for (mgr.sessions.items, 0..) |s, i| {
+        try std.testing.expectEqual(@as(u64, @intCast(i + 1)), s.id);
+        try std.testing.expect(!s.spawned);
+        try std.testing.expect(s.surface == null);
+    }
 }
 
-test "SessionManager: removeAt — clamp safety net for active = removed" {
-    // Doc says caller should switch first; this exercises the
-    // safety net for callers that don't, including the middle-
-    // position case the previous clamp branch silently mishandled.
-    const entries = [_]Config.ProfileEntry{
-        .{ .name = "a" },
-        .{ .name = "b" },
-        .{ .name = "c" },
+test "SessionManager: script beats command and is owned" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(platform.io(), "launch.sh", .{ .permissions = .fromMode(0o755) });
+    defer file.close(platform.io());
+    try file.writeStreamingAll(platform.io(), "#!/bin/sh\nexec /bin/sh\n");
+    try file.setPermissions(platform.io(), .fromMode(0o755));
+    const path = try tmp.dir.realPathFileAlloc(platform.io(), "launch.sh", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const entries = [_]Config.ProfileEntry{.{ .name = "main", .command = "ignored", .script = path }};
+    const cfg = Config{ .profiles = .{ .entries = &entries } };
+    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
+    defer mgr.deinit();
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "'{s}'", .{path});
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, mgr.active().profile.command.?);
+    try std.testing.expect(path.ptr != mgr.active().profile.command.?.ptr);
+}
+
+test "SessionManager: missing script fails instead of falling through" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir = try tmp.dir.realPathFileAlloc(platform.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, "missing.sh" });
+    defer std.testing.allocator.free(path);
+    const entries = [_]Config.ProfileEntry{.{ .name = "main", .command = "/bin/sh", .script = path }};
+    const cfg = Config{ .profiles = .{ .entries = &entries } };
+    try std.testing.expectError(error.FileNotFound, SessionManager.init(std.testing.allocator, &cfg));
+}
+
+test "SessionManager: nonexecutable script fails instead of spawning shell" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile(platform.io(), "launch.sh", .{ .permissions = .fromMode(0o644) });
+    defer file.close(platform.io());
+    try file.setPermissions(platform.io(), .fromMode(0o644));
+    const path = try tmp.dir.realPathFileAlloc(platform.io(), "launch.sh", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const entries = [_]Config.ProfileEntry{.{ .name = "main", .script = path }};
+    const cfg = Config{ .profiles = .{ .entries = &entries } };
+    try std.testing.expectError(error.NotExecutable, SessionManager.init(std.testing.allocator, &cfg));
+}
+
+test "SessionManager: retained launch strings outlive parsed config" {
+    var cfg = try Config.parse(std.testing.allocator,
+        \\profile.main.command = /bin/sh
+        \\profile.main.cwd = /tmp
+        \\profile.main.title = Main Shell
+        \\profile.main.bell-sound = Glass
+        \\profile.main.bell-audible = false
+        \\profile.main.bell-visual = true
+    );
+    var mgr = SessionManager.init(std.testing.allocator, &cfg) catch |err| {
+        cfg.deinit();
+        return err;
     };
-    var cfg = Config{};
-    cfg.profiles.entries = &entries;
-    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
     defer mgr.deinit();
-
-    try std.testing.expect(mgr.switchTo(1));
-    _ = mgr.removeAt(1) orelse return error.TestFailed;
-    // Before: [a, b, c] active=1. After remove(1): [a, c] active still
-    // points into bounds. Clamp keeps it in range; doesn't promise the
-    // same logical session.
-    try std.testing.expectEqual(@as(usize, 2), mgr.count());
-    try std.testing.expect(mgr.active_idx < mgr.count());
+    cfg.deinit();
+    const p = mgr.active().profile;
+    try std.testing.expectEqualStrings("main", p.name);
+    try std.testing.expectEqualStrings("/bin/sh", p.command.?);
+    try std.testing.expectEqualStrings("/tmp", p.cwd.?);
+    try std.testing.expectEqualStrings("Main Shell", p.label());
+    try std.testing.expectEqualStrings("Glass", p.bell_sound.?);
+    try std.testing.expectEqual(@as(?bool, false), p.bell_audible);
+    try std.testing.expectEqual(@as(?bool, true), p.bell_visual);
+    try std.testing.expectEqualStrings("fallback", (Profile{ .name = "fallback" }).label());
 }
 
-test "SessionManager: removeAt out of bounds returns null" {
-    const entries = [_]Config.ProfileEntry{ .{ .name = "a" } };
-    var cfg = Config{};
-    cfg.profiles.entries = &entries;
-    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
-    defer mgr.deinit();
-
-    try std.testing.expect(mgr.removeAt(5) == null);
-    try std.testing.expectEqual(@as(usize, 1), mgr.count());
+test "Session: label prefers explicit title then terminal title then name" {
+    var session = Session{ .id = 1, .profile = .{ .name = "main" } };
+    try std.testing.expectEqualStrings("main", session.label());
+    @memcpy(session.terminal_title[0..5], "shell");
+    session.terminal_title_len = 5;
+    try std.testing.expectEqualStrings("shell", session.label());
+    session.profile.title = "Pinned";
+    try std.testing.expectEqualStrings("Pinned", session.label());
+    session.profile.title = "";
+    try std.testing.expectEqualStrings("", session.label());
+    session.profile.title = null;
+    session.terminal_title_len = 0;
+    try std.testing.expectEqualStrings("main", session.label());
 }
 
-test "SessionManager: updateProfileDisplay re-points title + cwd" {
+test "SessionManager: explicit command remains a shell command unchanged" {
+    const command = "  FOO='a b' /bin/tool --arg=\"$HOME\"; echo done  ";
+    const entries = [_]Config.ProfileEntry{.{ .name = "main", .command = command }};
+    const cfg = Config{ .profiles = .{ .entries = &entries } };
+    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
+    defer mgr.deinit();
+    try std.testing.expectEqualStrings(command, mgr.active().profile.command.?);
+}
+
+test "SessionManager: reject empty explicit launch settings including shadowed command" {
     const entries = [_]Config.ProfileEntry{
-        .{ .name = "main", .title = "Old Title" },
+        .{ .name = "main", .command = "" },
+        .{ .name = "main", .command = " \t\n" },
+        .{ .name = "main", .script = "" },
+        .{ .name = "main", .cwd = "" },
+        .{ .name = "main", .cwd = " \t" },
+        .{ .name = "main", .command = "", .script = "/bin/sh" },
     };
-    var cfg = Config{};
-    cfg.profiles.entries = &entries;
+    for (entries) |entry| {
+        const single = [_]Config.ProfileEntry{entry};
+        const cfg = Config{ .profiles = .{ .entries = &single } };
+        try std.testing.expectError(error.EmptyLaunchValue, SessionManager.init(std.testing.allocator, &cfg));
+    }
+    const nul = [_]Config.ProfileEntry{.{ .name = "main", .command = "echo\x00ignored" }};
+    const cfg = Config{ .profiles = .{ .entries = &nul } };
+    try std.testing.expectError(error.InvalidLaunchValue, SessionManager.init(std.testing.allocator, &cfg));
+}
+
+test "SessionManager: cwd must be an existing absolute directory" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(platform.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(path);
+    const entries = [_]Config.ProfileEntry{.{ .name = "main", .cwd = path }};
+    const cfg = Config{ .profiles = .{ .entries = &entries } };
     var mgr = try SessionManager.init(std.testing.allocator, &cfg);
     defer mgr.deinit();
+    try std.testing.expectEqualStrings(path, mgr.active().profile.cwd.?);
+    try std.testing.expect(path.ptr != mgr.active().profile.cwd.?.ptr);
 
-    try std.testing.expectEqualStrings("Old Title", mgr.sessions.items[0].profile.title.?);
-    mgr.updateProfileDisplay(0, "New Title", "/tmp");
-    try std.testing.expectEqualStrings("New Title", mgr.sessions.items[0].profile.title.?);
-    try std.testing.expectEqualStrings("/tmp", mgr.sessions.items[0].profile.cwd.?);
+    const file = try tmp.dir.createFile(platform.io(), "file", .{});
+    file.close(platform.io());
+    const file_path = try std.fs.path.join(std.testing.allocator, &.{ path, "file" });
+    defer std.testing.allocator.free(file_path);
+    const missing_path = try std.fs.path.join(std.testing.allocator, &.{ path, "missing" });
+    defer std.testing.allocator.free(missing_path);
+    const invalid = [_]struct { path: []const u8, err: anyerror }{
+        .{ .path = file_path, .err = error.NotDir },
+        .{ .path = missing_path, .err = error.FileNotFound },
+        .{ .path = "relative/path", .err = error.NotAbsolutePath },
+    };
+    for (invalid) |case| {
+        const bad_entries = [_]Config.ProfileEntry{.{ .name = "bad", .cwd = case.path }};
+        const bad_cfg = Config{ .profiles = .{ .entries = &bad_entries } };
+        try std.testing.expectError(case.err, SessionManager.init(std.testing.allocator, &bad_cfg));
+    }
+}
+
+test "SessionManager: leading tilde expansion is literal and owned" {
+    const home = platform.getenv("HOME") orelse return error.SkipZigTest;
+    var owned: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned.items) |s| std.testing.allocator.free(s);
+        owned.deinit(std.testing.allocator);
+    }
+    const path = try expandHome(std.testing.allocator, "~/dir with spaces/$literal", &owned);
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "{s}/dir with spaces/$literal", .{home});
+    defer std.testing.allocator.free(expected);
+    try std.testing.expectEqualStrings(expected, path);
+}
+
+test "SessionManager: script shell quoting escapes apostrophes and disables expansion" {
+    var owned: std.ArrayList([]u8) = .empty;
+    defer {
+        for (owned.items) |s| std.testing.allocator.free(s);
+        owned.deinit(std.testing.allocator);
+    }
+    try std.testing.expectEqualStrings("'/tmp/it'\\''s a $HOME `tool`'", try quoteScriptPath(std.testing.allocator, "/tmp/it's a $HOME `tool`", &owned));
+    try std.testing.expectEqualStrings("'/tmp/simple'", try quoteScriptPath(std.testing.allocator, "/tmp/simple", &owned));
+}
+
+test "SessionManager: executable script path with spaces and apostrophe is one literal word" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const filename = "it's a $HOME script.sh";
+    const file = try tmp.dir.createFile(platform.io(), filename, .{ .permissions = .fromMode(0o755) });
+    defer file.close(platform.io());
+    try file.writeStreamingAll(platform.io(), "#!/bin/sh\nexit 0\n");
+    try file.setPermissions(platform.io(), .fromMode(0o755));
+    const dir = try tmp.dir.realPathFileAlloc(platform.io(), ".", std.testing.allocator);
+    defer std.testing.allocator.free(dir);
+    const path = try std.fs.path.join(std.testing.allocator, &.{ dir, filename });
+    defer std.testing.allocator.free(path);
+    const expected = try std.fmt.allocPrint(std.testing.allocator, "'{s}/it'\\''s a $HOME script.sh'", .{dir});
+    defer std.testing.allocator.free(expected);
+    const entries = [_]Config.ProfileEntry{.{ .name = "main", .script = path }};
+    const cfg = Config{ .profiles = .{ .entries = &entries } };
+    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
+    defer mgr.deinit();
+    try std.testing.expectEqualStrings(expected, mgr.active().profile.command.?);
+
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(allocator: std.mem.Allocator, script: []const u8, cwd: []const u8) !void {
+            const profiles = [_]Config.ProfileEntry{.{ .name = "main", .script = script, .cwd = cwd }};
+            const config = Config{ .profiles = .{ .entries = &profiles } };
+            var manager = try SessionManager.init(allocator, &config);
+            defer manager.deinit();
+        }
+    }.check, .{ path, dir });
+}
+
+test "Session: retained cwd is revalidated after load and before each launch" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(platform.io(), "launch", .default_dir);
+    const cwd = try tmp.dir.realPathFileAlloc(platform.io(), "launch", std.testing.allocator);
+    defer std.testing.allocator.free(cwd);
+    const entries = [_]Config.ProfileEntry{.{ .name = "main", .cwd = cwd }};
+    const cfg = Config{ .profiles = .{ .entries = &entries } };
+    var mgr = try SessionManager.init(std.testing.allocator, &cfg);
+    defer mgr.deinit();
+    try mgr.active().validateLaunch();
+    try tmp.dir.deleteDir(platform.io(), "launch");
+    // A lazy start or restart must fail, not change the retained cwd or use HOME.
+    try std.testing.expectError(error.FileNotFound, mgr.active().validateLaunch());
+    try std.testing.expectEqualStrings(cwd, mgr.active().profile.cwd.?);
+    try tmp.dir.createDir(platform.io(), "launch", .default_dir);
+    try mgr.active().validateLaunch();
+    try tmp.dir.deleteDir(platform.io(), "launch");
+    const file = try tmp.dir.createFile(platform.io(), "launch", .{});
+    file.close(platform.io());
+    try std.testing.expectError(error.NotDir, mgr.active().validateLaunch());
+    var shell: Session = .{ .id = 2, .profile = .{ .name = "shell" } };
+    try shell.validateLaunch();
+}
+
+test "SessionManager: allocation failures clean up" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, struct {
+        fn check(allocator: std.mem.Allocator) !void {
+            const entries = [_]Config.ProfileEntry{.{ .name = "main", .command = "/bin/sh", .cwd = "/tmp", .title = "Shell", .bell_sound = "Tink" }};
+            const cfg = Config{ .profiles = .{ .entries = &entries } };
+            var mgr = try SessionManager.init(allocator, &cfg);
+            defer mgr.deinit();
+        }
+    }.check, .{});
 }

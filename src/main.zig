@@ -1,7 +1,9 @@
 const std = @import("std");
+const platform = @import("io/platform.zig");
 const objc = @import("objc");
-const Hotkey = @import("hotkey/darwin.zig").Hotkey;
-const parseKeybinding = @import("hotkey/darwin.zig").parseKeybinding;
+const hotkey_mod = @import("hotkey/darwin.zig");
+const Hotkey = hotkey_mod.Hotkey;
+const parseKeybinding = hotkey_mod.parseKeybinding;
 const Config = @import("config.zig").Config;
 const Notifier = @import("notify/darwin.zig").Notifier;
 const Menubar = @import("notify/menubar.zig").Menubar;
@@ -9,12 +11,6 @@ const Panel = @import("window/panel.zig").Panel;
 const panel_mod = @import("window/panel.zig");
 const view_mod = @import("terminal/view.zig");
 const TerminalView = view_mod.TerminalView;
-const McpServer = @import("mcp/server.zig").McpServer;
-const writeMcpEndpointInfo = @import("mcp/server.zig").writeEndpointInfo;
-const Dispatcher = @import("mcp/dispatch.zig").Dispatcher;
-const ToolTable = @import("mcp/tools.zig").ToolTable;
-const AgentState = @import("agent/state.zig").AgentState;
-const LogView = @import("agent/log_view.zig").LogView;
 const theme_mod = @import("theme/theme.zig");
 const persist = @import("state/persist.zig");
 const app = @import("app.zig");
@@ -24,13 +20,10 @@ const tis = @import("terminal/tis.zig");
 const ghostty_runtime = @import("ghostty/runtime.zig");
 const cli = @import("cli.zig");
 const Session = @import("session/manager.zig").Session;
-const session_live = @import("session/live.zig");
 const layout = @import("window/layout.zig");
 const surface_lifecycle = @import("ghostty/surface_lifecycle.zig");
 
-const c_dispatch = @cImport({
-    @cInclude("dispatch/dispatch.h");
-});
+const c_dispatch = @import("darwin-c");
 
 extern "c" fn dispatch_async_f(
     queue: ?*anyopaque,
@@ -48,6 +41,7 @@ const libc_setenv = setenv;
 ///   - FSEventStream setup for live config reload
 fn deferredPostLaunchInit(_: ?*anyopaque) callconv(.c) void {
     const cfg = app.g.config orelse return;
+    reapDragDropTemps();
 
     if (cfg.system.open_at_login) {
         loginitem.register() catch |err| {
@@ -59,7 +53,7 @@ fn deferredPostLaunchInit(_: ?*anyopaque) callconv(.c) void {
 
     var djinn_path_buf: [512]u8 = undefined;
     var ghostty_path_buf: [512]u8 = undefined;
-    if (std.posix.getenv("HOME")) |home| {
+    if (platform.getenv("HOME")) |home| {
         const djinn_path = std.fmt.bufPrint(&djinn_path_buf, "{s}/.config/djinn/config", .{home}) catch null;
         const ghostty_path = std.fmt.bufPrint(&ghostty_path_buf, "{s}/.config/ghostty/config", .{home}) catch null;
         if (djinn_path) |dp| {
@@ -72,8 +66,8 @@ fn deferredPostLaunchInit(_: ?*anyopaque) callconv(.c) void {
     }
 }
 
-// Hotkey callback runs on the main thread (CGEventTap source is added to the
-// main run loop at hotkey init time). Safe to drive Cocoa from here.
+// Carbon delivers the registered shortcut on AppKit's main event loop.
+// No global keyboard monitor is needed. Safe to drive Cocoa from here.
 fn toggleCallback() void {
     if (app.g.window.panel) |p| p.toggle();
 }
@@ -87,174 +81,88 @@ fn onPanelResize(w: u32, h: u32) void {
     persist.saveDebounced(allocator, w, h, active_name);
 }
 
-/// FSEvent fan-in handler. Re-loads config from disk and pushes deltas
-/// into every subsystem that can absorb them at runtime. Settings that
-/// require process-restart (scrollback size, log_pane visibility,
-/// provider command, font metrics) are skipped — the user-visible
-/// surface is a one-line warning to the log pane.
-///
-/// Memory: old config strings leak. Reload is rare (user-edit cadence)
-/// and the strings are small (~hundreds of bytes). Avoiding the leak
-/// would mean tracking every duped slice, which the surrounding code
-/// doesn't need today.
-/// mtime cache for the two watched config files. The dispatch
-/// watch is parent-dir-granular (atomic-rename safe), so unrelated
-/// writes in the same dir — most notably djinn's own
-/// `~/.config/djinn/state.json` rewrites on every panel resize —
-/// also fire the FSEvents callback. Comparing against the
-/// previously-seen mtimes lets us short-circuit those before
-/// re-parsing the files + rebuilding chrome / ghostty config.
+// Parsed Config owns its arena. Sessions independently own immutable launch data.
 var last_djinn_mtime: ?i128 = null;
 var last_ghostty_mtime: ?i128 = null;
 
 fn onConfigChanged() void {
     const allocator = app.g.allocator orelse return;
     const cfg_ptr = app.g.config orelse return;
-
-    // mtime guard: if neither config file has changed since the last
-    // reload, this FSEvent fired for a sibling write (state.json on
-    // resize is the common case). Bail before doing any work.
     if (!configFilesChanged()) return;
 
-    // Shallow value-copy for the comparison + warning reads below.
-    // The old arena is NOT released here — see the comment near the
-    // swap site at the end of this function.
-    const old = cfg_ptr.*;
-
-    // FSEvents may fire mid-rename when an atomic-write editor saves
-    // (vim, VS Code, Helix). Retry a few times with a short sleep so
-    // transient ENOENT / partial-read doesn't push a default Config{}
-    // into the running app + clobber user settings.
-    const new_cfg = loadConfigWithRetry(allocator) orelse {
-        std.debug.print("warning: config reload failed (3 retries); keeping previous config\n", .{});
+    var new_cfg = loadConfigWithRetry(allocator) orelse {
+        hostWarn("config reload failed; keeping previous settings", .{});
         return;
     };
 
-    if (parseKeybinding(new_cfg.hotkey.toggle)) |kb| {
-        if (app.g.hotkey) |hk| hk.setBinding(kb.keycode, kb.modifiers);
-    } else |_| {}
-
+    const keybinding = app.g.hotkey_override orelse new_cfg.hotkey.toggle;
+    const kb = parseKeybinding(keybinding) catch {
+        hostWarn("invalid toggle hotkey; keeping previous settings", .{});
+        new_cfg.deinit();
+        return;
+    };
+    if (app.g.hotkey) |*hk| {
+        hk.setBinding(kb.keycode, kb.modifiers) catch |err| {
+            hostWarn("cannot register hotkey '{s}' ({}); keeping previous binding and settings", .{ keybinding, err });
+            new_cfg.deinit();
+            return;
+        };
+    } else {
+        app.g.hotkey = Hotkey.init(allocator, kb.keycode, kb.modifiers, &toggleCallback) catch |err| {
+            hostWarn("cannot register hotkey '{s}' ({}); keeping previous settings; menubar show/hide remains available", .{ keybinding, err });
+            new_cfg.deinit();
+            return;
+        };
+    }
+    var old = cfg_ptr.*;
+    defer old.deinit();
     if (app.g.window.panel) |p| {
         p.setHideOnBlur(new_cfg.window.hide_on_blur);
         p.setTopmost(new_cfg.window.topmost);
         p.setInstantToggle(new_cfg.window.toggle_style == .instant);
+        p.setPosition(@fromBackingInt(@intCast(@backingInt(new_cfg.window.position))), new_cfg.window.position_x, new_cfg.window.position_y);
     }
-
     if (app.g.notifier) |n| {
         n.enabled = new_cfg.notifications.system_notifications;
         n.rate_limit_ms = new_cfg.notifications.rate_limit_ms;
     }
-    if (app.g.tool_table) |tt| {
-        tt.attention_sound = new_cfg.notifications.attention_sound;
-        tt.notify_on_attention = new_cfg.notifications.notify_on_attention;
-        tt.notify_on_error = new_cfg.notifications.notify_on_error;
-        tt.notify_on_done = new_cfg.notifications.notify_on_done;
-        tt.notify_on_progress = new_cfg.notifications.notify_on_progress;
+    if (app.g.menubar) |mb| mb.setEnabled(new_cfg.notifications.menubar_icon);
+    if (new_cfg.system.open_at_login != old.system.open_at_login) {
+        if (new_cfg.system.open_at_login) loginitem.register() catch {} else loginitem.unregister() catch {};
     }
-    if (app.g.agent.menubar) |mb| mb.setEnabled(new_cfg.notifications.menubar_icon);
-
-    // Log-pane visibility: only re-apply when the config value
-    // actually changed. `toggle_log_pane` (Cmd+/) flips the same
-    // state at runtime; resetting on every save would clobber the
-    // user's hotkey override every time they edit any unrelated
-    // config field.
-    if (new_cfg.log_pane.enabled != old.log_pane.enabled) {
-        view_mod.setLogPaneHidden(!new_cfg.log_pane.enabled);
-    }
-
-    if (new_cfg.system.open_at_login) {
-        loginitem.register() catch {};
-    } else {
-        loginitem.unregister() catch {};
-    }
-
-    // Keymap overrides. Bindings removed from config since last reload
-    // stay on their old override — view_mod.rebind has no "reset to
-    // default" path and adding one isn't worth the complexity. Users
-    // who want to revert bindings should restart djinn.
-    for (new_cfg.keymap.entries) |entry| {
-        const parsed = parseKeybinding(entry.binding) catch continue;
-        _ = view_mod.rebind(entry.name, parsed.modifiers, parsed.keycode);
-    }
-
-    warnRestartRequired(old, new_cfg);
-    session_live.reconcileProfiles(old, new_cfg);
+    if (!std.meta.eql(old.scrollback, new_cfg.scrollback))
+        hostWarn("config: scrollback-size change requires restart", .{});
+    if (!profilesEqual(old, new_cfg))
+        hostWarn("config: profile launch definitions changed; restart Djinn to apply (running sessions unchanged)", .{});
 
     cfg_ptr.* = new_cfg;
-    // theme_apply.reload → reapply already calls
-    // ghostty_runtime.reloadConfigFromDisk + appSetColorScheme as
-    // part of its path. Calling it explicitly here too would do the
-    // same file-read + parse twice on every save.
-    @import("terminal/theme_apply.zig").reload();
-    // Old Config's arena is NOT released here: SessionManager's
-    // `Profile.name` / `.command` / `.bell_sound` etc. point directly
-    // into the arena (see `resolveEntry` — no copy), and
-    // `updateProfileDisplay` only re-points `.title` / `.cwd`.
-    // Releasing the arena would UAF every active session on the next
-    // bell ring, status surface, or `Cmd+R` restart.
-    // Sessions tear down before `defer config.deinit()` fires at
-    // shutdown (registered later than `defer session_manager.deinit()`,
-    // so it runs first), so the on-exit deinit is safe; live-reload
-    // intentionally leaks until `resolveEntry` copies through
-    // `owned_strings`.
+    view_mod.resetBindings();
+    applyKeymapOverrides(cfg_ptr);
+    view_mod.reloadTheme();
 }
 
-/// Emit one stderr warning per restart-required key whose value
-/// changed. These are config keys with no live-apply path today —
-/// users would otherwise edit + save + see no effect with no
-/// indication why. Stderr surfaces in `Console.app` for `.app`
-/// launches and the launching terminal for `just run`.
-fn warnRestartRequired(old: Config, new_cfg: Config) void {
-    if (old.mcp.enabled != new_cfg.mcp.enabled) {
-        hostWarn("config: 'mcp-enabled' change requires restart", .{});
+fn profilesEqual(a: Config, b: Config) bool {
+    if (!eqOptStr(a.profiles.default, b.profiles.default)) return false;
+    if (a.profiles.entries.len != b.profiles.entries.len) return false;
+    for (a.profiles.entries, b.profiles.entries) |x, y| {
+        if (!std.mem.eql(u8, x.name, y.name) or
+            !eqOptStr(x.command, y.command) or !eqOptStr(x.cwd, y.cwd) or
+            !eqOptStr(x.title, y.title) or !eqOptStr(x.script, y.script) or
+            x.bell_audible != y.bell_audible or x.bell_visual != y.bell_visual or
+            !eqOptStr(x.bell_sound, y.bell_sound)) return false;
     }
-    if (!eqOptStr(old.mcp.socket_path, new_cfg.mcp.socket_path)) {
-        hostWarn("config: 'mcp-socket-path' change requires restart", .{});
-    }
-    if (!eqOptU32(old.scrollback.size, new_cfg.scrollback.size)) {
-        hostWarn("config: 'scrollback-size' change requires restart", .{});
-    }
-    if (!std.mem.eql(u8, old.provider.name, new_cfg.provider.name) or
-        !eqOptStr(old.provider.command, new_cfg.provider.command))
-    {
-        hostWarn("config: 'provider' / 'provider-command' change requires restart", .{});
-    }
-    if (!eqOptStr(old.profiles.default, new_cfg.profiles.default)) {
-        hostWarn("config: 'default-profile' change requires restart", .{});
-    }
-    // Crossing legacy↔multi-profile boundaries is restart-required.
-    // Mid-multi-profile add/remove is handled live by
-    // reconcileProfiles, so no warning fires for that case.
-    const legacy_old = old.profiles.entries.len == 0;
-    const legacy_new = new_cfg.profiles.entries.len == 0;
-    if (legacy_old != legacy_new) {
-        hostWarn("config: switching between legacy single-profile and multi-profile mode requires restart", .{});
-    }
+    return true;
 }
 
-/// Fan a warning to stderr (Console.app for `.app`, terminal for
-/// `just run`) AND to the agent log pane so users running the bundle
-/// — who typically don't watch Console.app — see the message in the
-/// already-open side panel. Bounded 256-byte format buffer; longer
-/// formats truncate. Caller-side: if the log append fails (OOM in
-/// AgentState's bounded ring), we still emitted on stderr.
+/// Ordinary host diagnostics; no activity-log subsystem.
 pub fn hostWarn(comptime fmt: []const u8, args: anytype) void {
-    var buf: [256]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, fmt, args) catch buf[0..0];
-    std.debug.print("{s}\n", .{msg});
-    if (app.g.agent.state) |st| st.appendLog(.warn, msg) catch {};
+    std.debug.print("djinn: " ++ fmt ++ "\n", args);
 }
 
 fn eqOptStr(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return std.mem.eql(u8, a.?, b.?);
-}
-
-fn eqOptU32(a: ?u32, b: ?u32) bool {
-    if (a == null and b == null) return true;
-    if (a == null or b == null) return false;
-    return a.? == b.?;
 }
 
 /// Probe djinn + ghostty config mtimes; return true when either
@@ -267,7 +175,7 @@ fn eqOptU32(a: ?u32, b: ?u32) bool {
 /// where the file is briefly missing fall through to
 /// `loadConfigWithRetry`'s ENOENT retries.
 fn configFilesChanged() bool {
-    const home = std.posix.getenv("HOME") orelse return true;
+    const home = platform.getenv("HOME") orelse return true;
     var djinn_buf: [512]u8 = undefined;
     var ghostty_buf: [512]u8 = undefined;
 
@@ -287,10 +195,10 @@ fn configFilesChanged() bool {
 }
 
 fn fileMtime(path: []const u8) ?i128 {
-    const file = std.fs.openFileAbsolute(path, .{}) catch return null;
-    defer file.close();
-    const stat = file.stat() catch return null;
-    return stat.mtime;
+    const file = std.Io.Dir.openFileAbsolute(platform.io(), path, .{}) catch return null;
+    defer file.close(platform.io());
+    const stat = file.stat(platform.io()) catch return null;
+    return stat.mtime.nanoseconds;
 }
 
 fn optI128Eq(a: ?i128, b: ?i128) bool {
@@ -308,7 +216,7 @@ fn optI128Eq(a: ?i128, b: ?i128) bool {
 fn loadConfigWithRetry(allocator: std.mem.Allocator) ?Config {
     var attempt: u8 = 0;
     while (attempt < 3) : (attempt += 1) {
-        if (attempt > 0) std.Thread.sleep(20 * std.time.ns_per_ms);
+        if (attempt > 0) platform.sleep(20 * std.time.ns_per_ms);
         if (Config.load(allocator)) |cfg| return cfg else |_| {}
     }
     return null;
@@ -320,19 +228,19 @@ fn loadConfigWithRetry(allocator: std.mem.Allocator) ?Config {
 /// temp file is annoying, not breaking, and we don't want to
 /// block startup on a /tmp permission glitch.
 fn reapDragDropTemps() void {
-    var dir = std.fs.openDirAbsolute("/tmp", .{ .iterate = true }) catch return;
-    defer dir.close();
-    const now = std.time.timestamp();
+    var dir = std.Io.Dir.openDirAbsolute(platform.io(), "/tmp", .{ .iterate = true }) catch return;
+    defer dir.close(platform.io());
+    const now = platform.timestamp();
     const max_age_s: i64 = 3600;
     var it = dir.iterate();
-    while (it.next() catch return) |entry| {
+    while (it.next(platform.io()) catch return) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.startsWith(u8, entry.name, "djinn-drop-")) continue;
         if (!std.mem.endsWith(u8, entry.name, ".png")) continue;
-        const stat = dir.statFile(entry.name) catch continue;
-        const mtime_s = @divTrunc(stat.mtime, std.time.ns_per_s);
+        const stat = dir.statFile(platform.io(), entry.name, .{}) catch continue;
+        const mtime_s = @divTrunc(stat.mtime.nanoseconds, std.time.ns_per_s);
         if (now - mtime_s < max_age_s) continue;
-        dir.deleteFile(entry.name) catch continue;
+        dir.deleteFile(platform.io(), entry.name) catch continue;
     }
 }
 
@@ -398,7 +306,7 @@ fn restoreWindowSize(allocator: std.mem.Allocator, cfg: *const Config, active_pr
 /// missing theme. Caller owns the returned Theme + must `deinit`.
 fn resolveTheme(allocator: std.mem.Allocator, cfg: *const Config, ghostty_cfg_opaque: ?*anyopaque) theme_mod.Theme {
     return theme_mod.resolve(allocator, .{
-        .inherit_ghostty_config = cfg.theme.inherit_ghostty,
+        .inherit_ghostty_config = true, // Runtime already decides whether user files are inherited.
         .ghostty_cfg = ghostty_cfg_opaque,
         .font_family = cfg.terminal.font_family,
         .font_size = cfg.terminal.font_size,
@@ -434,40 +342,18 @@ const NSRect = extern struct {
     size: extern struct { width: f64, height: f64 },
 };
 
+pub fn main(init: std.process.Init) !void {
+    platform.init(init.io);
+    // Registered first, so native producers/owners are torn down before
+    // their background tasks are joined and process startup destroys IO.
+    defer {
+        Notifier.shutdownSounds();
+        persist.shutdown();
+    }
+    const allocator = init.gpa;
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
-
-    // Reap stale drag-drop temp files left behind by previous
-    // sessions. tryDropImage writes the path into the surface as
-    // bracketed-paste immediately, so by the next launch the
-    // agent has already consumed any file it cared about — the
-    // remainder is just /tmp pollution. 1h grace window protects
-    // a file freshly dropped in a still-open session that gets
-    // restarted.
-    reapDragDropTemps();
-
-    // Tier-5 step 1: smoke-init the libghostty surface API. Sets
-    // ghostty's global state + std.os.argv. Failures log + bail
-    // because anything downstream (Tier-5 surface wiring) needs the
-    // global state present. Pre-Tier-5 features still work even if
-    // this fails — call `try` after we trust it.
-    ghostty_runtime.init() catch |err| {
-        std.debug.print("warning: ghostty_runtime.init failed ({}); continuing without surface API\n", .{err});
-    };
-
-    // Tier-5 step 2: stand up an App with stub callbacks. Confirms
-    // ghostty_app_new + config_new + runtime_config plumbing are
-    // reachable + don't crash on a default config. App handle is
-    // freed at process exit; nothing is wired into the view yet.
-    //
-    // setHost wires `&app.g` into ghostty's userdata channel so
-    // action callbacks can recover host state via
-    // `ghostty_app_userdata`. Must run before App.init (which copies
-    // the userdata pointer into runtime_config_s).
-    var args = try std.process.argsWithAllocator(allocator);
+    // Parse host CLI options before initializing the terminal runtime.
+    var args = try init.minimal.args.iterateAllocator(allocator);
     defer args.deinit();
     _ = args.skip();
 
@@ -477,23 +363,42 @@ pub fn main() !void {
         .exit_ok => return,
         .exit_err => std.process.exit(1),
     }
+    // Diagnostics must not load config, spawn a shell, or sync login items.
+    if (parsed_args.diagnose_hotkey) {
+        const keybinding = parsed_args.keybinding_override orelse (Config.HotkeyConfig{}).toggle;
+        const binding = parseKeybinding(keybinding) catch {
+            std.debug.print("error: invalid keybinding '{s}'\n", .{keybinding});
+            std.process.exit(1);
+        };
+        std.debug.print("hotkey diagnostic: binding={s}\n", .{keybinding});
+        if (!hotkey_mod.diagnose(allocator, binding.keycode, binding.modifiers)) std.process.exit(1);
+        return;
+    }
     const keybinding_override = parsed_args.keybinding_override;
-    const provider_override = parsed_args.provider_override;
 
     // Startup: missing file is fine (use defaults); any other error
     // surfaces so the user sees what's wrong instead of running with
-    // mystery defaults. Config owns its duped strings via an internal
-    // arena; `defer config.deinit()` releases whichever arena is in
-    // place at shutdown (original or most-recently-reloaded).
+    // mystery defaults.
     var config = Config.loadOrDefault(allocator) catch |err| {
         std.debug.print("error: config load failed: {}\n", .{err});
         std.process.exit(1);
     };
+
     defer config.deinit();
 
+    try ghostty_runtime.init();
+    app.g.config = &config;
+    app.g.allocator = allocator;
+    app.g.hotkey_override = keybinding_override;
     ghostty_runtime.setHost(&app.g);
     var ghostty_app_opt = ghostty_runtime.App.init(config.scrollback.size);
-    defer if (ghostty_app_opt) |*a| a.deinit();
+    defer {
+        app.g.ghostty.app = null;
+        app.g.ghostty.config = null;
+        if (ghostty_app_opt) |*a| a.deinit();
+    }
+    // Publish the owner before view attachment can trigger a theme reload.
+    if (ghostty_app_opt) |*ga| app.g.ghostty.app = ga else return error.GhosttyAppInitFailed;
     const keybinding = keybinding_override orelse config.hotkey.toggle;
 
     const binding = parseKeybinding(keybinding) catch {
@@ -506,23 +411,14 @@ pub fn main() !void {
     defer menubar.deinit();
     menubar.setShowHideHandler(&toggleCallback);
 
-    // Agent state — pushed by MCP tools, consumed by menubar (Phase 3.3) and
-    // log panel (Phase 3.4). Declared early so all consumers can reference it.
-    var agent_state = AgentState.init(allocator);
-    defer agent_state.deinit();
+    app.g.menubar = &menubar;
 
     const startup_profile = resolveStartupProfileName(&config);
     const dims = restoreWindowSize(allocator, &config, startup_profile);
     const w: f64 = @floatFromInt(dims.w);
     const h: f64 = @floatFromInt(dims.h);
 
-    // Resolve theme: ghostty config (if inherited) → djinn config overrides
-    // → system appearance fallback.
-    // Tier-5 step 9: when ghostty backend is live, hand the resolved
-    // ghostty_config_t to theme.resolve so the log_pane / menubar
-    // palette tracks the surface palette without a separate file
-    // re-parse. ghostty already loaded + finalized the config during
-    // App.init.
+    // Resolve host chrome from Ghostty's finalized configuration.
     const ghostty_cfg_opaque: ?*anyopaque = if (ghostty_app_opt) |*ga| @ptrCast(ga.config) else null;
     app.g.ghostty.config = ghostty_cfg_opaque;
     var theme = resolveTheme(allocator, &config, ghostty_cfg_opaque);
@@ -537,7 +433,10 @@ pub fn main() !void {
         std.debug.print("error: panel init failed: {}\n", .{err});
         std.process.exit(1);
     };
-    defer panel.deinit();
+    defer {
+        app.g.window.panel = null;
+        panel.deinit();
+    }
     app.g.window.panel = &panel;
     // Theme reloader (viewDidChangeEffectiveAppearance) needs a stable
     // pointer to the config + an allocator. Stash both before the view
@@ -572,9 +471,7 @@ pub fn main() !void {
     // blur, the panel itself is alpha-modulated and the terminal bg is opaque.
     const view_bg_alpha: f64 = if (blur) theme.opacity else 1.0;
 
-    // Active chrome style — derived once from the resolved theme. Find
-    // overlay + log pane both read this so host UI surfaces share one
-    // visual language. reapplyTheme rebuilds + reskins both on flips.
+    // Find and tab chrome follow the terminal theme.
     const chrome_style = @import("chrome.zig").Style.fromTheme(theme);
     app.g.theme.chrome_style = chrome_style;
 
@@ -589,36 +486,15 @@ pub fn main() !void {
     // without touching AppKit on each keystroke.
     tis.install();
 
-    // Build side log panel and wrap both in an NSSplitView (terminal left, log right).
-    // Log uses opaque bg + theme palette colors so contrast inherits the
-    // user's ghostty theme aesthetic.
-    var log_view = LogView.init(
-        layout.computeLogWidth(w, &config),
-        h,
-        chrome_style,
-    ) catch |err| {
-        std.debug.print("error: log view init failed: {}\n", .{err});
-        std.process.exit(1);
-    };
-    // SessionManager — one Session per declared profile (or one
-    // synthesized "default" for legacy configs that only set
-    // `provider`). `--provider` CLI override mutates config.provider
-    // BEFORE init so the synthesized default picks it up; explicitly
-    // declared profiles ignore it (override has no profile name to
-    // target). Warn the user when both are present so the silent
-    // drop doesn't surprise them.
-    if (provider_override) |name| {
-        config.provider.name = name;
-        if (config.profiles.entries.len > 0) {
-            std.debug.print("warning: --provider override has no effect when `profile.*` keys are configured; ignoring '{s}'\n", .{name});
-        }
-    }
     const session_mod = @import("session/manager.zig");
     var session_manager = session_mod.SessionManager.init(allocator, &config) catch |err| {
         std.debug.print("error: session manager init failed: {}\n", .{err});
         std.process.exit(1);
     };
-    defer session_manager.deinit();
+    defer {
+        app.g.session_manager = null;
+        session_manager.deinit();
+    }
     app.g.session_manager = &session_manager;
 
     // One surface_host NSView per session. All siblings, same frame,
@@ -641,13 +517,7 @@ pub fn main() !void {
     const surface_host = objc.Object.fromId(active_host_id);
     app.g.layout.surface_host_id = active_host_id;
 
-    // Always build the dual-pane container so the runtime toggle
-    // (Cmd+/ → toggle_log_pane) only flips visibility, no view-tree
-    // rebuild. When log_pane.enabled = false at startup we hide the
-    // log column and grow the terminal to fill via setLogPaneHidden.
-    // MCP `djinn_log` calls always update AgentState; the log view
-    // observes regardless of visibility so reopening shows backlog.
-    const container = layout.buildContainer(w, h, &config, view.view, log_view.view, surface_host);
+    const container = layout.buildContainer(w, h, &config, view.view, surface_host);
     app.g.layout.container_id = container.value;
 
     // Slot the inactive surface_hosts in as siblings of the active host,
@@ -674,27 +544,19 @@ pub fn main() !void {
     // it to TerminalView explicitly — that's the view that owns
     // keyDownImpl + the responder-chain wiring.
     _ = panel.ns_panel.msgSend(c_int, "makeFirstResponder:", .{view.view});
-    view.observeLog(&log_view);
-    if (!config.log_pane.enabled) view_mod.setLogPaneHidden(true);
 
     const grid = view.gridSize(w, h);
-
-    // The legacy `provider` / `provider-command` resolution moved into
-    // SessionManager.init — `cmd` here is the active session's
-    // resolved spawn command.
-    const cmd = active_session.profile.command;
 
     // chdir + sync PWD env so the spawned shell starts at $HOME
     // instead of `/` when djinn is launched via `open Djinn.app`
     // (LaunchServices sets both cwd and PWD to `/` for GUI apps).
     // Best-effort — silent skip if HOME isn't set.
-    if (std.posix.getenv("HOME")) |home| {
-        std.posix.chdir(home) catch {};
-        const home_z = allocator.dupeZ(u8, home) catch null;
+    if (platform.getenv("HOME")) |home| {
+        std.process.setCurrentPath(platform.io(), home) catch {};
+        const home_z = allocator.dupeSentinel(u8, home, 0) catch null;
         if (home_z) |hz| {
             _ = libc_setenv("PWD", hz.ptr, 1);
-            // Leak intentionally — env value lives until process exit
-            // and libc may keep the pointer; freeing would dangle.
+            allocator.free(hz); // setenv copies the value.
         }
     }
 
@@ -703,7 +565,7 @@ pub fn main() !void {
     // come from ghostty's resolved Config (theme.resolve already pushed
     // them into our Theme struct, but the surface reads its own copy).
     view.attach();
-    view.observeAgent(&agent_state, &menubar);
+    menubar.refresh();
 
     // Persistent ghostty surface bound to `surface_host`. ghostty owns
     // the visible terminal area: its surface_new flips setWantsLayer
@@ -714,7 +576,7 @@ pub fn main() !void {
     var ghostty_surface_handle: ?ghostty_runtime.c.ghostty_surface_t = null;
     if (ghostty_app_opt) |*ga| {
         app.g.ghostty.app = ga;
-        ghostty_surface_handle = surface_lifecycle.bindGhosttySurface(allocator, active_session, ga, surface_host, cmd, active_session.profile.cwd) orelse {
+        ghostty_surface_handle = surface_lifecycle.bindGhosttySurface(allocator, ga, surface_host, active_session) orelse {
             std.debug.print("error: ghostty surface_new returned null\n", .{});
             std.process.exit(1);
         };
@@ -730,113 +592,35 @@ pub fn main() !void {
     // bound are skipped (s.surface = null).
     defer {
         if (ghostty_app_opt) |*ga| {
-            for (session_manager.sessions.items) |sess| {
-                if (sess.surface) |sp| ga.surfaceFree(@ptrCast(sp));
-            }
+            _ = ga;
+            for (session_manager.sessions.items) |*sess| surface_lifecycle.destroySession(sess);
         }
     }
 
     applyKeymapOverrides(&config);
 
-    // Soft-fail on Accessibility denial. After a fresh install, the
-    // bundle's signature differs from the prior copy in TCC's database,
-    // so CGEventTap install raises a TCC prompt asynchronously and the
-    // first call returns an error. Hard-exiting here makes the app die
-    // before macOS can show the prompt — users see Djinn.app launch
-    // and immediately quit, with no path forward. Falling through lets
-    // the menubar click + the TCC prompt take over; once the user
-    // grants permission and relaunches, the hotkey lights up.
-    var hotkey_storage: Hotkey = undefined;
-    var hotkey_active: bool = false;
-    if (Hotkey.init(binding.keycode, binding.modifiers, &toggleCallback)) |hk| {
-        hotkey_storage = hk;
-        hotkey_active = true;
-        app.g.hotkey = &hotkey_storage;
-    } else |err| {
+    // Register just the toggle shortcut; this does not require Accessibility.
+    // Conflicts must not take down the terminal or menubar. Config reload can
+    // retry with a different binding if startup registration failed.
+    app.g.hotkey = Hotkey.init(allocator, binding.keycode, binding.modifiers, &toggleCallback) catch |err| blk: {
+        // A disabled status item plus a rejected shortcut must not strand
+        // a hidden LSUIElement app. This fallback never rewrites config.
+        menubar.setEnabled(true);
         std.debug.print(
-            "warning: global hotkey failed ({}); System Settings → Privacy & Security → Accessibility → enable Djinn, then relaunch. Menubar click still toggles the panel.\n",
-            .{err},
+            "warning: cannot register global hotkey '{s}' ({}); quit other Djinn instances or choose another binding. Menubar show/hide remains available.\n",
+            .{ keybinding, err },
         );
-    }
-    defer if (hotkey_active) hotkey_storage.deinit();
-
-    // MCP HTTP server. Gated on `mcp-enabled`; when off, the ToolTable
-    // and Dispatcher still build (cheap, harmless) but no socket binds
-    // and no accept thread spawns — and ~/.config/djinn/mcp.json isn't
-    // touched, so stale endpoint info from a previous run isn't left
-    // pointing at a port nothing's listening on.
-    notifier.rate_limit_ms = config.notifications.rate_limit_ms;
-    var tools = ToolTable{
-        .state = &agent_state,
-        .notifier = &notifier,
-        .attention_sound = config.notifications.attention_sound,
-        .notify_on_attention = config.notifications.notify_on_attention,
-        .notify_on_error = config.notifications.notify_on_error,
-        .notify_on_done = config.notifications.notify_on_done,
-        .notify_on_progress = config.notifications.notify_on_progress,
-        // ToolTable used to read `app.g.config` and `app.g.session_manager`
-        // through the darwin-only `src/app.zig` global. Those reads were
-        // moved onto these fields so the same struct works on linux
-        // (which has no app.zig). Wiring them here keeps the darwin
-        // runtime behavior bit-identical.
-        .config = &config,
-        .session_manager = &session_manager,
+        break :blk null;
     };
-    app.g.tool_table = &tools;
-    var dispatcher = Dispatcher{ .tool_table = tools.table() };
-    var mcp_server_opt: ?McpServer = null;
-    if (config.mcp.enabled) {
-        mcp_server_opt = McpServer.init(allocator, dispatcher.handler()) catch |err| {
-            std.debug.print("warning: MCP server init failed: {}\n", .{err});
-            std.process.exit(1);
-        };
-    }
-    defer if (mcp_server_opt) |*s| s.deinit();
-
-    if (mcp_server_opt) |*s| {
-        writeMcpEndpointInfo(allocator, s.port, s.token) catch |err| {
-            std.debug.print("warning: failed to write MCP endpoint info: {}\n", .{err});
-        };
-        const mcp_thread = try std.Thread.spawn(.{}, McpServer.run, .{s});
-        mcp_thread.detach();
+    defer {
+        if (app.g.hotkey) |*hk| hk.deinit();
+        app.g.hotkey = null;
     }
 
-    var mcp_label_buf: [40]u8 = undefined;
-    const mcp_label: []const u8 = if (mcp_server_opt) |s|
-        std.fmt.bufPrint(&mcp_label_buf, "http://127.0.0.1:{d}", .{s.port}) catch "?"
-    else
-        "disabled";
-    std.debug.print(
-        "djinn running (provider: {s}, hotkey: {s}, grid: {d}x{d}, font: \"{s}\" @ {d:.1}pt, cell: {d:.0}x{d:.0}, mcp: {s})\n",
-        .{
-            config.provider.name,
-            keybinding,
-            grid.cols,
-            grid.rows,
-            theme.font_family,
-            theme.font_size,
-            view.cell_w,
-            view.cell_h,
-            mcp_label,
-        },
-    );
-
-    // Seed the log panel so it isn't empty on first launch — gives users a
-    // visible signal that the side panel is wired up before any agent
-    // connects. Three separate entries so the same-client grouping reads
-    // as one block under a single header instead of one long mid-token-
-    // wrapping line joined by `·`.
-    {
-        agent_state.appendLog(.info, "djinn ready") catch {};
-        if (mcp_server_opt) |s| {
-            var mcp_msg: [64]u8 = undefined;
-            const m = std.fmt.bufPrint(&mcp_msg, "MCP at 127.0.0.1:{d}", .{s.port}) catch "MCP up";
-            agent_state.appendLog(.info, m) catch {};
-        } else {
-            agent_state.appendLog(.info, "MCP disabled") catch {};
-        }
-        agent_state.appendLog(.info, "waiting for agents") catch {};
-    }
+    notifier.rate_limit_ms = config.notifications.rate_limit_ms;
+    std.debug.print("djinn running (hotkey: {s}, registered: {}, profiles: {d}, grid: {d}x{d})\n", .{
+        keybinding, app.g.hotkey != null, session_manager.count(), grid.cols, grid.rows,
+    });
 
     // Defer login-item sync (SMAppService XPC) + FSEventStream setup
     // until the run loop starts pumping. Neither is on the path to
@@ -850,18 +634,19 @@ pub fn main() !void {
 }
 
 test {
+    _ = @import("cli.zig");
     _ = @import("hotkey/darwin.zig");
     _ = @import("config.zig");
     _ = @import("notify/darwin.zig");
     _ = @import("notify/menubar.zig");
-    _ = @import("mcp/server.zig");
-    _ = @import("mcp/tools.zig");
-    _ = @import("agent/state.zig");
-    _ = @import("agent/log_view.zig");
     _ = @import("theme/theme.zig");
     _ = @import("state/persist.zig");
     _ = @import("chrome.zig");
-    _ = @import("mcp/dispatch.zig");
     _ = @import("session/manager.zig");
     _ = @import("terminal/keymap.zig");
+    _ = @import("terminal/find.zig");
+    _ = @import("terminal/view.zig");
+    _ = @import("window/panel.zig");
+    _ = @import("ghostty/surface_lifecycle.zig");
+    _ = @import("ghostty/runtime.zig");
 }

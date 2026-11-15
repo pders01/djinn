@@ -36,26 +36,26 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install Zig 0.15.2
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.15.2
+      # Locked Zig 0.17.1 + SDK 26.5; host Xcode runs Metal tools only.
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
 
       - name: Ensure Metal Toolchain
         # See ci.yml for the rationale on the xcode-select swap +
-        # `xcrun --find metal` probe before falling back to
+        # real Metal compiler probe before falling back to
         # `-downloadComponent`.
         run: |
-          newest_xcode=$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)
-          if [ -n "$newest_xcode" ]; then
+          xcode_paths=(/Applications/Xcode_*.app)
+          newest_xcode=$(printf '%s\n' "${xcode_paths[@]}" | sort -V | tail -1)
+          if [ -d "$newest_xcode" ]; then
             echo "Selecting $newest_xcode"
             sudo xcode-select -s "$newest_xcode"
           fi
-          if xcrun --find metal >/dev/null 2>&1; then
-            echo "Metal compiler at $(xcrun --find metal)"
-          else
-            sudo xcodebuild -downloadComponent MetalToolchain
+          if ! xcrun -sdk macosx metal --version; then
+            xcodebuild -downloadComponent MetalToolchain
           fi
+          # Finding the launcher is not enough; confirm the toolchain runs.
+          xcrun -sdk macosx metal --version
 
       - name: Cache zig packages
         uses: actions/cache@v4
@@ -66,7 +66,7 @@ jobs:
             zig-${{ runner.os }}-${{ runner.arch }}-
 
       - name: Build signed Djinn.app (ad-hoc)
-        run: ./scripts/build.sh bundle-sign
+        run: nix develop --command ./scripts/build.sh bundle-sign
 
       - name: Verify bundle metadata
         run: |
@@ -74,13 +74,8 @@ jobs:
             zig-out/Djinn.app/Contents/Info.plist
           codesign --verify --verbose=2 zig-out/Djinn.app
 
-      - name: Verify dylib linkage
-        run: |
-          otool -L zig-out/Djinn.app/Contents/MacOS/djinn | grep -q '@rpath/libghostty.dylib' \
-            || { echo "::error::libghostty not linked via @rpath"; exit 1; }
-          otool -l zig-out/Djinn.app/Contents/MacOS/djinn | grep -A2 LC_RPATH | grep -q '@loader_path' \
-            || { echo "::error::@loader_path missing from LC_RPATH"; exit 1; }
-          zig-out/Djinn.app/Contents/MacOS/djinn --version
+      - name: Verify self-contained signed bundle
+        run: ./scripts/verify-bundle.sh
 
       - name: Package release artifacts
         # `pre-release` tag is the stable label users pin to; the
@@ -195,10 +190,10 @@ jobs:
           sudo cp -a "$HOME/gtk4-layer-shell-prefix/." /
           sudo ldconfig
 
-      - name: Install Zig 0.15.2
+      - name: Install Zig 0.17.1
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.17.1
 
       - name: Cache zig packages
         uses: actions/cache@v4
@@ -208,10 +203,14 @@ jobs:
           restore-keys: |
             zig-${{ runner.os }}-${{ runner.arch }}-
 
+      - name: Check Linux host and unit suite
+        run: ./scripts/build.sh check test
+
       - name: Build + stage tarball
         run: |
           OUT="djinn-pre-release-x86_64-linux"
-          zig build install -Doptimize=ReleaseSafe --prefix "${OUT}"
+          # Stage optional launch files, but never enable/start the user unit.
+          ./scripts/build.sh install -Doptimize=ReleaseSafe -Dsystem-install=true --prefix "${OUT}"
           cp LICENSE NOTICES.md README.md "${OUT}/"
           tar -czf "${OUT}.tar.gz" "${OUT}"
           # coreutils on Linux ships `sha256sum`; BSD's `shasum -a 256`

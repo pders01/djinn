@@ -8,10 +8,11 @@ linked artifacts.
 
 ### ghostty — `git+https://github.com/ghostty-org/ghostty`
 
+Pinned release: **1.4.0**; see `build.zig.zon` for the exact revision/hash.
 License: **MIT** (Copyright (c) 2024 Mitchell Hashimoto, Ghostty
 contributors).
 
-djinn links the full `libghostty.dylib`. The visible terminal area, the terminal
+On macOS, djinn links the full `libghostty.dylib`. The visible terminal area, the terminal
 config grammar, the per-action key encoder, the surface search API,
 and the bundled libghostty are all ghostty's work. Several djinn
 config conventions (the `key = value` file format, `keybind =
@@ -19,19 +20,17 @@ config conventions (the `key = value` file format, `keybind =
 appearance-aware split) are lifted from ghostty so users with a
 ghostty config can drop in.
 
-The redistributed `libghostty.dylib` carries its own transitive
-dependencies (libxev, vaxis, z2d, zig-js, uucode, simdutf, utfcpp,
-highway, sentry, harfbuzz, freetype, libpng, oniguruma, wuffs, zlib,
-glslang, spirv-cross). Their licenses ship inside the ghostty source
-tree under `pkg/<dep>/LICENSE`. djinn does not extract or restate
-them here — when distributing the bundled `Djinn.app`, ship the
-`libghostty.dylib` license file alongside or point downstream users
-at the upstream ghostty repository.
+The redistributed `libghostty.dylib` includes transitive dependencies.
+The pinned Ghostty manifest, build graph, source tree, and extracted dependency
+packages identify their versions and license texts. This document is not a
+complete transitive-license inventory. Before public distribution, audit the
+actual linked code and bundled resources and include all required copyright
+and license notices; repository links alone do not replace those obligations.
 
-A small darwin-only patch (`patches/ghostty-001-darwin-install.patch`)
-is applied to ghostty's `build.zig` to remove an upstream install
-guard that hides `dep.artifact("ghostty")` on macOS. The patch is
-~10 lines and removes a guard rather than adding logic.
+A small Darwin-only patch (`patches/ghostty-001-darwin-install.patch`)
+registers the full shared renderer artifact in Ghostty's `build.zig`, making
+`dep.artifact("ghostty")` available on macOS. It is applied only to this
+checkout's extracted dependency, not a shared source cache.
 
 ### zig-objc — `git+https://github.com/mitchellh/zig-objc`
 
@@ -40,14 +39,14 @@ License: **MIT** (Copyright (c) 2023 Mitchell Hashimoto).
 Provides the `objc.Class` / `objc.Object` / `msgSend` primitives djinn
 uses everywhere a Cocoa class is touched (NSPanel, NSStatusItem,
 NSTextField, NSCursor, the registered `DjinnTerminalView` /
-`DjinnChipCell` / `DjinnDivider` subclasses, …).
+`DjinnTabStrip` subclasses, …).
 
 ## Toolchain
 
 ### Zig — <https://ziglang.org>
 
-License: **MIT**. djinn pins `0.15.2` as `minimum_zig_version` and
-ships a `flake.nix` exposing `pkgs.zig_0_15` for users without a
+License: **MIT**. djinn pins `0.17.1` as `minimum_zig_version` and
+ships a `flake.nix` exposing `pkgs.zig_0_17` for users without a
 compatible host toolchain.
 
 ### Apple platform frameworks
@@ -57,22 +56,16 @@ compatible host toolchain.
 Apple's macOS SDK / Xcode license. Not redistributed; resolved against
 the host system at build + run time.
 
-### Apple SF Symbols
+### Linux platform libraries
 
-The menubar non-idle states (`arrow.triangle.2.circlepath`,
-`exclamationmark.triangle.fill`, `checkmark.circle.fill`,
-`xmark.octagon.fill`) render Apple's SF Symbols glyphs. Use is
-permitted within an app's UI under the SF Symbols license. The
-glyphs are not redistributed in the repo or the `.icns`; macOS
-resolves them at runtime from the system font.
+The Linux backend uses **GTK4**, **VTE (GTK4)**, **gtk4-layer-shell**, and
+**GLib/GObject/GIO**, with their native dependencies such as Pango/Cairo.
+These are system-linked libraries under their respective upstream licenses,
+not the Ghostty renderer or Apple frameworks. Consult the exact versions'
+license texts and distribution metadata when packaging. The transitive
+notice/license audit remains required before public distribution.
 
 ## Specifications
-
-### Model Context Protocol (MCP) — Anthropic
-
-djinn implements an MCP HTTP server. The protocol is open; no formal
-attribution is required, but credit goes to Anthropic for publishing
-the spec.
 
 ### Quake-drop terminal idiom
 

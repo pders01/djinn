@@ -1,5 +1,5 @@
 [Unit]
-Description=djinn drop-down terminal panel + MCP agent surface
+Description=djinn drop-down terminal (GTK4/VTE)
 Documentation=https://github.com/derscheid/djinn
 
 # Wait for the graphical session to be up before launching — djinn
@@ -10,9 +10,9 @@ Documentation=https://github.com/derscheid/djinn
 # workspace.service / gnome-session-x11.target / sway-session.target
 # all populate it). Hyprland and bare sway/wlroots compositors that
 # don't run through `uwsm`, `niri-session`, or a similar session
-# manager need to `systemctl --user start graphical-session.target`
-# manually (or use `wantedBy=default.target` instead — see the
-# README "Linux (Wayland) → systemd user unit" section).
+# manager must arrange their graphical session environment themselves.
+# This unit is optional: no package enables or starts it automatically.
+# See share/doc/djinn/packaging.md for opt-in launch instructions.
 After=graphical-session.target
 PartOf=graphical-session.target
 
@@ -29,8 +29,9 @@ StartLimitIntervalSec=30s
 Type=simple
 
 # Hardcoded to /usr/bin/djinn — matches the canonical install path
-# the Arch / Debian / nix packages use (`--prefix /usr` or its
-# equivalent). Manual installs to /usr/local should drop their own
+# the Arch / Debian packages use (`--prefix /usr`). Nix substitutes
+# its output path at packaging time. Manual installs to /usr/local
+# should drop their own
 # copy of this file into /usr/local/lib/systemd/user/ with the
 # ExecStart adjusted.
 ExecStart=/usr/bin/djinn

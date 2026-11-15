@@ -22,6 +22,64 @@ const NSRect = extern struct { origin: NSPoint, size: NSSize };
 
 var g_chip_cell_class_registered: bool = false;
 
+/// Append a complete-codepoint prefix that fits. The existing buffer must
+/// contain valid UTF-8. Reject the entire input if it is invalid or contains
+/// control characters (including embedded NULs), rather than searching a
+/// misleading prefix of clipboard/binary data. No allocation or AppKit state.
+fn validQueryText(text: []const u8) bool {
+    const utf8 = std.unicode.Utf8View.init(text) catch return false;
+    var it = utf8.iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (cp < 0x20 or (cp >= 0x7f and cp <= 0x9f)) return false;
+    }
+    return true;
+}
+
+pub fn appendQueryBuffer(buffer: []u8, len: *usize, text: []const u8) bool {
+    if (!validQueryText(text)) return false;
+    const room = buffer.len - len.*;
+    var take: usize = 0;
+    while (take < text.len) {
+        const width = std.unicode.utf8ByteSequenceLength(text[take]) catch unreachable;
+        if (width > room - take) break;
+        take += width;
+    }
+    if (take == 0) return false;
+    @memcpy(buffer[len.* .. len.* + take], text[0..take]);
+    len.* += take;
+    return true;
+}
+
+/// Synchronously copy a start_search needle. Null opens an empty overlay or
+/// preserves an already-open query. An explicit needle replaces even an open
+/// query; oversized valid text is clipped at a UTF-8 boundary. Malformed/control
+/// input is rejected in FULL (including beyond capacity), preserving an open
+/// query and issuing no search. True means issue search, including empty text.
+fn applyStartSearchQuery(buffer: []u8, len: *usize, was_open: bool, needle: ?[]const u8) bool {
+    if (!was_open) len.* = 0;
+    const text = needle orelse return false;
+    if (!validQueryText(text)) return false;
+    len.* = 0;
+    _ = appendQueryBuffer(buffer, len, text);
+    return true;
+}
+
+/// Remove one Unicode scalar value, not one byte. Grapheme clusters may
+/// require multiple backspaces; the buffer always remains valid UTF-8.
+pub fn backspaceQueryBuffer(buffer: []const u8, len: *usize) bool {
+    if (len.* == 0) return false;
+    len.* -= 1;
+    while (len.* > 0 and (buffer[len.*] & 0xc0) == 0x80) len.* -= 1;
+    return true;
+}
+
+/// Shared keyboard/clipboard query input. Rejected input never reaches the
+/// terminal, and a full buffer does not issue a redundant search action.
+pub fn appendText(text: []const u8) void {
+    if (!app.g.find.mode) return;
+    if (appendQueryBuffer(&app.g.find.query_buf, &app.g.find.query_len, text)) pushNeedle();
+}
+
 /// Pump a ghostty binding action ("start_search", "end_search",
 /// "search:foo", "navigate_search:next"). Local copy so the find
 /// module doesn't have to back-import view.zig; the call surface is
@@ -117,6 +175,7 @@ pub fn updateCountLabel() void {
     const NSAttributedString = objc.getClass("NSMutableAttributedString") orelse return;
     const root_alloc = NSAttributedString.msgSend(objc.Object, "alloc", .{});
     const root = root_alloc.msgSend(objc.Object, "init", .{});
+    if (root.value == null) return;
     // alloc/init owned by us; setAttributedStringValue copies the
     // string into the field's cell, so we release after the set.
     defer root.msgSend(void, "release", .{});
@@ -172,13 +231,16 @@ fn appendFindRun(root: objc.Object, text: []const u8, color: chrome_mod.Rgb, sty
     const NSFont = objc.getClass("NSFont") orelse return;
     const NSParagraphStyle = objc.getClass("NSMutableParagraphStyle") orelse return;
 
-    var stack: [257]u8 = undefined;
-    const take = @min(text.len, stack.len - 1);
-    @memcpy(stack[0..take], text[0..take]);
-    stack[take] = 0;
-    const ns_text = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, &stack)});
+    // Length-based conversion avoids truncating UTF-8 or embedded NULs.
+    // Invalid input can still fail conversion: never pass nil to an
+    // attributed-string initializer (it raises an AppKit exception).
+    const ns_text = NSString.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "initWithBytes:length:encoding:", .{
+        text.ptr, @as(c_ulong, @intCast(text.len)), @as(c_ulong, 4), // NSUTF8StringEncoding
+    });
+    if (ns_text.value == null) return;
+    defer ns_text.msgSend(void, "release", .{});
 
-    const font = chrome_mod.chromeFont(NSFont, style.font_family, style.font_size_chip);
+    const font = chrome_mod.chromeFont(NSFont, style.font_size_chip);
     const ns_color = chrome_mod.nsColorFromRgb(NSColor, color);
 
     // NSCenterTextAlignment = 2. NSTextField paints the cell vertically
@@ -195,6 +257,8 @@ fn appendFindRun(root: objc.Object, text: []const u8, color: chrome_mod.Rgb, sty
     const fg_key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "NSColor")});
     const font_key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "NSFont")});
     const para_key = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, "NSParagraphStyle")});
+    if (fg_key.value == null or font_key.value == null or para_key.value == null or
+        ns_color.value == null or font.value == null or para.value == null) return;
     const objects = [_]objc.c.id{ ns_color.value, font.value, para.value };
     const keys = [_]objc.c.id{ fg_key.value, font_key.value, para_key.value };
     const dict = NSDictionary.msgSend(
@@ -203,8 +267,10 @@ fn appendFindRun(root: objc.Object, text: []const u8, color: chrome_mod.Rgb, sty
         .{ &objects, &keys, @as(c_ulong, 3) },
     );
 
+    if (dict.value == null) return;
     const attr_alloc = NSAttributedString.msgSend(objc.Object, "alloc", .{});
     const attr = attr_alloc.msgSend(objc.Object, "initWithString:attributes:", .{ ns_text, dict });
+    if (attr.value == null) return;
     defer attr.msgSend(void, "release", .{});
     root.msgSend(void, "appendAttributedString:", .{attr});
 }
@@ -213,7 +279,7 @@ fn appendFindRun(root: objc.Object, text: []const u8, color: chrome_mod.Rgb, sty
 /// before updateCountLabel pushes the styled attributed value.
 fn applyFindOverlayFont(tf: objc.Object, style: chrome_mod.Style) void {
     const NSFont = objc.getClass("NSFont") orelse return;
-    tf.msgSend(void, "setFont:", .{chrome_mod.chromeFont(NSFont, style.font_family, style.font_size_chip)});
+    tf.msgSend(void, "setFont:", .{chrome_mod.chromeFont(NSFont, style.font_size_chip)});
 }
 
 /// Reskin the find-overlay chip after a theme reload. Layer bg + font
@@ -284,9 +350,9 @@ fn pushNeedle() void {
     @memcpy(buf[0..prefix.len], prefix);
     const n = app.g.find.query_len;
     @memcpy(buf[prefix.len .. prefix.len + n], app.g.find.query_buf[0..n]);
-    forwardBindingAction(buf[0 .. prefix.len + n]);
     app.g.find.total = null;
     app.g.find.selected = null;
+    forwardBindingAction(buf[0 .. prefix.len + n]);
     updateCountLabel();
 }
 
@@ -300,20 +366,18 @@ fn enterMode() void {
     forwardBindingAction("start_search");
 }
 
-fn exitMode(end_search: bool) void {
-    if (!app.g.find.mode) return;
-    app.g.find.mode = false;
-    app.g.find.query_len = 0;
-    app.g.find.total = null;
-    app.g.find.selected = null;
-    updateCountLabel();
-    if (end_search) {
-        // end_search calls Search.deinit which joins the search thread.
-        // The thread's defer-block fires `.quit` via the event callback,
-        // which surface routes through its mailbox to clear renderer
-        // highlights. So this single call covers both teardown + clear.
-        forwardBindingAction("end_search");
-    }
+/// End search on the CURRENT global surface and clear all overlay state.
+/// Lifecycle callers must invoke this BEFORE switching or destroying the
+/// active surface, so end_search reaches the old search owner.
+pub fn endSearch() void {
+    const was_open = app.g.find.mode;
+    closeOverlayUiOnly();
+    // end_search calls Search.deinit which joins the search thread.
+    // The thread's defer-block fires `.quit` via the event callback,
+    // which surface routes through its mailbox to clear renderer
+    // highlights. This is safe even if UI state was already closed.
+    forwardBindingAction("end_search");
+    if (!was_open) return;
     // Re-anchor first responder on the terminal view. The end_search
     // path blocks main on Search.deinit's thread.join; AppKit can
     // shuffle event/responder state during that pause and stop
@@ -330,7 +394,6 @@ fn exitMode(end_search: bool) void {
 /// Public UI-sync entry point for ghostty's end_search action.
 /// Hides UI without re-emitting the binding (would recurse).
 pub fn closeOverlayUiOnly() void {
-    if (!app.g.find.mode) return;
     app.g.find.mode = false;
     app.g.find.query_len = 0;
     app.g.find.total = null;
@@ -338,46 +401,30 @@ pub fn closeOverlayUiOnly() void {
     updateCountLabel();
 }
 
-/// Public UI-sync entry point for ghostty's start_search action.
-pub fn openOverlayUiOnly() void {
-    if (app.g.find.mode) return;
+/// Handle Ghostty's borrowed start_search payload without re-emitting
+/// start_search (which would recurse). search_selection frees it on return.
+pub fn startSearchFromGhostty(needle: ?[]const u8) void {
+    const was_open = app.g.find.mode;
+    const search = applyStartSearchQuery(&app.g.find.query_buf, &app.g.find.query_len, was_open, needle);
     app.g.find.mode = true;
-    app.g.find.query_len = 0;
-    updateCountLabel();
+    if (!was_open) {
+        app.g.find.total = null;
+        app.g.find.selected = null;
+    }
+    if (search) pushNeedle() else updateCountLabel();
+}
+
+/// UI-only opener retained for callers without a search payload.
+pub fn openOverlayUiOnly() void {
+    startSearchFromGhostty(null);
 }
 
 pub fn actionOpen() void {
     if (app.g.find.mode) {
-        exitMode(true);
+        endSearch();
         return;
     }
     enterMode();
-}
-
-/// Drop the last byte from the needle buffer. Returns whether the
-/// buffer actually shrank (false on empty needle). Split out so the
-/// state-machine half of `handleKey` is exercised by unit tests
-/// without spinning Cocoa.
-pub fn backspaceNeedle() bool {
-    if (app.g.find.query_len == 0) return false;
-    app.g.find.query_len -= 1;
-    return true;
-}
-
-/// Append printable text to the needle buffer, bounded by remaining
-/// room. Filters out single control chars (< 0x20) the way AppKit
-/// delivers Tab / Ctrl combos through `event.characters`. Returns
-/// whether the buffer grew. Split out for the same unit-test reason
-/// as `backspaceNeedle`.
-pub fn appendChars(s: []const u8) bool {
-    if (s.len == 0) return false;
-    if (s.len == 1 and s[0] < 0x20) return false;
-    const room = app.g.find.query_buf.len - app.g.find.query_len;
-    if (room == 0) return false;
-    const take = @min(s.len, room);
-    @memcpy(app.g.find.query_buf[app.g.find.query_len .. app.g.find.query_len + take], s[0..take]);
-    app.g.find.query_len += take;
-    return true;
 }
 
 /// Handle a keystroke while find_mode is active. Caller (keyDownImpl)
@@ -386,13 +433,13 @@ pub fn appendChars(s: []const u8) bool {
 pub fn handleKey(event: objc.Object, keycode: u16) void {
     // Esc / Return — exit, clear highlights.
     if (keycode == 53 or keycode == 36 or keycode == 76) {
-        exitMode(true);
+        endSearch();
         return;
     }
     // Backspace — shrink needle. Re-pushes (empty needle stops search
     // per ghostty semantics, but UI stays in find mode).
     if (keycode == 51) {
-        if (backspaceNeedle()) pushNeedle();
+        if (backspaceQueryBuffer(&app.g.find.query_buf, &app.g.find.query_len)) pushNeedle();
         return;
     }
     // Append printable text from event.characters.
@@ -401,7 +448,11 @@ pub fn handleKey(event: objc.Object, keycode: u16) void {
     const chars_ptr = chars_obj.msgSend([*c]const u8, "UTF8String", .{});
     if (chars_ptr == null) return;
     const s = std.mem.sliceTo(chars_ptr, 0);
-    if (appendChars(s)) pushNeedle();
+    if (s.len == 0) return;
+    // AppKit encodes arrows/function keys in this private-use range;
+    // they aren't query text. Control/binary rejection is shared with paste.
+    if (s.len == 3 and s[0] == 0xef and s[1] >= 0x9c and s[1] <= 0xa3) return;
+    appendText(s);
 }
 
 pub fn actionNext() void {
@@ -412,52 +463,101 @@ pub fn actionPrev() void {
     forwardBindingAction("navigate_search:previous");
 }
 
-// Tests --------------------------------------------------------------
-//
-// Pure state machine on `app.g.find.query_*`. Each test resets the
-// global needle slot up-front so ordering between tests is moot
-// (Zig test runners share process state).
-
-fn resetFindState() void {
-    app.g.find.query_len = 0;
-    app.g.find.total = null;
-    app.g.find.selected = null;
+test "start_search synchronously replaces a query even when already open" {
+    var buffer: [16]u8 = undefined;
+    var len: usize = 0;
+    var borrowed = [_]u8{ 'n', 'e', 'w' };
+    try std.testing.expect(appendQueryBuffer(&buffer, &len, "old"));
+    try std.testing.expect(applyStartSearchQuery(&buffer, &len, true, &borrowed));
+    @memset(&borrowed, 'x');
+    try std.testing.expectEqualStrings("new", buffer[0..len]);
+    try std.testing.expect(!applyStartSearchQuery(&buffer, &len, true, null));
+    try std.testing.expectEqualStrings("new", buffer[0..len]);
+    try std.testing.expect(applyStartSearchQuery(&buffer, &len, true, ""));
+    try std.testing.expectEqual(@as(usize, 0), len);
+    try std.testing.expect(appendQueryBuffer(&buffer, &len, "stale"));
+    try std.testing.expect(!applyStartSearchQuery(&buffer, &len, false, null));
+    try std.testing.expectEqual(@as(usize, 0), len);
 }
 
-test "find: appendChars grows the needle and tracks length" {
-    resetFindState();
-    try std.testing.expect(appendChars("foo"));
-    try std.testing.expectEqual(@as(usize, 3), app.g.find.query_len);
-    try std.testing.expectEqualSlices(u8, "foo", app.g.find.query_buf[0..3]);
+test "start_search bounds valid UTF-8 and rejects malformed payloads in full" {
+    const text = "aé界😀";
+    for (0..text.len + 1) |capacity| {
+        var buffer: [16]u8 = undefined;
+        var len: usize = 0;
+        try std.testing.expect(applyStartSearchQuery(buffer[0..capacity], &len, false, text));
+        const expected: usize = if (capacity >= 10) 10 else if (capacity >= 6) 6 else if (capacity >= 3) 3 else if (capacity >= 1) 1 else 0;
+        try std.testing.expectEqual(expected, len);
+        try std.testing.expectEqualStrings(text[0..expected], buffer[0..len]);
+    }
+    for ([_][]const u8{ "a\xff", "\xc3", "\xed\xa0\x80", "abcde\xff", "abcde\n", "a\x00b", "\u{85}" }) |bad| {
+        var buffer: [4]u8 = undefined;
+        var len: usize = 0;
+        try std.testing.expect(appendQueryBuffer(&buffer, &len, "old"));
+        try std.testing.expect(!applyStartSearchQuery(&buffer, &len, true, bad));
+        try std.testing.expectEqualStrings("old", buffer[0..len]);
+        try std.testing.expect(!applyStartSearchQuery(&buffer, &len, false, bad));
+        try std.testing.expectEqual(@as(usize, 0), len);
+    }
 }
 
-test "find: appendChars rejects empty + single control bytes" {
-    resetFindState();
-    try std.testing.expect(!appendChars(""));
-    try std.testing.expect(!appendChars("\t"));
-    try std.testing.expect(!appendChars(&[_]u8{0x1b}));
-    try std.testing.expectEqual(@as(usize, 0), app.g.find.query_len);
+test "query append and backspace preserve complete UTF-8 codepoints" {
+    var buffer: [32]u8 = undefined;
+    var len: usize = 0;
+    try std.testing.expect(appendQueryBuffer(&buffer, &len, "aé界😀"));
+    try std.testing.expectEqualStrings("aé界😀", buffer[0..len]);
+    for ([_][]const u8{ "aé界", "aé", "a", "" }) |expected| {
+        try std.testing.expect(backspaceQueryBuffer(&buffer, &len));
+        try std.testing.expectEqualStrings(expected, buffer[0..len]);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(buffer[0..len]));
+    }
+    try std.testing.expect(!backspaceQueryBuffer(&buffer, &len));
 }
 
-test "find: appendChars saturates at buffer capacity" {
-    resetFindState();
-    const cap = app.g.find.query_buf.len;
-    var huge: [256]u8 = undefined;
-    @memset(&huge, 'x');
-    // First call fills the buffer.
-    try std.testing.expect(appendChars(huge[0..cap]));
-    try std.testing.expectEqual(cap, app.g.find.query_len);
-    // Second call has no room left.
-    try std.testing.expect(!appendChars("y"));
-    try std.testing.expectEqual(cap, app.g.find.query_len);
+test "query capacity truncates only between codepoints" {
+    const text = "aé界😀";
+    for (0..text.len + 2) |capacity| {
+        var buffer: [16]u8 = undefined;
+        var len: usize = 0;
+        _ = appendQueryBuffer(buffer[0..capacity], &len, text);
+        const expected_len: usize = if (capacity >= 10) 10 else if (capacity >= 6) 6 else if (capacity >= 3) 3 else if (capacity >= 1) 1 else 0;
+        try std.testing.expectEqual(expected_len, len);
+        try std.testing.expectEqualStrings(text[0..expected_len], buffer[0..len]);
+        try std.testing.expect(std.unicode.utf8ValidateSlice(buffer[0..len]));
+    }
+
+    var buffer: [5]u8 = undefined;
+    var len: usize = 0;
+    try std.testing.expect(appendQueryBuffer(&buffer, &len, "é"));
+    try std.testing.expect(!appendQueryBuffer(&buffer, &len, "😀"));
+    try std.testing.expect(appendQueryBuffer(&buffer, &len, "界"));
+    try std.testing.expect(!appendQueryBuffer(&buffer, &len, "x"));
+    try std.testing.expectEqualStrings("é界", buffer[0..len]);
+    try std.testing.expect(backspaceQueryBuffer(&buffer, &len));
+    try std.testing.expect(appendQueryBuffer(&buffer, &len, "abc"));
+    try std.testing.expectEqualStrings("éabc", buffer[0..len]);
 }
 
-test "find: backspaceNeedle shrinks one byte at a time and stops at empty" {
-    resetFindState();
-    try std.testing.expect(appendChars("ab"));
-    try std.testing.expect(backspaceNeedle());
-    try std.testing.expectEqual(@as(usize, 1), app.g.find.query_len);
-    try std.testing.expect(backspaceNeedle());
-    try std.testing.expectEqual(@as(usize, 0), app.g.find.query_len);
-    try std.testing.expect(!backspaceNeedle());
+test "query rejects invalid UTF-8 and binary or control input atomically" {
+    var buffer: [16]u8 = undefined;
+    var len: usize = 0;
+    try std.testing.expect(appendQueryBuffer(&buffer, &len, "ok"));
+    for ([_][]const u8{
+        "",      "x\x00y", "x\ny", "\t",       "\x7f",         "\u{85}",
+        "x\xff", "\xc3",   "\x80", "\xc0\xaf", "\xed\xa0\x80", "\xf4\x90\x80\x80",
+    }) |input| {
+        try std.testing.expect(!appendQueryBuffer(&buffer, &len, input));
+        try std.testing.expectEqualStrings("ok", buffer[0..len]);
+    }
+    // Invalid data beyond available capacity must not permit a valid prefix.
+    try std.testing.expect(!appendQueryBuffer(buffer[0..3], &len, "a\xff"));
+    try std.testing.expectEqualStrings("ok", buffer[0..len]);
+}
+
+test "query backspace treats combining marks as codepoints" {
+    var buffer: [8]u8 = undefined;
+    var len: usize = 0;
+    try std.testing.expect(appendQueryBuffer(&buffer, &len, "e\u{301}"));
+    try std.testing.expect(backspaceQueryBuffer(&buffer, &len));
+    try std.testing.expectEqualStrings("e", buffer[0..len]);
 }

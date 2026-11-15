@@ -1,528 +1,328 @@
-//! VTE-backed terminal widget.
-//!
-//! Wraps `VteTerminal` — a `GtkWidget` exposing a full terminal
-//! emulator (PTY, VT parser, scrollback, selection, IME, mouse,
-//! hyperlinks, font handling). VTE is the standard embeddable
-//! terminal on Linux; the macOS half of djinn uses ghostty's
-//! embeddable surface API for the same role. See the VTE-vs-ghostty
-//! tradeoff doc in the port history for why this asymmetry is
-//! deliberate rather than aspirational.
-//!
-//! Surface area is intentionally small: create the widget, spawn the
-//! user's shell as the child, expose the widget for embedding. Config
-//! translation (font, palette, cursor) lands in a follow-up pass —
-//! VTE configures via GObject properties rather than a config file, so
-//! mapping djinn's ghostty-format config keys is its own concern
-//! separate from the widget lifecycle.
-
+//! GTK4/VTE terminal. VTE owns rendering, PTY input, selection and IME.
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("../../io/platform.zig");
 const gtk = @import("gtk.zig");
 const dragdrop = @import("dragdrop.zig");
 const theme = @import("theme.zig");
-
 pub const ThemeOptions = theme.Options;
+const GtkWidget = gtk.GtkWidget;
+const VteTerminal = gtk.VteTerminal;
+const gpointer = gtk.gpointer;
 
-/// Per-session spawn payload. SessionManager resolves the command
-/// (script > command > provider > /bin/zsh) so VTE just exec's
-/// `command`; no argv splitting here. Tilde in cwd is NOT expanded
-/// (matches darwin) — users supply absolute paths or rely on the
-/// inherited cwd via `null`. When null is passed for the whole
-/// struct, Terminal falls back to $SHELL → /bin/sh resolution
-/// (legacy single-shell path; main_linux always passes a profile-
-/// derived Spawn once SessionHost lands).
 pub const Spawn = struct {
-    command: []const u8,
+    /// An unchanged shell expression. null means an ordinary interactive shell.
+    command: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
-    /// Resolved audible-bell state for this VTE: profile override
-    /// (`profile.<name>.bell-audible`) when set, else the global
-    /// `bell.audible` config. Applied via
-    /// `vte_terminal_set_audible_bell` so VTE's built-in BEL beep
-    /// honors per-profile mute. Visual bell is panel-wide and
-    /// handled outside the Terminal in `Panel.flashBell`.
     audible_bell: bool = true,
 };
 
-const GtkWidget = gtk.GtkWidget;
-const VteTerminal = gtk.VteTerminal;
-const GCancellable = gtk.GCancellable;
-const gpointer = gtk.gpointer;
-
-// Shared GLib signal externs live in gtk.zig now.
-const g_signal_connect_data = gtk.g_signal_connect_data;
-const g_signal_handler_disconnect = gtk.g_signal_handler_disconnect;
-
-/// Caller-supplied dispatch hook. Invoked on the GLib main thread when
-/// VTE emits `child-exited`, i.e. when the shell process the terminal
-/// hosts has terminated. The host typically flips a per-session exited
-/// bit so the chip dims and the user can hit Ctrl+R to revive; the
-/// panel itself stays up regardless of which session exited (matches
-/// the darwin path's "Press any key to close" semantics where ghostty
-/// owns the inline message).
-///
-/// `extra` is an opaque caller-defined payload that comes back through
-/// the callback. Terminal stores whatever the caller put in here and
-/// hands it back verbatim — no semantics imposed at this layer. Use
-/// case: a host running N Terminals through one callback function
-/// would otherwise need N wrapper-context allocations to distinguish
-/// which VTE fired; `extra` collapses that to a single `usize` per
-/// Handler. Callers with one Terminal default the field to 0.
 pub const Handler = struct {
     ctx: *anyopaque,
     extra: usize = 0,
-    on_child_exited: *const fn (ctx: *anyopaque, extra: usize) void,
-    /// Optional `bell` signal hook. VTE fires the GTK `bell` signal
-    /// when the PTY emits BEL (0x07). Used by the host to drive
-    /// panel-wide visual bell flash; per-VTE audible bell is set
-    /// directly via `vte_terminal_set_audible_bell` at spawn time
-    /// and doesn't need a callback. Null when the host doesn't
-    /// want bell dispatch.
-    on_bell: ?*const fn (ctx: *anyopaque, extra: usize) void = null,
+    on_child_exited: *const fn (*anyopaque, usize) void,
+    on_bell: ?*const fn (*anyopaque, usize) void = null,
+    on_title_changed: ?*const fn (*anyopaque, usize, []const u8) void = null,
 };
 
-// ─── VTE extern surface ──────────────────────────────────────────────
-//
-// Only the calls actually used today. Adding a getter or setter is
-// mechanical; the upstream header is `<vte/vte.h>`.
-
+const GError = extern struct { domain: u32, code: c_int, message: ?[*:0]const u8 };
 extern "c" fn vte_terminal_new() *GtkWidget;
-
-/// `vte_terminal_spawn_async` signature (stable since VTE 0.48).
-/// Timeout `-1` selects VTE's default. The callback is optional — we
-/// pass null for fire-and-forget. Spawn failure surfaces as a glib
-/// warning + visible "spawn failed" text inside the terminal; for
-/// richer handling we'd connect to `child-exited`.
-extern "c" fn vte_terminal_spawn_async(
-    terminal: *VteTerminal,
-    pty_flags: c_int,
-    working_directory: ?[*:0]const u8,
-    argv: [*]const ?[*:0]const u8,
-    envv: ?[*]const ?[*:0]const u8,
-    spawn_flags: c_int,
-    child_setup: ?*const anyopaque,
-    child_setup_data: gpointer,
-    child_setup_data_destroy: ?*const anyopaque,
-    timeout: c_int,
-    cancellable: ?*GCancellable,
-    callback: ?*const anyopaque,
-    user_data: gpointer,
-) void;
-
-// Font scale + reset are public VTE API; signatures stable since
-// VTE 0.40. Scale multiplies the base font set via
-// `vte_terminal_set_font`; default 1.0. `reset` clears scrollback
-// (clear_history) and / or tab stops (clear_tabstops); the visible
-// screen is preserved either way — that's a separate vt100 reset
-// sequence we don't issue.
-extern "c" fn vte_terminal_set_font_scale(terminal: *VteTerminal, scale: f64) void;
-extern "c" fn vte_terminal_get_font_scale(terminal: *VteTerminal) f64;
-extern "c" fn vte_terminal_reset(terminal: *VteTerminal, clear_tabstops: c_int, clear_history: c_int) void;
-extern "c" fn vte_terminal_feed_child(terminal: *VteTerminal, data: [*]const u8, length: isize) void;
-/// Feed bytes into VTE's screen buffer directly (NOT the PTY).
-/// Used to paint synthetic host messages after the child has
-/// already exited, when `feed_child` would have nowhere to go.
-/// ANSI escapes work (CSI/SGR are interpreted by VTE itself).
-extern "c" fn vte_terminal_feed(terminal: *VteTerminal, data: [*]const u8, length: isize) void;
-/// Toggle VTE's built-in audible bell. true = VTE beeps on BEL;
-/// false = swallow. Per-VTE setting so each profile's mute state
-/// is independent. Visual bell is the host's responsibility
-/// (VTE's `bell` signal still fires regardless of this setting).
-extern "c" fn vte_terminal_set_audible_bell(terminal: *VteTerminal, is_audible: c_int) void;
-
-// VTE inherits GtkScrollable since 0.40 — its vertical GtkAdjustment
-// is the canonical scrollback driver. `vte_terminal_get_vadjustment`
-// was deprecated in 0.60; the modern path is gtk_scrollable_get_*.
+extern "c" fn vte_terminal_spawn_async(*VteTerminal, c_int, ?[*:0]const u8, [*]const ?[*:0]const u8, ?[*]const ?[*:0]const u8, c_int, ?*const anyopaque, gpointer, ?*const anyopaque, c_int, ?*gtk.GCancellable, ?*const fn (?*VteTerminal, c_int, ?*GError, gpointer) callconv(.c) void, gpointer) void;
+extern "c" fn g_cancellable_new() *gtk.GCancellable;
+extern "c" fn g_cancellable_cancel(*gtk.GCancellable) void;
+extern "c" fn g_object_ref_sink(*anyopaque) *anyopaque;
+extern "c" fn vte_terminal_set_font_scale(*VteTerminal, f64) void;
+extern "c" fn vte_terminal_get_font_scale(*VteTerminal) f64;
+extern "c" fn vte_terminal_reset(*VteTerminal, c_int, c_int) void;
+extern "c" fn vte_terminal_feed_child(*VteTerminal, [*]const u8, isize) void;
+extern "c" fn vte_terminal_feed(*VteTerminal, [*]const u8, isize) void;
+extern "c" fn vte_terminal_set_audible_bell(*VteTerminal, c_int) void;
+extern "c" fn vte_terminal_copy_clipboard_format(*VteTerminal, c_int) void;
+extern "c" fn vte_terminal_paste_clipboard(*VteTerminal) void;
+extern "c" fn vte_terminal_paste_text(*VteTerminal, [*:0]const u8) void;
+extern "c" fn vte_terminal_get_window_title(*VteTerminal) ?[*:0]const u8;
 const GtkAdjustment = opaque {};
 const GtkScrollable = opaque {};
-extern "c" fn gtk_scrollable_get_vadjustment(scrollable: *GtkScrollable) ?*GtkAdjustment;
-extern "c" fn gtk_adjustment_get_value(adj: *GtkAdjustment) f64;
-extern "c" fn gtk_adjustment_get_lower(adj: *GtkAdjustment) f64;
-extern "c" fn gtk_adjustment_get_upper(adj: *GtkAdjustment) f64;
-extern "c" fn gtk_adjustment_get_page_size(adj: *GtkAdjustment) f64;
-extern "c" fn gtk_adjustment_set_value(adj: *GtkAdjustment, value: f64) void;
-// VTE 0.74+ removed default copy/paste keybindings; host apps must
-// drive these themselves. VteFormat enum starts at 1, not 0 —
-// passing 0 trips a g_return_if_fail assertion ("check_enum_value"
-// fails) and the clipboard write silently no-ops.
-const VTE_FORMAT_TEXT: c_int = 1;
-const VTE_FORMAT_HTML: c_int = 2;
-extern "c" fn vte_terminal_copy_clipboard_format(terminal: *VteTerminal, format: c_int) void;
-extern "c" fn vte_terminal_paste_clipboard(terminal: *VteTerminal) void;
+extern "c" fn gtk_scrollable_get_vadjustment(*GtkScrollable) ?*GtkAdjustment;
+extern "c" fn gtk_adjustment_get_value(*GtkAdjustment) f64;
+extern "c" fn gtk_adjustment_get_page_size(*GtkAdjustment) f64;
+extern "c" fn gtk_adjustment_set_value(*GtkAdjustment, f64) void;
 
-// Spawn flag / pty flag constants. Inline rather than re-declared as
-// enums because we only need a couple of values today.
-const VTE_PTY_DEFAULT: c_int = 0;
-const G_SPAWN_DEFAULT: c_int = 0;
-/// VTE-specific bit added to `spawn_flags`. Tells VTE not to ask
-/// systemd to create a unit scope for the child. With this OFF (the
-/// default), VTE calls `org.freedesktop.systemd1.Manager.StartTransientUnit`
-/// over D-Bus to get the child placed in its own scope. That works
-/// fine from a top-level terminal app, but when djinn itself is
-/// launched from inside another systemd-scope-creating terminal
-/// (Ghostty, GNOME Terminal, …), the nested StartTransientUnit call
-/// can return a malformed reply whose string field is null. VTE's
-/// libfmt-based error reporter then aborts on the null pointer:
-///
-///   GLib-CRITICAL: g_utf8_make_valid: assertion 'str != NULL' failed
-///   terminate called after fmt::v11::format_error: string pointer is null
-///
-/// Skipping the systemd scope sidesteps that entire path. The child
-/// still runs; it just doesn't get its own unit. For djinn's use case
-/// — terminal panel + agent shell — we don't need per-shell scopes.
-const VTE_SPAWN_NO_SYSTEMD_SCOPE: c_int = 1 << 26;
+/// A heap box shared by the Terminal owner and the pending spawn completion.
+/// No C callback points at the returned/movable Terminal value. On teardown,
+/// disconnect signals and clear handler BEFORE cancelling; the deferred callback
+/// can then only release its own reference, never touch a destroyed host.
+// Main-thread-only registry: cancelled spawn callbacks must finish even when
+// startup fails before portal initialization or its independent drain is empty.
+var pending_launches: ?*Launch = null;
 
-// ─── Terminal ────────────────────────────────────────────────────────
+const Launch = struct {
+    allocator: std.mem.Allocator,
+    refs: usize = 1,
+    handler: ?Handler,
+    shell: [:0]u8,
+    expression: ?[:0]u8,
+    cwd: ?[:0]u8,
+    argv: [4]?[*:0]const u8 = @splat(null),
+    cancellable: *gtk.GCancellable,
+    main_context: *gtk.GMainContext,
+    pending_next: ?*Launch = null,
+    completed_exit: bool = false,
+    retired: bool = false,
 
-/// Owned wrapper around a VTE widget.
-///
-/// `vte_terminal_spawn_async` is genuinely async: it stashes the
-/// `argv` pointer for a deferred spawn callback and returns
-/// immediately, BEFORE forking the child. Anything argv points at —
-/// the array slots themselves AND the string buffers they point to —
-/// must outlive the call. If they don't, the eventual fork-and-exec
-/// reads freed memory; the visible failure is glib's
-/// `g_utf8_make_valid: assertion 'str != NULL' failed` followed by a
-/// libfmt format_error abort (VTE's error path tries to render the
-/// garbage spawn failure as a terminal message and chokes on the
-/// null). We store both on the Terminal so they live until deinit.
+    fn create(a: std.mem.Allocator, spawn: Spawn, handler: ?Handler, shell: []const u8) !*Launch {
+        try validateValue(shell);
+        if (spawn.command) |s| try validateValue(s);
+        if (spawn.cwd) |s| try validateValue(s);
+        const shell_z = try a.dupeSentinel(u8, shell, 0);
+        errdefer a.free(shell_z);
+        const expression = if (spawn.command) |s| try a.dupeSentinel(u8, s, 0) else null;
+        errdefer if (expression) |s| a.free(s);
+        const cwd = if (spawn.cwd) |s| try a.dupeSentinel(u8, s, 0) else null;
+        errdefer if (cwd) |s| a.free(s);
+        const box = try a.create(Launch);
+        box.* = .{
+            .allocator = a,
+            .handler = handler,
+            .shell = shell_z,
+            .expression = expression,
+            .cwd = cwd,
+            .cancellable = g_cancellable_new(),
+            .main_context = gtk.g_main_context_ref_thread_default(),
+        };
+        // Explicit commands are shell expressions, NOT executable filenames.
+        // No splitting, escaping, or fallback on failure. Default is interactive
+        // (including when the parent process was launched without a terminal).
+        box.argv = launchArgv(box.shell.ptr, if (box.expression) |expr| expr.ptr else null);
+        return box;
+    }
+
+    fn beginSpawn(self: *Launch) void {
+        self.refs += 1;
+        self.pending_next = pending_launches;
+        pending_launches = self;
+    }
+
+    fn completeSpawn(self: *Launch) void {
+        self.unlinkSpawn();
+        self.release();
+    }
+
+    fn unlinkSpawn(self: *Launch) void {
+        var link = &pending_launches;
+        while (link.*) |entry| {
+            if (entry == self) {
+                link.* = self.pending_next;
+                self.pending_next = null;
+                return;
+            }
+            link = &entry.pending_next;
+        }
+        unreachable; // each queued spawn completes exactly once
+    }
+
+    fn dropLease(self: *Launch) bool {
+        std.debug.assert(self.refs != 0);
+        self.refs -= 1;
+        return self.refs == 0;
+    }
+
+    fn release(self: *Launch) void {
+        if (!self.dropLease()) return;
+        const a = self.allocator;
+        gtk.g_object_unref(@ptrCast(self.cancellable));
+        gtk.g_main_context_unref(self.main_context);
+        a.free(self.shell);
+        if (self.expression) |s| a.free(s);
+        if (self.cwd) |s| a.free(s);
+        a.destroy(self);
+    }
+
+    fn exited(self: *Launch) void {
+        if (self.completed_exit) return;
+        self.completed_exit = true;
+        if (self.handler) |h| h.on_child_exited(h.ctx, h.extra);
+    }
+};
+
+fn launchArgv(shell: [*:0]const u8, expression: ?[*:0]const u8) [4]?[*:0]const u8 {
+    return .{ shell, if (expression != null) "-lc" else "-i", expression, null };
+}
+
+fn validateValue(value: []const u8) !void {
+    if (std.mem.trim(u8, value, " \t\r\n").len == 0) return error.EmptyLaunchValue;
+    if (std.mem.indexOfScalar(u8, value, 0) != null) return error.InvalidLaunchValue;
+}
+
 pub const Terminal = struct {
     widget: *GtkWidget,
     allocator: std.mem.Allocator,
-    /// Owned argv[0] string. Either a profile.command dupe (multi-
-    /// profile path) or the $SHELL resolution (legacy single-session).
-    /// VTE retains the pointer until the deferred fork-and-exec
-    /// completes; Terminal frees on deinit.
-    command_path: [:0]u8,
-    /// Owned cwd string, null when the spawn inherits djinn's cwd.
-    /// Same lifetime story as command_path — VTE reads it during the
-    /// deferred fork, so it has to outlive the async spawn.
-    cwd_path: ?[:0]u8 = null,
-    /// Heap-resident argv handed to VTE. Two slots: argv[0] points at
-    /// `command_path.ptr`, argv[1] is the required null terminator.
-    /// Stored as a slice (rather than `[*]?[*:0]u8` + magic length at
-    /// the deinit site) so the allocator hand-back stays self-
-    /// describing. VTE retains the pointer until the async child-spawn
-    /// fires, so Terminal owns the backing buffer until deinit.
-    argv: []?[*:0]u8,
-    /// Heap-boxed handler the C `child-exited` callback recovers via
-    /// `user_data`. Boxed because Terminal lives on the caller's stack
-    /// and we can't take its address before `open` returns. Null when
-    /// the caller didn't register a handler.
-    handler_box: ?*Handler = null,
-    /// Signal id for the `child-exited` handler, 0 when no handler
-    /// was registered. Stashed so `deinit` can disconnect before
-    /// freeing `handler_box` — a pending dispatch in flight at
-    /// teardown would otherwise read freed memory through user_data.
+    launch: *Launch,
     child_exited_handler_id: c_ulong = 0,
-    /// Signal id for the `bell` handler, 0 when the caller didn't
-    /// supply `Handler.on_bell`. Same disconnect-before-free
-    /// contract as `child_exited_handler_id`.
     bell_handler_id: c_ulong = 0,
+    title_handler_id: c_ulong = 0,
 
-    /// Resolve $SHELL falling back to /bin/sh. Returns the dup'd
-    /// sentinel-terminated slice. $SHELL is the freedesktop convention;
-    /// /bin/sh is the POSIX guarantee, fine as fallback even on
-    /// systems where /bin is a symlink to /usr/bin (Arch). Used only
-    /// when `open` is called with `spawn = null`.
-    fn resolveShell(allocator: std.mem.Allocator) ![:0]u8 {
-        const shell = std.posix.getenv("SHELL") orelse "/bin/sh";
-        return try allocator.dupeZ(u8, shell);
+    pub fn open(allocator: std.mem.Allocator, opts: ThemeOptions, handler: ?Handler, spawn: ?Spawn) !Terminal {
+        const options: Spawn = spawn orelse .{};
+        const launch = try Launch.create(allocator, options, handler, platform.getenv("SHELL") orelse "/bin/sh");
+        const widget = vte_terminal_new();
+        // A separate owned reference keeps widget valid even if the stack has
+        // removed it. Host must deinit wrappers before destroying its stack.
+        _ = g_object_ref_sink(@ptrCast(widget));
+        const vte: *VteTerminal = @ptrCast(widget);
+        theme.apply(widget, opts);
+        vte_terminal_set_audible_bell(vte, @intFromBool(options.audible_bell));
+        dragdrop.attach(widget);
+        var term = Terminal{ .widget = widget, .allocator = allocator, .launch = launch };
+        term.child_exited_handler_id = gtk.g_signal_connect_data(@ptrCast(widget), "child-exited", @ptrCast(&onChildExited), launch, null, 0);
+        term.bell_handler_id = gtk.g_signal_connect_data(@ptrCast(widget), "bell", @ptrCast(&onBell), launch, null, 0);
+        term.title_handler_id = gtk.g_signal_connect_data(@ptrCast(widget), "window-title-changed", @ptrCast(&onTitleChanged), launch, null, 0);
+        launch.beginSpawn();
+        vte_terminal_spawn_async(vte, 0, if (launch.cwd) |s| s.ptr else null, &launch.argv, null, 1 << 26, null, null, null, -1, launch.cancellable, &onSpawnComplete, launch);
+        return term;
     }
 
-    pub fn open(
-        allocator: std.mem.Allocator,
-        theme_opts: ThemeOptions,
-        handler: ?Handler,
-        spawn: ?Spawn,
-    ) !Terminal {
-        const widget = vte_terminal_new();
-        const terminal: *VteTerminal = @ptrCast(widget);
-
-        // Apply config-driven theme (font, fg/bg/cursor, padding)
-        // before the widget is mapped so the first paint already
-        // shows djinn's styling instead of VTE's defaults. Each
-        // option is no-op-safe when null, so a caller with empty
-        // config gets VTE defaults.
-        theme.apply(widget, theme_opts);
-
-        // Audible bell: VTE's built-in beep on PTY BEL (0x07).
-        // Resolved by the caller from profile override + global
-        // config and threaded through `Spawn.audible_bell`. Null
-        // spawn (legacy single-shell path) gets the struct default
-        // (true) which matches VTE's own initial state.
-        const audible = if (spawn) |s| s.audible_bell else true;
-        vte_terminal_set_audible_bell(terminal, @intFromBool(audible));
-
-        // Drag-drop into the terminal. Attaches a GtkDropTarget that
-        // converts file-manager drops (text/uri-list) to shell-quoted
-        // paths and pastes them through VTE's paste path (bracketed
-        // paste mode aware). The controller's lifetime is tied to the
-        // widget — no separate handle to manage. Attaching per-VTE
-        // (instead of once on the SessionHost stack) means each
-        // profile's terminal can accept drops without re-targeting
-        // the drop target on every profile switch.
-        dragdrop.attach(widget);
-
-        const command_path = if (spawn) |s|
-            try allocator.dupeZ(u8, s.command)
-        else
-            try resolveShell(allocator);
-        errdefer allocator.free(command_path);
-
-        const cwd_path: ?[:0]u8 = if (spawn) |s|
-            if (s.cwd) |c| try allocator.dupeZ(u8, c) else null
-        else
-            null;
-        errdefer if (cwd_path) |p| allocator.free(p);
-
-        // Heap-allocate argv: [argv0, null]. VTE's C signature is
-        // `char **` (mutable strings, mutable array). We back it with
-        // `?[*:0]u8` slots so the type system matches. The string the
-        // first slot points at is `command_path.ptr` — owned by `self`.
-        const argv = try allocator.alloc(?[*:0]u8, 2);
-        errdefer allocator.free(argv);
-        argv[0] = @ptrCast(command_path.ptr);
-        argv[1] = null; // trailing null required by exec()
-
-        vte_terminal_spawn_async(
-            terminal,
-            VTE_PTY_DEFAULT,
-            if (cwd_path) |p| p.ptr else null,
-            argv.ptr,
-            null, // envv: inherit djinn's env
-            G_SPAWN_DEFAULT | VTE_SPAWN_NO_SYSTEMD_SCOPE,
-            null,
-            null,
-            null,
-            -1, // default timeout
-            null,
-            null, // no callback
-            null,
-        );
-
-        // `child-exited(VteTerminal*, gint status, gpointer)` fires
-        // when the spawned shell terminates (user types `exit`,
-        // kernel kills it, it segfaults, etc.). SessionHost routes
-        // the dispatcher, which marks the entry exited and paints
-        // an inline "Press Ctrl+R to restart" banner via
-        // `feedScreen`; the panel itself stays open. Status is
-        // ignored: djinn doesn't care WHY the child died, only
-        // that it did.
-        var handler_box: ?*Handler = null;
-        var child_exited_id: c_ulong = 0;
-        var bell_id: c_ulong = 0;
-        if (handler) |h| {
-            const box = try allocator.create(Handler);
-            errdefer allocator.destroy(box);
-            box.* = h;
-            child_exited_id = g_signal_connect_data(
-                @ptrCast(terminal),
-                "child-exited",
-                @ptrCast(&onChildExited),
-                @ptrCast(box),
-                null,
-                0,
-            );
-            // VTE `bell(VteTerminal*, gpointer)` fires on PTY BEL
-            // regardless of `set_audible_bell` state. Connect only
-            // when the host wants the dispatch (visual bell path).
-            // Reuses the same `handler_box` so a single `destroy` in
-            // deinit covers both signals.
-            if (h.on_bell != null) {
-                bell_id = g_signal_connect_data(
-                    @ptrCast(terminal),
-                    "bell",
-                    @ptrCast(&onBell),
-                    @ptrCast(box),
-                    null,
-                    0,
-                );
-            }
-            handler_box = box;
-        }
-
-        return .{
-            .widget = widget,
-            .allocator = allocator,
-            .command_path = command_path,
-            .cwd_path = cwd_path,
-            .argv = argv,
-            .handler_box = handler_box,
-            .child_exited_handler_id = child_exited_id,
-            .bell_handler_id = bell_id,
-        };
+    pub fn detachExitHandler(self: *Terminal) void {
+        self.launch.retired = true;
+        self.launch.handler = null;
+        if (self.child_exited_handler_id != 0) gtk.g_signal_handler_disconnect(@ptrCast(self.widget), self.child_exited_handler_id);
+        if (self.bell_handler_id != 0) gtk.g_signal_handler_disconnect(@ptrCast(self.widget), self.bell_handler_id);
+        if (self.title_handler_id != 0) gtk.g_signal_handler_disconnect(@ptrCast(self.widget), self.title_handler_id);
+        self.child_exited_handler_id = 0;
+        self.bell_handler_id = 0;
+        self.title_handler_id = 0;
     }
 
     pub fn deinit(self: *Terminal) void {
-        // Disconnect both signal handlers before freeing their
-        // shared user_data box. The widget itself is owned by its
-        // parent container (set via panel.attachChild), so a
-        // dispatch in flight against the still-live widget would
-        // otherwise deref a freed Handler.
-        if (self.child_exited_handler_id != 0) {
-            g_signal_handler_disconnect(@ptrCast(self.widget), self.child_exited_handler_id);
-            self.child_exited_handler_id = 0;
-        }
-        if (self.bell_handler_id != 0) {
-            g_signal_handler_disconnect(@ptrCast(self.widget), self.bell_handler_id);
-            self.bell_handler_id = 0;
-        }
-        self.allocator.free(self.argv);
-        self.allocator.free(self.command_path);
-        if (self.cwd_path) |p| self.allocator.free(p);
-        if (self.handler_box) |box| self.allocator.destroy(box);
+        self.detachExitHandler();
+        g_cancellable_cancel(self.launch.cancellable);
+        gtk.g_object_unref(@ptrCast(self.widget));
+        self.launch.release();
     }
 
-    /// Re-apply theme.Options to a live widget. Same code path as
-    /// startup — VTE setters are idempotent and the global CSS
-    /// provider gets reloaded in place. Called by the config watcher
-    /// on file change so font / colors / padding / opacity can shift
-    /// without a restart.
+    /// Final entrypoint teardown only, after EVERY native owner/producer has
+    /// detached. Never pump the shared context during terminal replacement.
+    pub fn shutdown() void {
+        while (pending_launches) |launch| {
+            std.debug.assert(launch.retired and launch.handler == null);
+            launch.refs += 1; // callback can release its last completion lease
+            _ = gtk.g_main_context_iteration(launch.main_context, 1);
+            launch.release();
+        }
+    }
+
     pub fn applyTheme(self: *Terminal, opts: ThemeOptions) void {
         theme.apply(self.widget, opts);
     }
-
-    /// Adjust VTE's font-scale multiplier in place. Default scale is
-    /// 1.0; `delta = 0.1` zooms in 10%, `delta = -0.1` zooms out 10%.
-    /// Clamped to [0.4, 4.0] — outside that range text either
-    /// hairline-shrinks below readability or hits VTE's internal
-    /// metrics caps and starts rendering oddly. Bound to Ctrl+= /
-    /// Ctrl+- from the linux keymap.
     pub fn fontScaleAdjust(self: *Terminal, delta: f64) void {
-        const terminal: *VteTerminal = @ptrCast(self.widget);
-        const current = vte_terminal_get_font_scale(terminal);
-        const next = std.math.clamp(current + delta, 0.4, 4.0);
-        vte_terminal_set_font_scale(terminal, next);
+        const vte: *VteTerminal = @ptrCast(self.widget);
+        vte_terminal_set_font_scale(vte, std.math.clamp(vte_terminal_get_font_scale(vte) + delta, 0.4, 4.0));
     }
-
-    /// Reset the font scale to 1.0. Bound to Ctrl+0 from the keymap.
     pub fn fontScaleReset(self: *Terminal) void {
-        const terminal: *VteTerminal = @ptrCast(self.widget);
-        vte_terminal_set_font_scale(terminal, 1.0);
+        vte_terminal_set_font_scale(@ptrCast(self.widget), 1.0);
     }
-
-    /// Copy the current VTE selection to the system clipboard as
-    /// plain text. Bound to Ctrl+Shift+C from the keymap. No-op when
-    /// no selection exists — VTE handles that internally.
     pub fn copySelectionToClipboard(self: *Terminal) void {
-        const terminal: *VteTerminal = @ptrCast(self.widget);
-        vte_terminal_copy_clipboard_format(terminal, VTE_FORMAT_TEXT);
+        vte_terminal_copy_clipboard_format(@ptrCast(self.widget), 1);
     }
-
-    /// Paste the system clipboard contents into VTE as if typed.
-    /// Bound to Ctrl+Shift+V from the keymap. VTE handles bracketed-
-    /// paste mode automatically when the shell enables it.
     pub fn pasteFromClipboard(self: *Terminal) void {
-        const terminal: *VteTerminal = @ptrCast(self.widget);
-        vte_terminal_paste_clipboard(terminal);
+        vte_terminal_paste_clipboard(@ptrCast(self.widget));
     }
-
-    /// Clear scrollback + visible + repaint the shell prompt. Bound
-    /// to Ctrl+Shift+K from the keymap; iTerm "Cmd+K" / Ghostty
-    /// "clear" idiom.
-    ///
-    /// Two steps because VTE's `reset` alone clears state but leaves
-    /// the user staring at an empty buffer with no prompt — the shell
-    /// process hasn't been told anything happened, so PS1 doesn't
-    /// re-render. Sending `\x0c` (Ctrl+L) through `feed_child` is
-    /// readline's "clear-screen + redraw-prompt" hotkey, so bash /
-    /// zsh / fish all paint a fresh prompt at the now-cleared top
-    /// (and also redraw any half-typed command line, which the user
-    /// would otherwise lose). TUIs that grab the PTY (vim, less,
-    /// htop) interpret Ctrl+L as their own redraw, which is the
-    /// "right thing" in those contexts too.
-    ///
-    /// Ordering: reset first so the scrollback drop lands before the
-    /// shell's response to Ctrl+L arrives — otherwise the prompt
-    /// would render, then the reset would scroll it away briefly
-    /// before the next paint cycle.
+    /// Explicit text insertion uses VTE's bracketed-paste-aware API, not keys.
+    pub fn pasteText(self: *Terminal, text: []const u8) !void {
+        if (std.mem.indexOfScalar(u8, text, 0) != null or !std.unicode.utf8ValidateSlice(text)) return error.InvalidText;
+        const z = try self.allocator.dupeSentinel(u8, text, 0);
+        defer self.allocator.free(z);
+        vte_terminal_paste_text(@ptrCast(self.widget), z.ptr);
+    }
     pub fn clearScrollback(self: *Terminal) void {
-        const terminal: *VteTerminal = @ptrCast(self.widget);
-        vte_terminal_reset(terminal, 0, 1);
-        const ctrl_l = "\x0c";
-        vte_terminal_feed_child(terminal, ctrl_l.ptr, @intCast(ctrl_l.len));
+        const vte: *VteTerminal = @ptrCast(self.widget);
+        vte_terminal_reset(vte, 0, 1);
+        vte_terminal_feed_child(vte, "\x0c", 1);
     }
-
-    /// Paint `data` directly into VTE's screen buffer, bypassing the
-    /// PTY. Used by the host to drop a synthetic "Process exited"
-    /// banner after the child terminates so single-profile setups
-    /// (tab strip hidden, no chip strikethrough cue) still get a
-    /// visible signal. ANSI escapes work (VTE interprets SGR/CSI
-    /// itself).
     pub fn feedScreen(self: *Terminal, data: []const u8) void {
-        if (data.len == 0) return;
-        const terminal: *VteTerminal = @ptrCast(self.widget);
-        vte_terminal_feed(terminal, data.ptr, @intCast(data.len));
+        if (data.len != 0) vte_terminal_feed(@ptrCast(self.widget), data.ptr, @intCast(data.len));
     }
-
-    /// Disconnect the `child-exited` signal so an imminent widget
-    /// destroy (via `gtk_stack_remove` during a session restart)
-    /// can hangup the PTY child without fanning the resulting
-    /// SIGHUP-then-child-exited into the host's exit-tracking
-    /// dispatch (which would mark the about-to-be-replaced slot
-    /// exited just before the new spawn lands, causing a chip
-    /// flicker). Called by `SessionHost.restartActive` right before
-    /// tearing the old VTE widget down. Idempotent: `deinit`'s own
-    /// disconnect short-circuits when `child_exited_handler_id == 0`.
-    ///
-    /// Why we don't use `vte_terminal_set_pty(t, NULL)` for the
-    /// hangup: VTE 0.84's set_pty(NULL) path NULL-derefs at offset
-    /// 0x18 inside the PTY dispose chain when the prior spawn's
-    /// child watch isn't fully wired (the failure mode the host hit
-    /// on the first try). The widget-replacement strategy
-    /// SessionHost uses sidesteps that path entirely — destroy the
-    /// widget, build a fresh one in the same stack slot. Tab strip,
-    /// log pane, window position all preserved.
-    pub fn detachExitHandler(self: *Terminal) void {
-        if (self.child_exited_handler_id != 0) {
-            g_signal_handler_disconnect(@ptrCast(self.widget), self.child_exited_handler_id);
-            self.child_exited_handler_id = 0;
-        }
-        // The bell signal could still fire during the imminent
-        // widget destroy (theoretical: a queued BEL ahead of SIGHUP)
-        // and would dispatch into the about-to-be-replaced slot's
-        // visual flash. Disconnect alongside the exit handler so
-        // restartActive has one paired call to make.
-        if (self.bell_handler_id != 0) {
-            g_signal_handler_disconnect(@ptrCast(self.widget), self.bell_handler_id);
-            self.bell_handler_id = 0;
-        }
-    }
-
-    /// Scroll the scrollback view by one screen-page in the requested
-    /// direction. Negative `pages` scrolls toward older output, positive
-    /// toward newer. The GtkAdjustment clamps `set_value` to
-    /// `[lower, upper - page_size]` internally, so a value past the
-    /// bottom resolves to the bottom — no manual clamping needed.
-    /// No-op on the (rare) path where VTE's GtkScrollable interface
-    /// hasn't materialized a vadjustment yet (widget not yet mapped).
-    /// Bound to Shift+PgUp / Shift+PgDn — universal terminal scrollback
-    /// gesture (gnome-terminal, konsole, xterm, foot, kitty).
     pub fn scrollPages(self: *Terminal, pages: f64) void {
-        const scrollable: *GtkScrollable = @ptrCast(self.widget);
-        const adj = gtk_scrollable_get_vadjustment(scrollable) orelse return;
-        const cur = gtk_adjustment_get_value(adj);
-        const page = gtk_adjustment_get_page_size(adj);
-        gtk_adjustment_set_value(adj, cur + page * pages);
+        const adj = gtk_scrollable_get_vadjustment(@ptrCast(self.widget)) orelse return;
+        gtk_adjustment_set_value(adj, gtk_adjustment_get_value(adj) + gtk_adjustment_get_page_size(adj) * pages);
     }
 };
 
-fn onChildExited(_: *VteTerminal, _: c_int, user_data: gpointer) callconv(.c) void {
-    const h: *Handler = @ptrCast(@alignCast(user_data orelse return));
-    h.on_child_exited(h.ctx, h.extra);
+fn onSpawnComplete(terminal: ?*VteTerminal, _: c_int, err: ?*GError, data: gpointer) callconv(.c) void {
+    const box: *Launch = @ptrCast(@alignCast(data orelse return));
+    defer box.completeSpawn();
+    if (err) |e| {
+        // GError is borrowed. Never inject its untrusted message into the PTY
+        // or terminal parser. Retired launches deliberately do not notify.
+        if (!box.retired) {
+            std.debug.print("terminal: session {d} spawn failed: {s}\n", .{ if (box.handler) |h| h.extra else 0, if (e.message) |m| std.mem.span(m) else "unknown error" });
+            if (terminal) |vte| {
+                const message = "\r\n[djinn: launch failed; check command/cwd and restart]\r\n";
+                vte_terminal_feed(vte, message.ptr, message.len);
+            }
+            box.exited();
+        }
+    }
+}
+fn onChildExited(_: *VteTerminal, _: c_int, data: gpointer) callconv(.c) void {
+    const box: *Launch = @ptrCast(@alignCast(data orelse return));
+    box.exited();
+}
+fn onBell(_: *VteTerminal, data: gpointer) callconv(.c) void {
+    const box: *Launch = @ptrCast(@alignCast(data orelse return));
+    const h = box.handler orelse return;
+    if (h.on_bell) |cb| cb(h.ctx, h.extra);
+}
+fn onTitleChanged(vte: *VteTerminal, data: gpointer) callconv(.c) void {
+    const box: *Launch = @ptrCast(@alignCast(data orelse return));
+    const h = box.handler orelse return;
+    if (h.on_title_changed) |cb| cb(h.ctx, h.extra, if (vte_terminal_get_window_title(vte)) |s| std.mem.span(s) else "");
 }
 
-fn onBell(_: *VteTerminal, user_data: gpointer) callconv(.c) void {
-    const h: *Handler = @ptrCast(@alignCast(user_data orelse return));
-    const cb = h.on_bell orelse return;
-    cb(h.ctx, h.extra);
+test "pending spawns remain tracked independently until each completion" {
+    try std.testing.expect(pending_launches == null);
+    defer pending_launches = null;
+    // Synthetic owner leases keep cleanup native-free; only registry and
+    // completion ownership are exercised here, never fake GTK objects.
+    var first: Launch = .{ .allocator = undefined, .refs = 2, .handler = null, .shell = undefined, .expression = null, .cwd = null, .cancellable = undefined, .main_context = undefined };
+    var second = first;
+    first.beginSpawn();
+    second.beginSpawn();
+    try std.testing.expect(pending_launches == &second);
+    first.unlinkSpawn();
+    try std.testing.expect(!first.dropLease());
+    try std.testing.expect(pending_launches == &second and second.pending_next == null);
+    try std.testing.expectEqual(@as(usize, 2), first.refs);
+    second.unlinkSpawn();
+    try std.testing.expect(!second.dropLease());
+    try std.testing.expect(pending_launches == null);
+    try std.testing.expectEqual(@as(usize, 2), second.refs);
 }
 
 test "Terminal type compiles" {
     if (builtin.os.tag != .linux) return;
-    // Don't actually instantiate — Terminal.open requires a live GTK
-    // context (gtk_init must have been called) and we don't bring up
-    // a display in tests. This proves the struct declarations
-    // type-check; runtime exercise happens via the smoke binary.
     _ = Terminal;
+}
+test "launch argv preserves shell expression and default is interactive" {
+    const expression = "  FOO='a b' /bin/tool --arg=\"$HOME\"; echo done  ";
+    const command = launchArgv("/bin/fish", expression);
+    try std.testing.expectEqualStrings("/bin/fish", std.mem.span(command[0].?));
+    try std.testing.expectEqualStrings("-lc", std.mem.span(command[1].?));
+    try std.testing.expectEqualStrings(expression, std.mem.span(command[2].?));
+    try std.testing.expect(command[3] == null);
+    const shell = launchArgv("/bin/zsh", null);
+    try std.testing.expectEqualStrings("/bin/zsh", std.mem.span(shell[0].?));
+    try std.testing.expectEqualStrings("-i", std.mem.span(shell[1].?));
+    try std.testing.expect(shell[2] == null and shell[3] == null);
+    const fish = launchArgv("/bin/fish", null);
+    try std.testing.expectEqualStrings("/bin/fish", std.mem.span(fish[0].?));
+    try std.testing.expectEqualStrings("-i", std.mem.span(fish[1].?));
+    // Recovery must never ask fish to interpret a POSIX ${SHELL:-...} command.
+    try std.testing.expect(fish[2] == null and fish[3] == null);
+}
+
+test "explicit launch rejects empty and NUL rather than falling back" {
+    try std.testing.expectError(error.EmptyLaunchValue, validateValue(" \t"));
+    try std.testing.expectError(error.InvalidLaunchValue, validateValue("echo\x00ignored"));
+    try validateValue("  FOO='a b' tool --arg=\"$HOME\"; echo done  ");
 }

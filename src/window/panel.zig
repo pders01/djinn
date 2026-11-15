@@ -5,7 +5,7 @@ const app_state = @import("../app.zig");
 // Class registration is a one-shot flag with no cross-callback reach,
 // so it stays module-private. Resize wiring goes through app.g.
 var g_class_registered: bool = false;
-var g_resign_observer_registered: bool = false;
+var g_key_observers_registered: bool = false;
 
 /// Subclass NSPanel so we can override `canBecomeKeyWindow:` — borderless
 /// panels return NO by default, which prevents the contentView from ever
@@ -18,7 +18,10 @@ fn registerPanelClass() void {
     _ = cls.addMethod("canBecomeKeyWindow", canBecomeKeyImpl);
     _ = cls.addMethod("canBecomeMainWindow", canBecomeKeyImpl);
     _ = cls.addMethod("djinnPanelDidResignKey:", didResignKeyImpl);
+    _ = cls.addMethod("djinnPanelDidBecomeKey:", didBecomeKeyImpl);
+    _ = cls.addMethod("djinnApplicationDidDeactivate:", didDeactivateImpl);
     _ = cls.addMethod("djinnPanelDidEndLiveResize:", didEndLiveResizeImpl);
+    _ = cls.addMethod("djinnPanelGeometryDidChange:", geometryDidChangeImpl);
     _ = cls.addMethod("djinnPanelRestoreBellAlpha:", restoreBellAlphaImpl);
     objc.registerClassPair(cls);
 }
@@ -35,27 +38,69 @@ fn canBecomeKeyImpl(_: objc.c.id, _: objc.c.SEL) callconv(.c) bool {
     return true;
 }
 
-/// Sync internal panel state when macOS deactivates djinn and auto-hides
-/// the panel via `setHidesOnDeactivate:`. The actual hiding is OS-driven
-/// — we just keep `visible`, `prev_app_pid`, and the ghostty surface's
-/// focus/occlusion state in step.
-///
-/// Bails when NSApp is still active: that means key transferred to a
-/// sibling djinn window (find chip, palette overlay), not a real blur.
-/// macOS won't auto-hide in that case either.
+/// Key-window focus is independent of visibility and hide-on-blur policy.
+/// A sibling window taking key also unfocuses the terminal, but does not
+/// dismiss the panel while our application remains active.
 fn didResignKeyImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
-    if (!app_state.g.window.hide_on_blur) return;
+    const p = app_state.g.window.panel orelse return;
+    if (app_state.g.ghostty.surface) |surf_ptr| {
+        const ghostty_runtime = @import("../ghostty/runtime.zig");
+        const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
+        ghostty_runtime.surfaceSetFocus(surf, false);
+    }
+    p.dismissForBlur(.key_resigned);
+}
+
+/// Deactivation can follow a prior key resignation (e.g. to a sibling
+/// window), so it needs its own observer rather than relying on key loss.
+fn didDeactivateImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
+    const p = app_state.g.window.panel orelse return;
+    if (app_state.g.ghostty.surface) |surf_ptr| {
+        const ghostty_runtime = @import("../ghostty/runtime.zig");
+        const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
+        ghostty_runtime.surfaceSetFocus(surf, false);
+    }
+    p.dismissForBlur(.app_deactivated);
+}
+
+const BlurEvent = enum { key_resigned, app_deactivated };
+
+fn shouldDismissOnBlur(visible: bool, enabled: bool, event: BlurEvent, app_active: bool) bool {
+    return visible and enabled and (event == .app_deactivated or !app_active);
+}
+
+test "blur dismissal follows deactivation even after key resignation" {
+    try std.testing.expect(!shouldDismissOnBlur(true, true, .key_resigned, true));
+    // No second key resignation is needed; the deactivation notification
+    // is authoritative even if isActive has not caught up yet.
+    try std.testing.expect(shouldDismissOnBlur(true, true, .app_deactivated, true));
+    try std.testing.expect(shouldDismissOnBlur(true, true, .key_resigned, false));
+    for ([_]BlurEvent{ .key_resigned, .app_deactivated }) |event| {
+        try std.testing.expect(!shouldDismissOnBlur(true, false, event, false));
+        try std.testing.expect(!shouldDismissOnBlur(false, true, event, false));
+    }
+}
+
+/// Clicking a still-visible, unfocused panel may not change its first
+/// responder, so becomeFirstResponder alone cannot restore surface focus.
+fn didBecomeKeyImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
     const p = app_state.g.window.panel orelse return;
     if (!p.visible) return;
+    if (app_state.g.ghostty.surface) |surf_ptr| {
+        const ghostty_runtime = @import("../ghostty/runtime.zig");
+        const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
+        ghostty_runtime.surfaceSetFocus(surf, true);
+    }
+}
 
-    const NSApplication = objc.getClass("NSApplication") orelse return;
-    const nsapp = NSApplication.msgSend(objc.Object, "sharedApplication", .{});
-    if (nsapp.msgSend(bool, "isActive", .{})) return;
-
-    p.syncHiddenState();
+/// Window notifications cover backing/screen changes and resizing even
+/// while ordered out. Do not gate geometry synchronization on visibility.
+fn geometryDidChangeImpl(_: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
+    @import("../terminal/view.zig").relayout();
 }
 
 fn didEndLiveResizeImpl(self_id: objc.c.id, _: objc.c.SEL, _: objc.c.id) callconv(.c) void {
+    @import("../terminal/view.zig").relayout();
     const handler = app_state.g.window.resize_handler orelse return;
     const panel_obj = objc.Object.fromId(self_id);
     const frame = panel_obj.msgSend(NSRect, "frame", .{});
@@ -158,9 +203,8 @@ pub const Panel = struct {
         // behavior below give us the visual on-top property without the
         // focus-stickiness.
         panel.msgSend(void, "setFloatingPanel:", .{@as(c_int, 0)});
-        // setHidesOnDeactivate driven by hide_on_blur via setHideOnBlur;
-        // default to NO so the panel persists across app switches when
-        // hide_on_blur is off.
+        // Always hide explicitly. AppKit's automatic hiding restores the
+        // panel on reactivation behind our visible/focus/occlusion state.
         panel.msgSend(void, "setHidesOnDeactivate:", .{@as(c_int, 0)});
         panel.msgSend(void, "setReleasedWhenClosed:", .{@as(c_int, 0)});
         panel.msgSend(void, "setOpaque:", .{@as(c_int, 0)});
@@ -224,6 +268,24 @@ pub const Panel = struct {
             panel.msgSend(void, "setBackgroundColor:", .{bg});
         }
 
+        // AppKit emits these for programmatic/hidden resizes too. View
+        // frame notifications handle intermediate live-resize geometry;
+        // window notifications also catch scale-only display transitions.
+        if (objc.getClass("NSNotificationCenter")) |NotificationCenter| {
+            const center = NotificationCenter.msgSend(objc.Object, "defaultCenter", .{});
+            const NSString = objc.getClass("NSString") orelse return error.ClassNotFound;
+            for ([_][*:0]const u8{
+                "NSWindowDidResizeNotification",
+                "NSWindowDidChangeBackingPropertiesNotification",
+                "NSWindowDidChangeScreenNotification",
+            }) |name| {
+                const ns_name = NSString.msgSend(objc.Object, "stringWithUTF8String:", .{@as([*c]const u8, name)});
+                center.msgSend(void, "addObserver:selector:name:object:", .{
+                    panel, objc.sel("djinnPanelGeometryDidChange:"), ns_name, panel,
+                });
+            }
+        }
+
         return .{
             .ns_app = app,
             .ns_panel = panel,
@@ -238,6 +300,7 @@ pub const Panel = struct {
     }
 
     pub fn show(self: *Panel) void {
+        if (!@import("../ghostty/surface_lifecycle.zig").ensureActiveSession()) return;
         // Capture the app that's currently frontmost so hide() can hand
         // focus back. NSWorkspace.frontmostApplication returns the app with
         // the menu bar — the app the user was using before they hit our
@@ -291,8 +354,14 @@ pub const Panel = struct {
             };
             self.ns_panel.msgSend(void, "setFrame:display:", .{ start, @as(c_int, 0) });
         }
+        // Key/activation notifications and the animation can reenter us.
+        // Let blur dismissal see this show, and never overwrite its state
+        // if the user switches apps before the animation has completed.
+        self.visible = true;
         self.ns_panel.msgSend(void, "makeKeyAndOrderFront:", .{@as(?*anyopaque, null)});
+        if (!self.visible) return;
         self.ns_app.msgSend(void, "activateIgnoringOtherApps:", .{@as(c_int, 1)});
+        if (!self.visible) return;
 
         // makeKeyAndOrderFront resets firstResponder to the window's
         // initialFirstResponder (defaults to contentView, which is the
@@ -308,13 +377,15 @@ pub const Panel = struct {
         // Re-resolve theme on show. AppKit suppresses
         // viewDidChangeEffectiveAppearance for offscreen windows, so a
         // system light↔dark flip while the panel is hidden leaves djinn
-        // chrome (tab strip, log pane, find bar, panel bg) stuck on the
+        // chrome (tab strip, find bar, panel bg) stuck on the
         // stale palette. Ghostty's surface has its own appearance
         // pipeline and flips independently — that's why the terminal
         // pane updates but the chrome around it lags. The internal
         // `last_appearance == current_tag` guard makes this a no-op
         // when nothing actually changed.
-        @import("../terminal/theme_apply.zig").reapplyIfChanged();
+        if (!self.visible) return;
+        @import("../terminal/view.zig").reapplyThemeIfChanged();
+        @import("../terminal/view.zig").relayout();
 
         // Force a fresh redraw of the entire view hierarchy. orderOut may
         // discard the backing store; without an explicit invalidation, AppKit
@@ -324,18 +395,15 @@ pub const Panel = struct {
             cv.msgSend(void, "setNeedsDisplay:", .{@as(c_int, 1)});
             recursiveSetNeedsDisplay(cv);
         }
-        self.visible = true;
+        if (!self.visible) return;
 
-        // Step 5: ghostty surface focus follows panel visibility.
-        // Quake-drop UX = the panel is the only UI; if it's visible
-        // it owns input. setFocus(true) wakes the surface's renderer
-        // out of low-frequency idle. set_occlusion(true) tells the
-        // surface it's visible so CADisplayLink runs at full cadence.
+        // Visibility wakes rendering; focus follows the actual key window.
+        // Key notifications keep focus current even when hide-on-blur is off.
         if (app_state.g.ghostty.surface) |surf_ptr| {
             const ghostty_runtime = @import("../ghostty/runtime.zig");
             const surf: ghostty_runtime.c.ghostty_surface_t = @ptrCast(surf_ptr);
             ghostty_runtime.surfaceSetOcclusion(surf, true);
-            ghostty_runtime.surfaceSetFocus(surf, true);
+            ghostty_runtime.surfaceSetFocus(surf, self.ns_panel.msgSend(bool, "isKeyWindow", .{}));
         }
     }
 
@@ -399,11 +467,15 @@ pub const Panel = struct {
         self.syncHiddenState();
     }
 
-    /// Reconcile internal state with the panel being hidden — clears
-    /// `visible`, `prev_app_pid`, and tells the ghostty surface it
-    /// lost focus + occlusion. Called both from `hide()` (explicit
-    /// toggle) and from `didResignKeyImpl` (macOS-driven auto-hide
-    /// via `setHidesOnDeactivate:`).
+    /// Dismiss without animation or focus restoration: another app already
+    /// owns activation. Clear state before orderOut's reentrant key callback.
+    fn dismissForBlur(self: *Panel, event: BlurEvent) void {
+        if (!shouldDismissOnBlur(self.visible, app_state.g.window.hide_on_blur, event, self.ns_app.msgSend(bool, "isActive", .{}))) return;
+        self.syncHiddenState();
+        self.ns_panel.msgSend(void, "orderOut:", .{@as(?*anyopaque, null)});
+    }
+
+    /// Reconcile explicit toggle/blur dismissal with surface bookkeeping.
     pub fn syncHiddenState(self: *Panel) void {
         self.prev_app_pid = 0;
         self.visible = false;
@@ -460,8 +532,7 @@ pub const Panel = struct {
     /// position grid (top_left → origin stays at the top-left of the
     /// active screen; top_center → re-centers). Called when switching
     /// to a profile that has a persisted per-profile size in
-    /// state.json — log-heavy profile gets its tall+wide frame back,
-    /// shell profile gets its compact frame back. No-op when dims
+    /// state.json. Each profile gets its own frame back. No-op when dims
     /// match current frame to avoid a redundant repaint.
     pub fn setSize(self: *Panel, width: f64, height: f64) void {
         const cur = self.ns_panel.msgSend(NSRect, "frame", .{});
@@ -504,6 +575,7 @@ pub const Panel = struct {
         // window the user can't see.
         const animate: c_int = if (self.visible) 1 else 0;
         self.ns_panel.msgSend(void, "setFrame:display:animate:", .{ target, @as(c_int, 1), animate });
+        @import("../terminal/view.zig").relayout();
     }
 
     /// Register a resize-end handler. AppKit emits NSWindowDidEndLiveResize
@@ -528,26 +600,16 @@ pub const Panel = struct {
         });
     }
 
-    /// Enable auto-hide when djinn loses application focus. Implemented
-    /// as `setHidesOnDeactivate:enabled` — macOS hides the panel when
-    /// the user clicks/Cmd+Tabs into another app, and the user's chosen
-    /// app stays frontmost (no Accessory-app deactivation cascade fires
-    /// because djinn's deactivation is the *consequence* of the other
-    /// app activating, not the trigger).
-    ///
-    /// `didResignKeyImpl` runs alongside the auto-hide to keep djinn's
-    /// internal state (`visible`, ghostty focus/occlusion) in sync;
-    /// the resignKey observer is registered once and gates on
-    /// `hide_on_blur` at fire time.
+    /// Observe focus independently of the policy. Blur dismissal uses
+    /// orderOut, never AppKit auto-hide/restore, and also observes app
+    /// deactivation when the panel has already stopped being key.
     pub fn setHideOnBlur(self: *Panel, enabled: bool) void {
         app_state.g.window.hide_on_blur = enabled;
         app_state.g.window.panel = self;
 
-        const c_enabled: c_int = if (enabled) 1 else 0;
-        self.ns_panel.msgSend(void, "setHidesOnDeactivate:", .{c_enabled});
+        self.ns_panel.msgSend(void, "setHidesOnDeactivate:", .{@as(c_int, 0)});
 
-        if (g_resign_observer_registered) return;
-        g_resign_observer_registered = true;
+        if (g_key_observers_registered) return;
 
         const NSNotificationCenter = objc.getClass("NSNotificationCenter") orelse return;
         const center = NSNotificationCenter.msgSend(objc.Object, "defaultCenter", .{});
@@ -557,12 +619,38 @@ pub const Panel = struct {
             "stringWithUTF8String:",
             .{@as([*c]const u8, "NSWindowDidResignKeyNotification")},
         );
+        if (name.value == null) return;
+        const become_name = NSString.msgSend(
+            objc.Object,
+            "stringWithUTF8String:",
+            .{@as([*c]const u8, "NSWindowDidBecomeKeyNotification")},
+        );
+        if (become_name.value == null) return;
+        const deactivate_name = NSString.msgSend(
+            objc.Object,
+            "stringWithUTF8String:",
+            .{@as([*c]const u8, "NSApplicationDidResignActiveNotification")},
+        );
+        if (deactivate_name.value == null) return;
         center.msgSend(void, "addObserver:selector:name:object:", .{
             self.ns_panel,
             objc.sel("djinnPanelDidResignKey:"),
             name,
             self.ns_panel,
         });
+        center.msgSend(void, "addObserver:selector:name:object:", .{
+            self.ns_panel,
+            objc.sel("djinnPanelDidBecomeKey:"),
+            become_name,
+            self.ns_panel,
+        });
+        center.msgSend(void, "addObserver:selector:name:object:", .{
+            self.ns_panel,
+            objc.sel("djinnApplicationDidDeactivate:"),
+            deactivate_name,
+            self.ns_app,
+        });
+        g_key_observers_registered = true;
     }
 
     /// Update the panel's background color. No-op when blur is on
@@ -596,6 +684,11 @@ pub const Panel = struct {
     }
 
     pub fn deinit(self: *Panel) void {
+        if (objc.getClass("NSNotificationCenter")) |NotificationCenter| {
+            const center = NotificationCenter.msgSend(objc.Object, "defaultCenter", .{});
+            center.msgSend(void, "removeObserver:", .{self.ns_panel});
+        }
+        g_key_observers_registered = false;
         self.ns_panel.msgSend(void, "close", .{});
     }
 };

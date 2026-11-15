@@ -2,13 +2,7 @@ const std = @import("std");
 const objc = @import("objc");
 const theme_mod = @import("theme/theme.zig");
 
-/// Single source of truth for chrome (host UI surfaces — log pane, find
-/// overlay, future settings/palette). Derives colors + typography from
-/// the resolved Theme so every surface feels like one app, not three.
-///
-/// Anything that paints chrome should consume a `Style` and use the
-/// helpers in this module instead of hardcoding colors. The terminal
-/// surface itself is not chrome — ghostty owns its own render.
+/// Theme-derived styling for the find overlay and static tab strip.
 pub const Rgb = theme_mod.Rgb;
 
 pub const Style = struct {
@@ -17,34 +11,12 @@ pub const Style = struct {
     /// palette[8] — bright black. Section headers, timestamps, inline
     /// labels; anywhere subdued text reads better than full fg.
     dim: Rgb,
-    /// palette[12] / [11] / [9] — ANSI bright blue / yellow / red. Used
-    /// by the log pane for level dots; available for any chrome that
-    /// needs to signal info / warn / error consistently.
-    info: Rgb,
-    warn: Rgb,
-    err: Rgb,
-    /// 6 chromatic accents picked from the bright ANSI band
-    /// (palette[9..15], skipping bright_white). Hashed against client
-    /// id to give each MCP agent a stable color in log headers + tab
-    /// strip activity dots. Order is intentional: starts at the
-    /// info/blue end so single-client setups land on the same color
-    /// as the existing info hue.
-    client_palette: [6]Rgb,
     /// Inverted high-contrast chip for floating UI affordances (find
     /// overlay, future toasts). Reads as a distinct surface, not as
     /// blended chrome — that's the design call: chips DECLARE
     /// themselves; header strips RECEDE.
     chip: Chip,
-    /// Inherited from the resolved Theme — matches the terminal font so
-    /// chrome text + terminal text don't fight for attention.
-    font_family: []const u8,
-    /// Smaller secondary size for chrome (log entries, log header).
-    /// `max(11, theme.font_size - 2)` — readable but visually subordinate
-    /// to terminal output.
-    font_size_sm: f64,
-    /// Chip text size — same as `font_size_sm` so chip labels and log
-    /// entries read at the same visual weight. Different chrome roles
-    /// (floating control vs. side panel) but one typographic axis.
+    /// Secondary chrome text, kept subordinate to terminal output.
     font_size_chip: f64,
 
     pub fn fromTheme(t: theme_mod.Theme) Style {
@@ -52,22 +24,10 @@ pub const Style = struct {
             .bg = t.background,
             .fg = t.foreground,
             .dim = t.palette[8],
-            .info = t.palette[12],
-            .warn = t.palette[11],
-            .err = t.palette[9],
-            .client_palette = .{
-                t.palette[12], // bright blue
-                t.palette[10], // bright green
-                t.palette[11], // bright yellow
-                t.palette[13], // bright magenta
-                t.palette[14], // bright cyan
-                t.palette[9], // bright red
-            },
             .chip = blk: {
                 // 22% lift toward fg — strong enough to survive
                 // `background-opacity < 1` translucency over a desktop
-                // backdrop. Same fill drives the log pane, so chrome
-                // surfaces share one color.
+                // backdrop; shared by the remaining host chrome.
                 const chip_bg = mix(t.background, t.foreground, 0.22);
                 break :blk .{
                     .bg = chip_bg,
@@ -90,13 +50,11 @@ pub const Style = struct {
                     .border = mix(t.background, .{ .r = 0, .g = 0, .b = 0 }, 0.2),
                 };
             },
-            .font_family = t.font_family,
             // Cap chrome fonts so they stay visually subordinate to
             // terminal output regardless of how big the user runs the
             // terminal font. Floor 11 keeps text legible on small
             // themes; ceiling 13 stops chrome from competing at 18pt+
             // theme sizes.
-            .font_size_sm = @min(13, @max(11, t.font_size - 2)),
             .font_size_chip = @min(12, @max(11, t.font_size - 2)),
         };
     }
@@ -149,42 +107,17 @@ pub fn nsColorFromRgb(NSColor: objc.Class, c: Rgb) objc.Object {
 /// Resolve the chrome font — system UI font (San Francisco) at medium
 /// weight. Sits on a different typographic axis from the terminal's
 /// monospace so chrome text doesn't read as more terminal output.
-/// Used by the find chip + log entries.
-///
-/// `family` is unused — kept in the signature so the call sites read
-/// uniformly across "chrome wants the system font" + future helpers
-/// that may want the ghostty family.
-pub fn chromeFont(NSFont: objc.Class, family: []const u8, size: f64) objc.Object {
-    _ = family;
+/// Used by the find chip and tab labels.
+pub fn chromeFont(NSFont: objc.Class, size: f64) objc.Object {
     // NSFontWeightMedium = 0.23. systemFontOfSize:weight: takes a
     // CGFloat weight; 0.23 sits between regular (0.0) and semibold
     // (0.3) — readable without shouting.
     return NSFont.msgSend(objc.Object, "systemFontOfSize:weight:", .{ size, @as(f64, 0.23) });
 }
 
-/// Same as `nsColorFromRgb` but with caller-provided alpha. Useful for
-/// any chrome that wants a partially translucent fill (e.g. shadow
-/// scrim, modal backdrop).
-pub fn nsColorFromRgba(NSColor: objc.Class, c: Rgb, alpha: f64) objc.Object {
-    return NSColor.msgSend(
-        objc.Object,
-        "colorWithSRGBRed:green:blue:alpha:",
-        .{
-            @as(f64, @floatFromInt(c.r)) / 255.0,
-            @as(f64, @floatFromInt(c.g)) / 255.0,
-            @as(f64, @floatFromInt(c.b)) / 255.0,
-            alpha,
-        },
-    );
-}
-
-test "Style.fromTheme: dims + accents from palette" {
+test "Style.fromTheme: subdued color follows palette" {
     const t = theme_mod.Theme{};
-    const s = Style.fromTheme(t);
-    try std.testing.expectEqual(t.palette[8], s.dim);
-    try std.testing.expectEqual(t.palette[12], s.info);
-    try std.testing.expectEqual(t.palette[11], s.warn);
-    try std.testing.expectEqual(t.palette[9], s.err);
+    try std.testing.expectEqual(t.palette[8], Style.fromTheme(t).dim);
 }
 
 test "Style.fromTheme: chip bg lifted in-palette" {
@@ -194,16 +127,9 @@ test "Style.fromTheme: chip bg lifted in-palette" {
     try std.testing.expectEqual(t.foreground, s.chip.fg);
 }
 
-test "Style.font_size_sm: floor at 11" {
-    const t = theme_mod.Theme{ .font_size = 9 };
-    const s = Style.fromTheme(t);
-    try std.testing.expectEqual(@as(f64, 11), s.font_size_sm);
-}
-
-test "Style.font_size_sm: tracks larger sizes minus 2" {
-    const t = theme_mod.Theme{ .font_size = 14 };
-    const s = Style.fromTheme(t);
-    try std.testing.expectEqual(@as(f64, 12), s.font_size_sm);
+test "Style.font_size_chip stays legible and compact" {
+    try std.testing.expectEqual(@as(f64, 11), Style.fromTheme(.{ .font_size = 9 }).font_size_chip);
+    try std.testing.expectEqual(@as(f64, 12), Style.fromTheme(.{ .font_size = 18 }).font_size_chip);
 }
 
 test "mix: endpoints + midpoint" {

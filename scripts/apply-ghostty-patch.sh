@@ -1,30 +1,37 @@
 #!/usr/bin/env bash
-# apply-ghostty-patch.sh — patches the cached upstream ghostty source
+# apply-ghostty-patch.sh — patches the checkout-local upstream ghostty source
 # in-place so `dep.artifact("ghostty")` resolves on darwin.
 #
 # WHY:
 #   ghostty's build.zig gates its `install*` calls for the full
 #   libghostty behind `if (!isDarwin)`. Zig's `dep.artifact()` lookup
 #   reads the install registry, so on macOS the artifact is invisible
-#   to djinn. Patching the cached source removes the guard locally
-#   without forking ghostty.
+#   to djinn. The patch registers the shared renderer explicitly on
+#   Darwin without changing upstream's other installation behavior.
 #
 # IDEMPOTENCY:
-#   The script (a) locates the cached ghostty dir from
+#   The script (a) locates the extracted ghostty dir from
 #   build.zig.zon's pinned hash, (b) checks for a sentinel string the
 #   patch introduces (`djinn local patch`), and (c) applies via
 #   `patch -p1` only when the sentinel is absent. Re-runs are no-ops.
 #
 # WHEN TO RUN:
-#   - After the first `zig fetch` / `zig build` on a fresh checkout
-#   - After `rm -rf ~/.cache/zig` or other cache wipes
+#   - After the first `zig build --fetch` on a fresh checkout
+#   - After removing checkout-local zig-pkg/
 #   - After bumping the ghostty pin in build.zig.zon (re-fetch
 #     re-extracts pristine source; sentinel will be absent again)
 #
-# Not currently wired into `zig build` — Tier 5 hasn't started, the
-# main build still uses `ghostty-vt-static` which needs no patching.
+# scripts/build.sh applies this before invoking the project build.
+# This patch revision targets Ghostty v1.4.0.
 
 set -euo pipefail
+
+# The wrapper supplies the target OS; direct invocations default to the host.
+# Linux does not instantiate Ghostty or need its Darwin artifact registration.
+case "${1:-$(uname -s)}" in
+    Darwin|macos) ;;
+    *) exit 0 ;;
+esac
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PATCH_FILE="$REPO_ROOT/patches/ghostty-001-darwin-install.patch"
@@ -47,13 +54,12 @@ if [[ -z "$HASH" ]]; then
     exit 1
 fi
 
-# Resolve the global zig cache path. Default is `~/.cache/zig` on
-# linux/darwin; ZIG_GLOBAL_CACHE_DIR overrides.
-CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig}"
-PKG_DIR="$CACHE_DIR/p/$HASH"
+# Zig 0.17 extracts packages locally; the global cache holds archives.
+# Patch only this checkout's extraction, never another build's sources.
+PKG_DIR="${ZIG_LOCAL_PKG_DIR:-$REPO_ROOT/zig-pkg}/$HASH"
 
 if [[ ! -d "$PKG_DIR" ]]; then
-    echo "ghostty cache not found at $PKG_DIR — run \`zig fetch\` or \`zig build\` first" >&2
+    echo "ghostty source not found at $PKG_DIR — run \`zig build --fetch\` first" >&2
     exit 1
 fi
 

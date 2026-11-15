@@ -2,12 +2,13 @@
 #
 # One-shot: create a self-signed code-signing cert in the login keychain
 # so every `install-app` re-signs the bundle under the same identity.
-# TCC keys grants on cdhash for ad-hoc-signed binaries, so each rebuild
-# burns Accessibility / Input Monitoring grants. With a stable signing
-# identity, the bundle's designated requirement stays constant across
-# rebuilds and macOS treats every new build as the same app.
+# A stable signing identity keeps the bundle's designated requirement
+# constant across rebuilds. It is not needed for native global hotkeys.
 #
-# Idempotent — re-running detects an existing identity and skips.
+# This optional helper mutates the login keychain and trust settings and
+# can remove an existing certificate with the same name. Review it first.
+# A valid existing identity is detected and skipped; this path has not been
+# exercised by the automated bundle verification.
 # Run once: `./scripts/dev-cert-create.sh`. Then deploy as usual; the
 # bundle codesign step picks up the identity automatically when present.
 #

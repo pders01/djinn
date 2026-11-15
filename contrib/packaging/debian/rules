@@ -5,7 +5,7 @@
 
 # ZIG is overridable for hosts where zig isn't on PATH or a specific
 # version is needed. Defaults to the user's `zig` binary; CI / packagers
-# can pass ZIG=/opt/zig-0.15.2/zig.
+# can pass ZIG=/opt/zig-0.17.1/zig.
 export ZIG ?= zig
 
 # Defaults work for djinn: `dh $@` runs the full sequence including
@@ -22,12 +22,10 @@ export ZIG ?= zig
 	dh $@
 
 override_dh_auto_configure:
-	# Pre-fetch the build.zig.zon graph (ghostty + transitive deps).
-	# Requires network access — Debian buildds typically block it, so
-	# this skeleton targets PPAs / local builds rather than the
-	# official archive. `--fetch` is idempotent; safe to re-run.
+	test "$$($(ZIG) version)" = 0.17.1
+	# Cold caches require network access; this targets local builds,
+	# not official offline Debian buildds. No Darwin patch on Linux.
 	$(ZIG) build --fetch
-	./scripts/apply-ghostty-patch.sh
 
 override_dh_auto_build:
 	$(ZIG) build -Doptimize=ReleaseSafe -Dsystem-install=true
@@ -46,8 +44,10 @@ override_dh_auto_install:
 	    --prefix debian/tmp/usr
 
 override_dh_auto_test:
-	# zig build test runs the platform-agnostic suite. Skipped in the
-	# Debian build because builders may not have zig available on
-	# PATH at test time (the wrapper's already done build + install
-	# at this point). Run `zig build test` locally before tagging a
-	# release instead.
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	$(ZIG) build check test
+endif
+
+# Shipping a launch option is not consent to start a persistent process.
+override_dh_installsystemduser:
+	dh_installsystemduser --no-enable --no-start

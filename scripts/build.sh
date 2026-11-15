@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
-# build.sh — wrapper around `zig build` that handles the Tier-5
-# integration prereqs:
+# build.sh — cross-platform wrapper around `zig build`. Linux goes directly
+# to Zig (GTK4/VTE via pkg-config); macOS handles the ghostty
+# integration prerequisites:
 #
-#   1. `zig fetch` to materialize ghostty in the global cache.
+#   1. `zig build --fetch` to materialize ghostty in checkout-local zig-pkg/.
 #   2. Apply patches/ghostty-001-darwin-install.patch via
 #      scripts/apply-ghostty-patch.sh (idempotent).
 #   3. Invoke `zig build` with the args we got, with environment
@@ -12,17 +13,19 @@
 # Why we need this:
 #   djinn now links against the full libghostty (not just
 #   ghostty-vt-static) so the surface API is reachable. ghostty's
-#   build.zig has an upstream darwin install guard that the patch
-#   removes, and ghostty's Metal renderer compiles `.metal` shaders
+#   build.zig does not register the full artifact on Darwin; the patch
+#   adds that registration. ghostty's Metal renderer compiles `.metal` shaders
 #   via `xcrun -sdk macosx metal` which needs the system toolchain
-#   on PATH and `DEVELOPER_DIR` / `SDKROOT` un-overridden. The nix
-#   dev shell sets those env vars to a stripped-down apple-sdk-14.4
-#   that doesn't ship Metal.
+#   on PATH and `DEVELOPER_DIR` / `SDKROOT` un-overridden. The Nix
+#   xcrun wrapper answers SDK discovery with the pinned Nix SDK (also
+#   needed to link Zig's build runner), but delegates tool execution
+#   to system Xcode, since the Nix SDK doesn't ship Metal.
 #
 # Prereqs the user has to satisfy once:
 #   - Xcode + the optional Metal Toolchain component:
-#       sudo xcodebuild -downloadComponent MetalToolchain
-#   - Run from inside `nix develop` (or any shell with zig 0.15.2+).
+#       xcodebuild -downloadComponent MetalToolchain
+#       xcrun -sdk macosx metal --version
+#   - Run from inside `nix develop` (or a shell with Zig exactly 0.17.1).
 #
 # All args after `build.sh` are forwarded verbatim to `zig build`,
 # e.g.:
@@ -36,17 +39,26 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-# Step 1: ensure the ghostty source is in the cache. `zig fetch`
-# without args is a no-op in 0.15; `zig build --fetch` does the
-# resolve without compiling anything.
-zig build --fetch >/dev/null 2>&1 || true
+# Linux uses VTE and needs neither Ghostty extraction nor an Apple patch.
+# Honor cross-target checks too, e.g. build.sh check -Dtarget=x86_64-linux-gnu.
+TARGET_OS="$(uname -s)"
+for arg in "$@"; do
+    case "$arg" in
+        -Dtarget=*-linux*) TARGET_OS=Linux ;;
+        -Dtarget=*-macos*) TARGET_OS=Darwin ;;
+        -Dtarget=native) TARGET_OS="$(uname -s)" ;;
+    esac
+done
 
-# Step 2: apply patches (idempotent).
-"$REPO_ROOT/scripts/apply-ghostty-patch.sh"
+if [[ "$TARGET_OS" == Darwin ]]; then
+    # Preserve pinned SDK discovery; use system Xcode for Metal tools.
+    unset DEVELOPER_DIR SDKROOT
+    export PATH="${DJINN_XCRUN_BIN:+$DJINN_XCRUN_BIN:}/usr/bin:$PATH"
 
-# Step 3: build with the right env. Unset the nix-imposed Apple SDK
-# overrides so xcrun falls back to system Xcode for the Metal
-# Toolchain lookup. Prepend /usr/bin so the system xcrun (which
-# resolves through Xcode) shadows the nix `xcbuild` shim.
-unset DEVELOPER_DIR SDKROOT
-PATH="/usr/bin:$PATH" exec zig build "$@"
+    # Graph resolution may fail before the first patch. The real build below
+    # must still succeed; do not hide any of its diagnostics or exit status.
+    zig build --fetch "$@" >/dev/null 2>&1 || true
+    "$REPO_ROOT/scripts/apply-ghostty-patch.sh" macos
+fi
+
+exec zig build "$@"

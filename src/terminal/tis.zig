@@ -17,25 +17,7 @@ const std = @import("std");
 // keys under the fast-path. Refining the deny-list is a follow-up;
 // US / ABC / Dvorak / Colemak — the common case — work as-is.
 
-const cf = @cImport({
-    @cInclude("CoreFoundation/CoreFoundation.h");
-});
-
-extern "c" fn TISCopyCurrentKeyboardInputSource() ?*anyopaque;
-extern "c" fn TISGetInputSourceProperty(src: ?*anyopaque, key: ?*anyopaque) ?*anyopaque;
-extern const kTISPropertyInputSourceID: ?*anyopaque;
-
-extern "c" fn CFNotificationCenterGetDistributedCenter() ?*anyopaque;
-extern "c" fn CFNotificationCenterAddObserver(
-    center: ?*anyopaque,
-    observer: ?*const anyopaque,
-    callback: ?*const fn (?*anyopaque, ?*anyopaque, ?*anyopaque, ?*const anyopaque, ?*anyopaque) callconv(.c) void,
-    name: ?*anyopaque,
-    object: ?*const anyopaque,
-    suspensionBehavior: c_int,
-) void;
-
-const cf_notification_suspension_deliver_immediately: c_int = 4;
+const cf = @import("darwin-c");
 
 /// Cached. `false` is the safe default — caller takes the slow path
 /// (full NSTextInputContext.handleEvent: round-trip) until refresh()
@@ -49,13 +31,13 @@ pub fn isLatin() bool {
 const latin_prefix = "com.apple.keylayout.";
 
 fn refresh() void {
-    const src = TISCopyCurrentKeyboardInputSource() orelse {
+    const src = cf.TISCopyCurrentKeyboardInputSource() orelse {
         g_is_latin = false;
         return;
     };
     defer cf.CFRelease(@ptrCast(src));
 
-    const id_obj = TISGetInputSourceProperty(src, kTISPropertyInputSourceID) orelse {
+    const id_obj = cf.TISGetInputSourceProperty(src, cf.kTISPropertyInputSourceID) orelse {
         g_is_latin = false;
         return;
     };
@@ -73,11 +55,11 @@ fn refresh() void {
 }
 
 fn onInputSourceChanged(
+    _: cf.CFNotificationCenterRef,
     _: ?*anyopaque,
-    _: ?*anyopaque,
-    _: ?*anyopaque,
+    _: cf.CFNotificationName,
     _: ?*const anyopaque,
-    _: ?*anyopaque,
+    _: cf.CFDictionaryRef,
 ) callconv(.c) void {
     refresh();
 }
@@ -87,11 +69,10 @@ fn onInputSourceChanged(
 pub fn install() void {
     refresh();
 
-    const center = CFNotificationCenterGetDistributedCenter() orelse return;
+    const center = cf.CFNotificationCenterGetDistributedCenter() orelse return;
     // Notification posted by HIToolbox when the selected keyboard
     // input source changes (kTISNotifySelectedKeyboardInputSourceChanged).
-    // Use the literal name string to avoid pulling the Carbon umbrella
-    // header just for one constant pointer.
+    // Keep the existing literal notification name.
     const name = cf.CFStringCreateWithCString(
         null,
         "AppleSelectedInputSourcesChangedNotification",
@@ -99,12 +80,12 @@ pub fn install() void {
     ) orelse return;
     defer cf.CFRelease(@ptrCast(name));
 
-    CFNotificationCenterAddObserver(
+    cf.CFNotificationCenterAddObserver(
         center,
         null,
         onInputSourceChanged,
-        @ptrCast(@constCast(name)),
+        name,
         null,
-        cf_notification_suspension_deliver_immediately,
+        cf.CFNotificationSuspensionBehaviorDeliverImmediately,
     );
 }

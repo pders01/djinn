@@ -1,7 +1,7 @@
 //! Linux platform aggregator.
 //!
 //! Re-exports the Linux subsystem modules under flat names so callers
-//! in `main_linux.zig` reach them via `platform.zig` rather than
+//! in `main_linux.zig` reach them via this module rather than
 //! poking inside `src/platform/linux/*` directly.
 
 pub const panel = @import("linux/panel.zig");
@@ -20,21 +20,11 @@ pub const tab_strip = @import("linux/tab_strip.zig");
 pub const TabStrip = tab_strip.TabStrip;
 pub const TabStripOnActivate = tab_strip.OnActivate;
 
-pub const palette = @import("linux/palette.zig");
-pub const Palette = palette.Palette;
-pub const PaletteOnActivate = palette.OnActivate;
-
 pub const keymap = @import("linux/keymap.zig");
 pub const KeymapContext = keymap.Context;
 
-pub const log_pane = @import("linux/log_pane.zig");
-pub const LogPane = log_pane.LogPane;
-
 pub const find_overlay = @import("linux/find_overlay.zig");
 pub const FindOverlay = find_overlay.FindOverlay;
-
-pub const cheatsheet = @import("linux/cheatsheet.zig");
-pub const Cheatsheet = cheatsheet.Cheatsheet;
 
 pub const ghostty_config = @import("linux/ghostty_config.zig");
 pub const GhosttyColors = ghostty_config.Colors;
@@ -58,7 +48,6 @@ pub const TrayHandler = tray.Handler;
 
 pub const notifier = @import("linux/notifier.zig");
 pub const Notifier = notifier.Notifier;
-pub const NotifyKind = notifier.Kind;
 
 pub const watcher = @import("linux/watcher.zig");
 pub const Watcher = watcher.Watcher;

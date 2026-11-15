@@ -11,7 +11,7 @@ _pkgname=djinn
 pkgname=djinn-git
 pkgver=0.1.0_alpha.1.r0.0000000
 pkgrel=1
-pkgdesc="Drop-down terminal panel + MCP agent surface (Wayland) — git/main"
+pkgdesc="Quake-style drop-down terminal (GTK4/VTE, Wayland) — git/main"
 arch=('x86_64' 'aarch64')
 url="https://github.com/derscheid/djinn"
 license=('MIT')
@@ -30,7 +30,7 @@ conflicts=("$_pkgname")
 # GlobalShortcuts hotkey path AND the Settings color-scheme probe
 # that drives ghostty light/dark theme switching.
 depends=(
-  'gtk4'
+  'gtk4>=4.12'
   'gtk4-layer-shell'
   'vte4'
   'glib2'
@@ -48,19 +48,14 @@ optdepends=(
   'xdg-desktop-portal-kde: GlobalShortcuts on KDE Plasma'
   'xdg-desktop-portal-hyprland: GlobalShortcuts on Hyprland'
   'xdg-desktop-portal-wlr: GlobalShortcuts on sway / wlroots-likes'
-  'libnotify: org.freedesktop.Notifications client (for agent banners)'
   'socat: bind the IPC socket to a compositor hotkey'
 )
 
-# Pinned to zig 0.15.x via the AUR `zig0.15` / `zig0.15-bin` packages
-# (both install `/usr/bin/zig-0.15`; the `-bin` variant `provides=zig0.15`
-# so this single name covers either install). Cannot use the official
-# `zig` package — Arch ships 0.16 there, and ghostty's `requireZig` in
-# its build.zig explicitly rejects anything outside 0.15.2 with a
-# @compileError. Several transitive deps (uucode, zig_objc) also hit
-# zig 0.16 std-lib API breakages independent of ghostty.
+# Exact project compiler. If the repository does not carry this version,
+# supply a local package providing zig=0.17.1; do not silently use a newer
+# compiler or assume that a versioned AUR package exists.
 makedepends=(
-  'zig0.15'
+  'zig=0.17.1'
   'pkgconf'
   'git'
 )
@@ -85,12 +80,12 @@ pkgver() {
 
 prepare() {
   cd "$_pkgname"
-  # Pre-fetch zig deps so the build phase doesn't need network access.
-  # `zig build --fetch` is idempotent + non-destructive.
-  zig-0.15 build --fetch
-  # Apply the ghostty-darwin install patch. Cross-platform safe; the
-  # script is a no-op on linux but the build expects it to have run.
-  ./scripts/apply-ghostty-patch.sh
+  [[ "$(zig version)" == 0.17.1 ]] || {
+    echo 'djinn requires Zig 0.17.1' >&2
+    return 1
+  }
+  # Pre-fetch pinned archives; Linux never instantiates or patches Ghostty.
+  zig build --fetch
 }
 
 build() {
@@ -105,7 +100,12 @@ build() {
   # prefix `zig-out/` keeps the binary + share tree in the source dir;
   # package() then re-runs install with --prefix=$pkgdir/usr, which
   # re-uses the build cache and just copies files.
-  zig-0.15 build -Doptimize=ReleaseSafe -Dsystem-install=true
+  zig build -Doptimize=ReleaseSafe -Dsystem-install=true
+}
+
+check() {
+  cd "$_pkgname"
+  zig build check test
 }
 
 package() {
@@ -117,6 +117,6 @@ package() {
   # build.zig drop .desktop / .service / LICENSE / README under
   # share/ — without it pacman would track only the binary and the
   # other artifacts would orphan on uninstall.
-  zig-0.15 build install -Doptimize=ReleaseSafe -Dsystem-install=true \
+  zig build install -Doptimize=ReleaseSafe -Dsystem-install=true \
     --prefix "$pkgdir/usr"
 }

@@ -28,7 +28,7 @@
 //! user has a system install AND a dev build.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const platform = @import("../../io/platform.zig");
 
 /// Mirrors `system/loginitem.zig`'s Status. Linux only ever returns
 /// `not_registered` or `enabled` — the macOS-specific
@@ -66,26 +66,19 @@ pub fn register(allocator: std.mem.Allocator) !void {
     const path = try desktopPath(allocator);
     defer allocator.free(path);
 
-    // Best-effort: create the parent dir. ENOENT on the dir means
-    // we're the first autostart-using app on this system; any other
-    // error gets reported through the file create below with a
-    // clearer message.
-    if (std.fs.path.dirname(path)) |dir| {
-        std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => |e| {
-                std.debug.print("autostart: makeDirAbsolute({s}) failed: {}\n", .{ dir, e });
-                return Error.OperationFailed;
-            },
-        };
-    }
-
     const exec_path = try resolveExePath(allocator);
     defer allocator.free(exec_path);
+    try registerAt(allocator, path, exec_path);
+}
 
-    var body_buf: [1024]u8 = undefined;
-    const body = std.fmt.bufPrint(&body_buf, desktop_template, .{exec_path}) catch
-        return Error.OperationFailed;
+/// Explicit destination/executable for safe fixtures. No environment reads.
+fn registerAt(allocator: std.mem.Allocator, path: []const u8, exec_path: []const u8) !void {
+    const io = platform.io();
+    if (std.fs.path.dirname(path)) |dir| {
+        std.Io.Dir.cwd().createDirPath(io, dir) catch return Error.OperationFailed;
+    }
+    const body = try std.fmt.allocPrint(allocator, desktop_template, .{exec_path});
+    defer allocator.free(body);
 
     // Atomic write: stage to `<path>.tmp`, then rename over `<path>`.
     // Crash between createFile and writeAll on the prior shape left
@@ -99,23 +92,23 @@ pub fn register(allocator: std.mem.Allocator) !void {
     defer allocator.free(tmp_path);
 
     {
-        const file = std.fs.createFileAbsolute(tmp_path, .{ .truncate = true }) catch |err| {
+        const file = std.Io.Dir.cwd().createFile(io, tmp_path, .{ .truncate = true }) catch |err| {
             std.debug.print("autostart: create({s}) failed: {}\n", .{ tmp_path, err });
             return Error.OperationFailed;
         };
-        defer file.close();
-        file.writeAll(body) catch |err| {
+        defer file.close(io);
+        file.writeStreamingAll(io, body) catch |err| {
             std.debug.print("autostart: write failed: {}\n", .{err});
             // Clean up the partial .tmp so we don't leave debris on
             // the next register attempt's rename target.
-            std.fs.deleteFileAbsolute(tmp_path) catch {};
+            std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
             return Error.OperationFailed;
         };
     }
 
-    std.fs.renameAbsolute(tmp_path, path) catch |err| {
+    std.Io.Dir.rename(.cwd(), tmp_path, .cwd(), path, io) catch |err| {
         std.debug.print("autostart: rename({s} → {s}) failed: {}\n", .{ tmp_path, path, err });
-        std.fs.deleteFileAbsolute(tmp_path) catch {};
+        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
         return Error.OperationFailed;
     };
 }
@@ -127,7 +120,11 @@ pub fn unregister(allocator: std.mem.Allocator) !void {
     const path = try desktopPath(allocator);
     defer allocator.free(path);
 
-    std.fs.deleteFileAbsolute(path) catch |err| switch (err) {
+    try unregisterAt(path);
+}
+
+fn unregisterAt(path: []const u8) !void {
+    std.Io.Dir.cwd().deleteFile(platform.io(), path) catch |err| switch (err) {
         error.FileNotFound => return,
         else => |e| {
             std.debug.print("autostart: delete({s}) failed: {}\n", .{ path, e });
@@ -138,15 +135,17 @@ pub fn unregister(allocator: std.mem.Allocator) !void {
 
 /// Read the current state. Truthful but coarse: any existing file
 /// counts as `enabled`. We don't parse the `Hidden=true` /
-/// `X-GNOME-Autostart-enabled=false` opt-out keys; if a user wants
-/// to keep the file but disable the autostart, they can edit the
-/// file and we won't claim it's enabled — but the simpler rule
-/// matches what real DEs do at session-start time.
+/// `X-GNOME-Autostart-enabled=false` opt-out keys; an entry edited
+/// outside djinn can therefore be present but disabled by the DE.
 pub fn status(allocator: std.mem.Allocator) !Status {
     const path = try desktopPath(allocator);
     defer allocator.free(path);
 
-    std.fs.accessAbsolute(path, .{}) catch |err| switch (err) {
+    return statusAt(path);
+}
+
+fn statusAt(path: []const u8) Status {
+    std.Io.Dir.cwd().access(platform.io(), path, .{}) catch |err| switch (err) {
         error.FileNotFound => return .not_registered,
         else => return .unknown,
     };
@@ -159,12 +158,16 @@ pub fn status(allocator: std.mem.Allocator) !Status {
 /// to `$HOME/.config/autostart/djinn.desktop` when XDG_CONFIG_HOME
 /// is unset. Returned slice is allocator-owned.
 fn desktopPath(allocator: std.mem.Allocator) ![]u8 {
-    if (std.posix.getenv("XDG_CONFIG_HOME")) |xdg| {
-        if (xdg.len > 0) {
+    return desktopPathFor(allocator, platform.getenv("XDG_CONFIG_HOME"), platform.getenv("HOME"));
+}
+
+fn desktopPathFor(allocator: std.mem.Allocator, xdg_home: ?[]const u8, home_dir: ?[]const u8) ![]u8 {
+    if (xdg_home) |xdg| {
+        if (std.fs.path.isAbsolute(xdg)) {
             return std.fmt.allocPrint(allocator, "{s}/autostart/djinn.desktop", .{xdg});
         }
     }
-    const home = std.posix.getenv("HOME") orelse return Error.NoHomeDir;
+    const home = home_dir orelse return Error.NoHomeDir;
     return std.fmt.allocPrint(allocator, "{s}/.config/autostart/djinn.desktop", .{home});
 }
 
@@ -179,11 +182,9 @@ fn desktopPath(allocator: std.mem.Allocator) ![]u8 {
 /// land in the .desktop's `Exec=` and the autostart entry would
 /// silently fail at the next login.
 fn resolveExePath(allocator: std.mem.Allocator) ![]u8 {
-    var buf: [4096]u8 = undefined;
-    const link_target = std.posix.readlink("/proc/self/exe", &buf) catch
-        return Error.OperationFailed;
-    const cleaned = stripDeletedAnnotation(link_target);
-    return allocator.dupe(u8, cleaned);
+    const path = platform.executablePathAlloc(allocator) catch return Error.OperationFailed;
+    defer allocator.free(path);
+    return allocator.dupe(u8, stripDeletedAnnotation(path));
 }
 
 /// Trim the trailing ` (deleted)` annotation kernels append when the
@@ -238,18 +239,50 @@ const desktop_template =
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
-test "desktopPath honors XDG_CONFIG_HOME when set" {
-    // std.posix.getenv reads the real process env, which we can't
-    // mutate portably in tests. We can still cover the fallback
-    // branch by checking the suffix shape.
-    if (builtin.os.tag != .linux) return;
-    const path = try desktopPath(std.testing.allocator);
-    defer std.testing.allocator.free(path);
-    try std.testing.expect(std.mem.endsWith(u8, path, "/autostart/djinn.desktop"));
+test "Autostart native API compiles without accessing personal files" {
+    std.testing.refAllDecls(@This());
+}
+
+test "desktopPath honors injected XDG_CONFIG_HOME and HOME fallback" {
+    const a = std.testing.allocator;
+    const path = try desktopPathFor(a, "/fixture/config", "/fixture/home");
+    defer a.free(path);
+    try std.testing.expectEqualStrings("/fixture/config/autostart/djinn.desktop", path);
+    for ([_]?[]const u8{ null, "", "relative" }) |xdg| {
+        const fallback = try desktopPathFor(a, xdg, "/fixture/home");
+        defer a.free(fallback);
+        try std.testing.expectEqualStrings("/fixture/home/.config/autostart/djinn.desktop", fallback);
+    }
+    try std.testing.expectError(Error.NoHomeDir, desktopPathFor(a, null, null));
+}
+
+test "autostart register, replace, status and unregister use only a temp fixture" {
+    const a = std.testing.allocator;
+    const io = platform.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "config/autostart/djinn.desktop" });
+    defer a.free(path);
+    try std.testing.expectEqual(Status.not_registered, statusAt(path));
+    try registerAt(a, path, "/fixture/bin/djinn");
+    try std.testing.expectEqual(Status.enabled, statusAt(path));
+    try registerAt(a, path, "/fixture/replaced/djinn");
+    const body = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(8192));
+    defer a.free(body);
+    const expected = try std.fmt.allocPrint(a, desktop_template, .{"/fixture/replaced/djinn"});
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, body);
+    const staged = try std.fmt.allocPrint(a, "{s}.tmp", .{path});
+    defer a.free(staged);
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, staged, .{}));
+    try unregisterAt(path);
+    try unregisterAt(path);
+    try std.testing.expectEqual(Status.not_registered, statusAt(path));
 }
 
 test "Status.label covers every case" {
-    if (builtin.os.tag != .linux) return;
     const cases = [_]Status{
         .not_registered,
         .enabled,

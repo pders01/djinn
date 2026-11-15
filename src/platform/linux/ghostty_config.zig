@@ -30,6 +30,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("../../io/platform.zig");
 
 pub const Rgb = struct { r: u8, g: u8, b: u8 };
 
@@ -46,7 +47,7 @@ pub const Colors = struct {
     /// 16-color ANSI palette. Each slot is independently optional —
     /// a theme that sets only the bright variants leaves slots 0–7
     /// null and the caller fills with VTE defaults.
-    palette: [16]?Rgb = .{null} ** 16,
+    palette: [16]?Rgb = @splat(null),
     /// Owned slice. Freed in deinit. Caller can dupe to extend
     /// lifetime past `Colors.deinit`.
     font_family: ?[]const u8 = null,
@@ -65,24 +66,45 @@ pub const Colors = struct {
 /// caller decides whether that's an error. On success the caller owns
 /// the returned Colors and must call `Colors.deinit(allocator)`.
 pub fn loadFromUserConfig(allocator: std.mem.Allocator) !?Colors {
-    const home = std.posix.getenv("HOME") orelse return null;
-
-    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/.config/ghostty/config", .{home});
+    const root = try configRoot(allocator) orelse return null;
+    defer allocator.free(root);
+    const cfg_path = try std.fs.path.join(allocator, &.{ root, "ghostty/config" });
     defer allocator.free(cfg_path);
+    const user_themes = try std.fs.path.join(allocator, &.{ root, "ghostty/themes" });
+    defer allocator.free(user_themes);
+    return loadFromPath(allocator, cfg_path, detectAppearance(), &.{
+        user_themes,
+        "/usr/share/ghostty/themes",
+        "/usr/local/share/ghostty/themes",
+    });
+}
 
-    const file = std.fs.openFileAbsolute(cfg_path, .{}) catch |err| switch (err) {
-        error.FileNotFound, error.AccessDenied => return null,
-        else => return err,
-    };
-    defer file.close();
+fn configRoot(allocator: std.mem.Allocator) !?[]u8 {
+    if (platform.getenv("XDG_CONFIG_HOME")) |xdg| {
+        if (std.fs.path.isAbsolute(xdg)) return try allocator.dupe(u8, xdg);
+    }
+    const home = platform.getenv("HOME") orelse return null;
+    return try std.fs.path.join(allocator, &.{ home, ".config" });
+}
+
+/// Explicit paths and appearance keep fixtures independent of the user's
+/// configuration and the settings portal. Theme directories are searched
+/// in the supplied order; no implicit personal/system reads occur here.
+pub fn loadFromPath(
+    allocator: std.mem.Allocator,
+    cfg_path: []const u8,
+    appearance: Appearance,
+    theme_dirs: []const []const u8,
+) !?Colors {
 
     // 1 MiB cap. Real-world ghostty configs sit under 10 KB; the
     // ceiling is just to keep a runaway file from OOMing startup.
     // Hard-fatal `readToEndAlloc` made a too-big config block the
     // whole inheritance path with no recovery — degrade to "use VTE
     // defaults" instead so the panel still opens.
-    const text = file.readToEndAlloc(allocator, 1 << 20) catch |err| switch (err) {
-        error.FileTooBig => {
+    const text = std.Io.Dir.cwd().readFileAlloc(platform.io(), cfg_path, allocator, .limited(1 << 20)) catch |err| switch (err) {
+        error.FileNotFound, error.AccessDenied => return null,
+        error.StreamTooLong => {
             std.debug.print("ghostty config: {s} exceeds 1 MiB cap; skipping inheritance\n", .{cfg_path});
             return null;
         },
@@ -98,11 +120,10 @@ pub fn loadFromUserConfig(allocator: std.mem.Allocator) !?Colors {
     // returns a slice borrowing from `text`; we dupe it because the
     // theme-file load allocates and we don't want to entangle its
     // lifetime with the source buffer.
-    const appearance = detectAppearance();
     if (findThemeName(text, appearance)) |name_borrow| {
         const name = try allocator.dupe(u8, name_borrow);
         defer allocator.free(name);
-        if (try loadThemeFile(allocator, name)) |theme_colors|
+        if (try loadThemeFile(allocator, name, theme_dirs)) |theme_colors|
             colors = theme_colors;
     }
 
@@ -137,7 +158,7 @@ fn stripInlineComment(line: []const u8) []const u8 {
             if (is_hex) continue;
         }
         if (i == 0) return line[0..0];
-        return std.mem.trimRight(u8, line[0..i], " \t");
+        return std.mem.trimEnd(u8, line[0..i], " \t");
     }
     return line;
 }
@@ -197,8 +218,9 @@ pub fn parseInto(text: []const u8, colors: *Colors, allocator: std.mem.Allocator
             if (idx >= 16) continue;
             if (parseColor(color_str)) |c| colors.palette[idx] = c;
         } else if (std.mem.eql(u8, key, "font-family")) {
+            const family = try allocator.dupe(u8, val);
             if (colors.font_family) |s| allocator.free(s);
-            colors.font_family = try allocator.dupe(u8, val);
+            colors.font_family = family;
         } else if (std.mem.eql(u8, key, "font-size")) {
             if (std.fmt.parseFloat(f64, val)) |v| {
                 if (v > 0) colors.font_size = v;
@@ -254,7 +276,7 @@ pub fn pickThemeVariant(spec: []const u8, appearance: Appearance) []const u8 {
     return spec;
 }
 
-fn loadThemeFile(allocator: std.mem.Allocator, name: []const u8) !?Colors {
+fn loadThemeFile(allocator: std.mem.Allocator, name: []const u8, theme_dirs: []const []const u8) !?Colors {
     // Reject names that could escape the themes/ directories. A
     // malicious ghostty config (shared dotfiles repo, copy-pasted from
     // a forum) with `theme = ../../../etc/passwd` would otherwise
@@ -265,19 +287,7 @@ fn loadThemeFile(allocator: std.mem.Allocator, name: []const u8) !?Colors {
     // future fourth search path can't forget the check.
     if (!isSafeThemeName(name)) return null;
 
-    // User dir first so user-supplied themes shadow system ones. The
-    // `/usr/local/share` slot covers Homebrew-on-linux installs;
-    // `/usr/share` covers Arch/Fedora/Debian packages.
-    if (std.posix.getenv("HOME")) |home| {
-        const p = try std.fmt.allocPrint(allocator, "{s}/.config/ghostty/themes/{s}", .{ home, name });
-        defer allocator.free(p);
-        if (try tryLoadThemeAt(allocator, p)) |c| return c;
-    }
-    const system_dirs = [_][]const u8{
-        "/usr/share/ghostty/themes",
-        "/usr/local/share/ghostty/themes",
-    };
-    for (system_dirs) |dir| {
+    for (theme_dirs) |dir| {
         const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir, name });
         defer allocator.free(p);
         if (try tryLoadThemeAt(allocator, p)) |c| return c;
@@ -304,24 +314,27 @@ fn isSafeThemeName(name: []const u8) bool {
 }
 
 fn tryLoadThemeAt(allocator: std.mem.Allocator, path: []const u8) !?Colors {
-    const file = std.fs.openFileAbsolute(path, .{ .mode = .read_only, .lock = .none }) catch |err| switch (err) {
+    const io = platform.io();
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| switch (err) {
         error.FileNotFound, error.AccessDenied, error.IsDir => return null,
         else => return err,
     };
-    defer file.close();
+    defer file.close(io);
 
     // Refuse anything that isn't a regular file. A theme file
     // symlinked at `/dev/zero` would otherwise block startup on a
     // 1 MiB read; a fifo replacement between path resolution and
     // open would otherwise hang.
-    const stat = file.stat() catch return null;
+    const stat = file.stat(io) catch return null;
     if (stat.kind != .file) return null;
 
     // Same 1 MiB cap as the user config; degrade to "skip this
     // theme" instead of aborting startup when a runaway theme file
     // hits the ceiling.
-    const text = file.readToEndAlloc(allocator, 1 << 20) catch |err| switch (err) {
-        error.FileTooBig => return null,
+    var reader = file.reader(io, &.{});
+    const text = reader.interface.allocRemaining(allocator, .limited(1 << 20)) catch |err| switch (err) {
+        error.StreamTooLong => return null,
+        error.ReadFailed => return reader.err.?,
         else => return err,
     };
     defer allocator.free(text);
@@ -641,6 +654,40 @@ test "findThemeName: variant split picks active" {
 
 test "findThemeName: missing key returns null" {
     try std.testing.expectEqual(@as(?[]const u8, null), findThemeName("background = #fff\n", .dark));
+}
+
+test "Ghostty config native API compiles without reading personal files" {
+    std.testing.refAllDecls(@This());
+}
+
+test "loadFromPath merges only injected temporary config and themes" {
+    const a = std.testing.allocator;
+    const io = platform.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(io, "themes", .default_dir);
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "config",
+        .data = "theme = light:Day,dark:Night\nforeground = #ffffff\nfont-size = 15\n",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "themes/Night",
+        .data = "background = #112233\nforeground = #000000\nfont-family = fixture-font\n",
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const path = try std.fs.path.join(a, &.{ root, "config" });
+    defer a.free(path);
+    const themes = try std.fs.path.join(a, &.{ root, "themes" });
+    defer a.free(themes);
+    var colors = (try loadFromPath(a, path, .dark, &.{themes})).?;
+    defer colors.deinit(a);
+    try std.testing.expectEqual(Rgb{ .r = 0x11, .g = 0x22, .b = 0x33 }, colors.background.?);
+    try std.testing.expectEqual(Rgb{ .r = 255, .g = 255, .b = 255 }, colors.foreground.?);
+    try std.testing.expectEqualStrings("fixture-font", colors.font_family.?);
+    try std.testing.expectEqual(@as(f64, 15), colors.font_size.?);
+    try tmp.dir.deleteFile(io, "config");
+    try std.testing.expectEqual(@as(?Colors, null), try loadFromPath(a, path, .light, &.{}));
 }
 
 test "isSafeThemeName: plain names accepted" {

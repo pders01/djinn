@@ -32,7 +32,6 @@
 //!   - cursor-shape / cursor-blink. Not in config today.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const gtk = @import("gtk.zig");
 const ghostty_config = @import("ghostty_config.zig");
 
@@ -103,9 +102,8 @@ const g_free = gtk.g_free;
 
 // CSS provider — global so we don't need gtk_widget_get_style_context
 // (deprecated in GTK 4.10). The `vte-terminal` selector matches by
-// widget type name; djinn has a single VTE instance, so the targeting
-// is unambiguous. Provider externs live in gtk.zig now (also used by
-// log_pane.zig).
+// widget type name and applies the shared appearance to session terminals.
+// Provider externs live in gtk.zig.
 const gtk_css_provider_new = gtk.gtk_css_provider_new;
 const gtk_css_provider_load_from_string = gtk.gtk_css_provider_load_from_string;
 const gtk_style_context_add_provider_for_display = gtk.gtk_style_context_add_provider_for_display;
@@ -143,7 +141,7 @@ pub const Options = struct {
     /// `theme/theme.zig::default_palette` so cross-platform users see
     /// the same fallback). When all slots are null, VTE keeps its
     /// built-in palette.
-    palette: [16]?Rgb = .{null} ** 16,
+    palette: [16]?Rgb = @splat(null),
 };
 
 pub fn apply(widget: *GtkWidget, opts: Options) void {
@@ -210,7 +208,7 @@ fn applyFont(terminal: *VteTerminal, opts: Options) void {
     var buf: [256]u8 = undefined;
     const family = effective_family orelse "monospace";
     const size = opts.font_size orelse 11;
-    const spec = std.fmt.bufPrintZ(&buf, "{s} {d:.1}", .{ family, size }) catch return;
+    const spec = std.mem.printSentinel(&buf, "{s} {d:.1}", .{ family, size }, 0) catch return;
 
     const desc = pango_font_description_from_string(spec.ptr);
     defer pango_font_description_free(desc);
@@ -398,8 +396,11 @@ fn applyCss(opts: Options) void {
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
+test "Theme native API compiles without opening a display" {
+    std.testing.refAllDecls(@This());
+}
+
 test "rgbToGdkRgba: channel mapping" {
-    if (builtin.os.tag != .linux) return;
     const c = rgbToGdkRgba(.{ .r = 0x1a, .g = 0x2b, .b = 0x3c }, 1.0);
     try std.testing.expectApproxEqAbs(@as(f32, 0x1a) / 255.0, c.red, 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 0x2b) / 255.0, c.green, 1e-6);

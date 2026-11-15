@@ -3,3 +3,4 @@ usr/share/applications/djinn.desktop
 usr/lib/systemd/user/djinn.service
 usr/share/licenses/djinn/LICENSE
 usr/share/doc/djinn/README.md
+usr/share/doc/djinn/packaging.md
