@@ -188,6 +188,7 @@ const Dispatch = struct {
         // Every cached borrowed theme string is moved onto candidate storage
         // before releasing old arenas. Sessions own immutable launch copies.
         host.applyTheme(opts);
+        host.applyScrollback(candidate.scrollback.size);
         if (self.tab_strip) |strip| strip.applyTheme(opts);
         if (old.window.width != candidate.window.width or old.window.height != candidate.window.height) {
             const current = self.panel.currentSize();
@@ -198,10 +199,9 @@ const Dispatch = struct {
         syncAutostart(self.allocator, candidate.system.open_at_login);
         if (profilesChanged(&old, &candidate))
             std.debug.print("config: profile membership/launch changes require restart; existing sessions retained\n", .{});
-        if (keymapChanged(&old, &candidate) or old.scrollback.size != candidate.scrollback.size)
-            std.debug.print("config: keymap/scrollback changes require restart\n", .{});
-        if (old.window.position != candidate.window.position or old.window.position_x != candidate.window.position_x or old.window.position_y != candidate.window.position_y)
-            std.debug.print("config: window anchor changes require restart\n", .{});
+        if (keymapChanged(&old, &candidate))
+            std.debug.print("config: keymap changes require restart\n", .{});
+        self.panel.setPosition(candidate.window.position, candidate.window.position_x, candidate.window.position_y);
         if (old.notifications.menubar_icon != candidate.notifications.menubar_icon)
             std.debug.print("config: tray visibility changes require restart\n", .{});
         self.notifier.enabled = candidate.notifications.system_notifications;
@@ -294,7 +294,7 @@ fn buildThemeOptions(config: *const Config, colors: ?platform.GhosttyColors) pla
         .cursor = mergeColor(config.theme.cursor, colors, .cursor),
         .padding_x = config.terminal.padding_x,
         .padding_y = config.terminal.padding_y,
-        .opacity = config.theme.opacity orelse config.window.opacity,
+        .opacity = config.theme.opacity,
         .palette = if (colors) |gc| gc.palette else @splat(null),
     };
 }
@@ -342,6 +342,9 @@ pub fn main(init: std.process.Init) !void {
         .width = @intCast(config.window.width orelse if (state) |s| if (s.width > 0) s.width else 800 else 800),
         .height = @intCast(config.window.height orelse if (state) |s| if (s.height > 0) s.height else 400 else 400),
         .title = "djinn",
+        .position = config.window.position,
+        .position_x = config.window.position_x,
+        .position_y = config.window.position_y,
     });
     defer panel.deinit();
     var colors = loadColors(allocator, &config);
@@ -357,6 +360,7 @@ pub fn main(init: std.process.Init) !void {
     defer ipc.deinit();
     const opts = buildThemeOptions(&config, colors);
     var host = try platform.SessionHost.init(allocator, &sm, opts, .{ .ctx = &dispatch, .on_child_exited = Dispatch.onChildExited, .on_bell = Dispatch.onBell }, config.bell.audible);
+    host.applyScrollback(config.scrollback.size);
     defer {
         dispatch.session_host = null;
         host.deinit();

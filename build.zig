@@ -286,6 +286,24 @@ fn buildSharedTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
     }) });
     const run = b.addRunArtifact(tests);
     b.step("test-shared", "Run shared config/session/persistence tests without native UI libraries").dependOn(&run.step);
+    const models = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/tests_linux_models.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+        .filters = &.{
+            "scrollback",      "placement",       "font and cursor",
+            "removed colors",  "CSS replacement", "appearance replacement",
+            "autostart",       "desktopPath",     "stripDeletedAnnotation",
+            "Status.label",    "owned image",     "file list",
+            "formatPayload",   "percentDecode",   "drops reject",
+            "tray login view",
+        },
+    });
+    if (target.result.os.tag == .macos) models.setLibCFile(buildDarwinLibC(b, target));
+    b.step("test-linux-models", "Run Linux pure policy/model/fixture tests on the host without GTK").dependOn(&b.addRunArtifact(models).step);
     return tests;
 }
 
@@ -320,6 +338,10 @@ fn buildLinux(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bui
 
     const tests = b.addTest(.{ .root_module = linuxModule(b, target, optimize, true) });
     b.step("test", "Run Linux unit tests (no display required)").dependOn(&b.addRunArtifact(tests).step);
+    // Semantic analysis of all tests without discovering/linking GTK/VTE.
+    // This is intentionally not test execution or a native Linux link check.
+    const compile_tests = b.addTest(.{ .root_module = linuxModule(b, target, optimize, false) });
+    b.step("test-compile", "Compile-check Linux tests without native linkage or execution").dependOn(&compile_tests.step);
 }
 
 const ModuleOpts = struct {

@@ -112,10 +112,9 @@ pub const Config = struct {
     };
 
     pub const ScrollbackConfig = struct {
-        /// Rows of scrollback retained beyond the visible grid. null =
-        /// inherit ghostty's own `scrollback-limit` (10M by default).
-        /// Cost is roughly `size * cols * sizeof(cell)` of resident
-        /// memory in the ghostty page list.
+        /// Lines retained beyond the visible grid. null leaves the backend
+        /// default/inherited limit; zero disables retained scrollback.
+        /// Ghostty's independent byte cap can retain fewer than this limit.
         size: ?u32 = null,
     };
 
@@ -667,6 +666,19 @@ test "Config: absent login policy leaves OS state alone; explicit false is disti
     defer disabled.deinit();
     try std.testing.expectEqual(@as(?bool, null), absent.system.open_at_login);
     try std.testing.expectEqual(@as(?bool, false), disabled.system.open_at_login);
+}
+
+test "Config: scrollback unset zero and positive are distinct line limits" {
+    const cases = [_]struct { text: []const u8, lines: ?u32 }{
+        .{ .text = "", .lines = null },
+        .{ .text = "scrollback-size = 0", .lines = 0 },
+        .{ .text = "scrollback-size = 12345", .lines = 12345 },
+    };
+    for (cases) |case| {
+        var cfg = try Config.parse(std.testing.allocator, case.text);
+        defer cfg.deinit();
+        try std.testing.expectEqual(case.lines, cfg.scrollback.size);
+    }
 }
 
 test "Config: parse scrollback + system" {

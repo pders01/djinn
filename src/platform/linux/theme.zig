@@ -10,7 +10,7 @@
 //!   - theme.cursor → vte_terminal_set_color_cursor(GdkRGBA*)
 //!   - terminal.padding_x + terminal.padding_y → CSS attached to the
 //!     default GdkDisplay so the `vte-terminal` widget type matches
-//!     djinn's single VTE instance without needing a per-widget
+//!     all djinn session terminals without needing a per-widget
 //!     style-context dance (deprecated in GTK 4.10).
 //!
 //! `inherit_ghostty` is owned by `main_linux.zig` now — it loads
@@ -23,9 +23,9 @@
 //! On Wayland every surface is RGBA, so the only extra ceremony is one
 //! CSS rule that makes `window` itself transparent — otherwise GTK's
 //! default theme paints an opaque background under VTE and the alpha
-//! never reaches the compositor. We register that rule unconditionally
-//! when opacity < 1.0; at exactly 1.0 (or null) the bg is rendered
-//! solid and the CSS would be a no-op anyway.
+//! never reaches the compositor. The shared CSS provider is replaced on every
+//! apply, including an empty stylesheet when padding/transparency are removed.
+//! Every apply is a full reconciliation, never a patch to previous options.
 //!
 //! Out of scope:
 //!
@@ -75,12 +75,12 @@ extern "c" fn vte_terminal_set_color_cursor(
     cursor_background: ?*const GdkRGBA,
 ) void;
 
-// Pango font descriptions. `from_string` parses a "Family Size" form
-// (e.g. "IosevkaTerm 13"). We build that string from the config so we
-// don't have to set size via a separate setter call.
-extern "c" fn pango_font_description_from_string(
-    str: [*:0]const u8,
-) *PangoFontDescription;
+// Start from VTE's current native default description after set_font(NULL),
+// then override only the configured axes (no synthetic family/size default).
+extern "c" fn vte_terminal_get_font(terminal: *VteTerminal) *const PangoFontDescription;
+extern "c" fn pango_font_description_copy(desc: *const PangoFontDescription) *PangoFontDescription;
+extern "c" fn pango_font_description_set_family(desc: *PangoFontDescription, family: [*:0]const u8) void;
+extern "c" fn pango_font_description_set_size(desc: *PangoFontDescription, size: c_int) void;
 extern "c" fn pango_font_description_free(desc: *PangoFontDescription) void;
 
 // Font availability check. `pango_font_map_list_families` populates a
@@ -117,7 +117,7 @@ const STYLE_PROVIDER_PRIORITY_APPLICATION: c_uint = 600;
 // ─── Public surface ──────────────────────────────────────────────────
 
 /// Caller-supplied subset of djinn config. Each field is optional so
-/// `apply` can leave VTE's defaults in place for anything the user
+/// `apply` restores native defaults for anything the user removed or
 /// didn't set. Colors arrive as `Rgb` so the caller owns hex parsing
 /// upstream (`ghostty_config.parseColor` is the canonical entry).
 pub const Options = struct {
@@ -140,7 +140,7 @@ pub const Options = struct {
     /// missing slots filled from `default_palette` (matches darwin's
     /// `theme/theme.zig::default_palette` so cross-platform users see
     /// the same fallback). When all slots are null, VTE keeps its
-    /// built-in palette.
+    /// built-in palette, restoring it if a previous apply overrode it.
     palette: [16]?Rgb = @splat(null),
 };
 
@@ -179,39 +179,45 @@ const default_palette: [16]Rgb = .{
 
 // ─── Field appliers ──────────────────────────────────────────────────
 
-fn applyFont(terminal: *VteTerminal, opts: Options) void {
-    // Both unset → leave VTE's default in place. We don't synthesize a
-    // family name to attach a size to; that would silently override
-    // whatever the user's GTK theme picked.
-    if (opts.font_family == null and opts.font_size == null) return;
+const FontPlan = struct {
+    family: ?[]const u8,
+    size: ?c_int,
+};
 
-    // Pango substitutes silently when the requested family is missing.
-    // Some substitutions (a Nerd Font name → a generic sans, glyph
-    // table padded out with CJK ranges) produce the "wide-cell"
-    // rendering bug. Check availability up front so a missing font
-    // inherited from ghostty doesn't trash legibility.
-    var effective_family: ?[]const u8 = opts.font_family;
-    if (opts.font_family) |fam| {
-        if (!fontFamilyAvailable(fam)) {
-            std.debug.print(
-                "theme: pango can't resolve font-family '{s}' — falling back to monospace default. Install the font or set terminal.font_family in djinn config.\n",
-                .{fam},
-            );
-            effective_family = null;
+fn fontPlan(opts: Options, family_available: bool) FontPlan {
+    return .{
+        .family = if (family_available) opts.font_family else null,
+        .size = if (opts.font_size) |size|
+            if (std.math.isFinite(size) and size > 0)
+                @intFromFloat(std.math.clamp(size * 1024.0, 1.0, @as(f64, @floatFromInt(std.math.maxInt(c_int)))))
+            else
+                null
+        else
+            null,
+    };
+}
+
+fn applyFont(terminal: *VteTerminal, opts: Options) void {
+    // NULL restores VTE's native default even when the old family disappeared,
+    // inheritance was disabled, or a newly requested font is unavailable.
+    vte_terminal_set_font(terminal, null);
+    const available = if (opts.font_family) |family| fontFamilyAvailable(family) else false;
+    const plan = fontPlan(opts, available);
+    if (opts.font_family != null and !available)
+        std.debug.print("theme: pango can't resolve font-family '{s}'; using VTE default family\n", .{opts.font_family.?});
+    if (plan.family == null and plan.size == null) return;
+
+    const desc = pango_font_description_copy(vte_terminal_get_font(terminal));
+    defer pango_font_description_free(desc);
+    if (plan.family) |family| {
+        var buffer: [512]u8 = undefined;
+        if (std.mem.printSentinel(&buffer, "{s}", .{family}, 0)) |name| {
+            pango_font_description_set_family(desc, name.ptr);
+        } else |_| {
+            std.debug.print("theme: font-family too long; using VTE default family\n", .{});
         }
     }
-
-    // If we dropped the family but have no size override either,
-    // there's nothing meaningful to set — leave VTE's default whole.
-    if (effective_family == null and opts.font_size == null) return;
-
-    var buf: [256]u8 = undefined;
-    const family = effective_family orelse "monospace";
-    const size = opts.font_size orelse 11;
-    const spec = std.mem.printSentinel(&buf, "{s} {d:.1}", .{ family, size }, 0) catch return;
-
-    const desc = pango_font_description_from_string(spec.ptr);
-    defer pango_font_description_free(desc);
+    if (plan.size) |size| pango_font_description_set_size(desc, size);
     vte_terminal_set_font(terminal, desc);
 }
 
@@ -221,6 +227,8 @@ fn applyFont(terminal: *VteTerminal, opts: Options) void {
 /// them. Returns false on map-empty edge cases (Pango not yet
 /// initialized) — caller treats that as "skip the font override".
 fn fontFamilyAvailable(family: []const u8) bool {
+    // Pango's generic monospace alias need not appear in the installed list.
+    if (std.ascii.eqlIgnoreCase(family, "monospace")) return true;
     var families: [*]?*PangoFontFamily = undefined;
     var n: c_int = 0;
     pango_font_map_list_families(pango_cairo_font_map_get_default(), &families, &n);
@@ -238,57 +246,40 @@ fn fontFamilyAvailable(family: []const u8) bool {
     return false;
 }
 
+const ColorPlan = struct {
+    foreground: ?GdkRGBA,
+    background: ?GdkRGBA,
+    palette: [16]GdkRGBA,
+    has_palette: bool = false,
+};
+
+fn colorPlan(opts: Options) ColorPlan {
+    const alpha: f32 = if (opts.opacity) |o| @floatCast(std.math.clamp(o, 0.0, 1.0)) else 1.0;
+    var plan = ColorPlan{
+        .foreground = if (opts.foreground) |c| rgbToGdkRgba(c, 1.0) else null,
+        // Opacity alone intentionally uses the djinn dark baseline background.
+        .background = if (opts.background != null or alpha < 1.0) rgbToGdkRgba(opts.background orelse default_palette[0], alpha) else null,
+        .palette = undefined,
+    };
+    for (opts.palette, default_palette, 0..) |slot, fallback, i| {
+        plan.has_palette = plan.has_palette or slot != null;
+        plan.palette[i] = rgbToGdkRgba(slot orelse fallback, 1.0);
+    }
+    return plan;
+}
+
 fn applyColors(terminal: *VteTerminal, opts: Options) void {
-    const bg_alpha: f32 = if (opts.opacity) |o|
-        @floatCast(std.math.clamp(o, 0.0, 1.0))
-    else
-        1.0;
-
-    var fg_rgba: GdkRGBA = undefined;
-    var bg_rgba: GdkRGBA = undefined;
-    const fg_ptr: ?*const GdkRGBA = if (opts.foreground) |c| blk: {
-        fg_rgba = rgbToGdkRgba(c, 1.0);
-        break :blk &fg_rgba;
-    } else null;
-    // When opacity < 1 but no explicit background was supplied, fall
-    // back to a black bg so VTE has something to apply alpha against.
-    // The dark fallback matches default_palette[0] (Tomorrow Night–ish
-    // background) so users who only set opacity don't see a stark
-    // black flash through the transparency.
-    const need_bg = opts.background != null or bg_alpha < 1.0;
-    const bg_ptr: ?*const GdkRGBA = if (need_bg) blk: {
-        const c = opts.background orelse default_palette[0];
-        bg_rgba = rgbToGdkRgba(c, bg_alpha);
-        break :blk &bg_rgba;
-    } else null;
-
-    // Build the palette only if the caller set at least one slot. VTE
-    // accepts palette_size = 0 to mean "keep defaults", and we want
-    // that path when no palette overrides exist at all — otherwise
-    // we'd needlessly stomp VTE's built-in ANSI table with our
-    // fallback every launch.
-    var has_palette = false;
-    for (opts.palette) |slot| {
-        if (slot != null) {
-            has_palette = true;
-            break;
-        }
-    }
-
-    if (fg_ptr == null and bg_ptr == null and !has_palette) return;
-
-    if (has_palette) {
-        var palette: [16]GdkRGBA = undefined;
-        for (opts.palette, default_palette, 0..) |slot, fallback, i| {
-            const c = slot orelse fallback;
-            palette[i] = rgbToGdkRgba(c, 1.0);
-        }
-        vte_terminal_set_colors(terminal, fg_ptr, bg_ptr, &palette, 16);
-        return;
-    }
-
-    // No palette override → null + size 0 keeps VTE's built-in ANSI.
-    vte_terminal_set_colors(terminal, fg_ptr, bg_ptr, null, 0);
+    const plan = colorPlan(opts);
+    // This is a reset API, not a patch: NULL fg/bg choose VTE's defaults,
+    // NULL palette + size 0 restores the built-in palette. ALWAYS call it,
+    // even when every override disappeared, to remove previous values/alpha.
+    vte_terminal_set_colors(
+        terminal,
+        if (plan.foreground) |*c| c else null,
+        if (plan.background) |*c| c else null,
+        if (plan.has_palette) &plan.palette else null,
+        if (plan.has_palette) 16 else 0,
+    );
 }
 
 fn rgbToGdkRgba(c: Rgb, alpha: f32) GdkRGBA {
@@ -300,10 +291,14 @@ fn rgbToGdkRgba(c: Rgb, alpha: f32) GdkRGBA {
     };
 }
 
+fn cursorColor(opts: Options) ?GdkRGBA {
+    return if (opts.cursor) |c| rgbToGdkRgba(c, 1.0) else null;
+}
+
 fn applyCursorColor(terminal: *VteTerminal, opts: Options) void {
-    const c = opts.cursor orelse return;
-    var rgba = rgbToGdkRgba(c, 1.0);
-    vte_terminal_set_color_cursor(terminal, &rgba);
+    const rgba = cursorColor(opts);
+    // NULL returns to VTE's reverse-video cursor, including after reload.
+    vte_terminal_set_color_cursor(terminal, if (rgba) |*c| c else null);
 }
 
 /// Build the combined theme CSS (padding + window transparency) and
@@ -311,67 +306,14 @@ fn applyCursorColor(terminal: *VteTerminal, opts: Options) void {
 /// display. First call creates + adds the provider; subsequent calls
 /// reload its content in place. CSS shorthand puts vertical first,
 /// horizontal second, matching GTK's box model.
-///
-/// Both buf-print failures and an empty-CSS reload now log + return
-/// without touching the provider. The prior shape silently dropped
-/// half-written CSS strings on `bufPrint` `NoSpace` and loaded an
-/// empty string (no rules) when neither padding nor opacity was
-/// set, which silently disabled any previously-applied padding /
-/// transparency without the user knowing why.
+/// Empty CSS is intentional: loading it removes old padding/transparency.
 fn applyCss(opts: Options) void {
     var css_buf: [512]u8 = undefined;
-    var css_len: usize = 0;
-
-    if (opts.padding_x != null or opts.padding_y != null) {
-        const px: u32 = if (opts.padding_x) |v| @intFromFloat(@max(0.0, v)) else 8;
-        const py: u32 = if (opts.padding_y) |v| @intFromFloat(@max(0.0, v)) else 8;
-        const w = std.fmt.bufPrint(
-            css_buf[css_len..],
-            "vte-terminal {{ padding: {d}px {d}px; }}",
-            .{ py, px },
-        ) catch |err| {
-            std.debug.print("theme: padding CSS overflowed buf: {}\n", .{err});
-            return;
-        };
-        css_len += w.len;
-    }
-
-    // Transparent window only when opacity actually requests it.
-    // GdkRGBA bg-alpha won't reach the compositor without these rules;
-    // GTK4 themes paint an opaque background on `window.background`
-    // (the default class on every GtkWindow), and the VTE widget node
-    // also inherits one. Use longhand `background-color` — GTK4's CSS
-    // parser rejects `!important` inside the `background` shorthand
-    // ("Junk at end of value") and drops the whole rule on parse
-    // error. `background-color` accepts it cleanly. PRIORITY_APPLICATION
-    // already beats the default theme; !important only matters against
-    // a user-installed gtk.css at PRIORITY_USER (rare).
-    if (opts.opacity) |o| {
-        if (o < 1.0) {
-            const w = std.fmt.bufPrint(
-                css_buf[css_len..],
-                "window, window.background, window.csd {{ background-color: transparent; background-image: none; }} " ++
-                    "window > * {{ background-color: transparent; }} " ++
-                    "vte-terminal, vte-terminal.terminal {{ background-color: transparent; }}",
-                .{},
-            ) catch |err| {
-                std.debug.print("theme: opacity CSS overflowed buf: {}\n", .{err});
-                return;
-            };
-            css_len += w.len;
-        }
-    }
-
-    // Empty buffer = neither padding nor opacity is set. Loading
-    // the empty sentinel string into the provider would clear any
-    // prior rules — fine if that's what the caller wants, but it's
-    // distinct from "first apply with no theme overrides", which
-    // should leave the GTK theme defaults alone. Skip the load so
-    // we don't perturb the display.
-    if (css_len == 0) return;
-    if (css_len >= css_buf.len) return;
-    css_buf[css_len] = 0;
-    const css: [*:0]const u8 = @ptrCast(css_buf[0..css_len :0].ptr);
+    const css = buildCss(&css_buf, opts) catch |err| {
+        std.debug.print("theme: CSS buffer overflow: {}\n", .{err});
+        return;
+    };
+    if (css.len == 0 and g_css_provider == null) return;
 
     const display = gdk_display_get_default() orelse {
         std.debug.print("theme: gdk_display_get_default returned null; skipping CSS\n", .{});
@@ -391,13 +333,116 @@ fn applyCss(opts: Options) void {
         );
     }
 
-    gtk_css_provider_load_from_string(g_css_provider.?, css);
+    gtk_css_provider_load_from_string(g_css_provider.?, css.ptr);
+}
+
+fn cssPixels(value: f64) u32 {
+    if (!std.math.isFinite(value)) return 0;
+    return @intFromFloat(std.math.clamp(value, 0.0, @as(f64, @floatFromInt(std.math.maxInt(u32)))));
+}
+
+/// Pure stylesheet builder. Omitted axes have NO rule so GTK's native theme
+/// supplies them; never fill a removed axis with an arbitrary 8px override.
+fn buildCss(buffer: []u8, opts: Options) ![:0]const u8 {
+    var n: usize = 0;
+    if (opts.padding_x) |x| {
+        const text = try std.fmt.bufPrint(buffer[n..], "vte-terminal {{ padding-left: {d}px; padding-right: {d}px; }}", .{ cssPixels(x), cssPixels(x) });
+        n += text.len;
+    }
+    if (opts.padding_y) |y| {
+        const text = try std.fmt.bufPrint(buffer[n..], "vte-terminal {{ padding-top: {d}px; padding-bottom: {d}px; }}", .{ cssPixels(y), cssPixels(y) });
+        n += text.len;
+    }
+    if ((opts.opacity orelse 1.0) < 1.0) {
+        const text = try std.fmt.bufPrint(buffer[n..], "window, window.background, window.csd {{ background-color: transparent; background-image: none; }} " ++
+            "window > * {{ background-color: transparent; }} " ++
+            "vte-terminal, vte-terminal.terminal {{ background-color: transparent; }}", .{});
+        n += text.len;
+    }
+    if (n >= buffer.len) return error.NoSpaceLeft;
+    buffer[n] = 0;
+    return buffer[0..n :0];
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────
 
 test "Theme native API compiles without opening a display" {
     std.testing.refAllDecls(@This());
+}
+
+test "font and cursor plans remove each override without inventing defaults" {
+    var opts = Options{ .font_family = "Fixture Mono", .font_size = 13.5, .cursor = .{ .r = 1, .g = 2, .b = 3 } };
+    var plan = fontPlan(opts, true);
+    try std.testing.expectEqualStrings("Fixture Mono", plan.family.?);
+    try std.testing.expectEqual(@as(?c_int, 13824), plan.size);
+    try std.testing.expect(cursorColor(opts) != null);
+    opts.font_family = null;
+    plan = fontPlan(opts, false);
+    try std.testing.expect(plan.family == null);
+    try std.testing.expectEqual(@as(?c_int, 13824), plan.size);
+    opts.font_family = "Fixture Mono";
+    opts.font_size = null;
+    plan = fontPlan(opts, true);
+    try std.testing.expectEqualStrings("Fixture Mono", plan.family.?);
+    try std.testing.expect(plan.size == null);
+    // An unavailable inherited family falls back to the reset native font,
+    // not whichever override had been installed on this terminal before.
+    plan = fontPlan(opts, false);
+    try std.testing.expect(plan.family == null and plan.size == null);
+    plan = fontPlan(.{}, false);
+    try std.testing.expect(plan.family == null and plan.size == null);
+    try std.testing.expect(cursorColor(.{}) == null);
+    try std.testing.expect(fontPlan(.{ .font_size = std.math.inf(f64) }, false).size == null);
+}
+
+test "removed colors palette and opacity resolve to native reset arguments" {
+    var opts = Options{
+        .foreground = .{ .r = 1, .g = 2, .b = 3 },
+        .background = .{ .r = 4, .g = 5, .b = 6 },
+        .cursor = .{ .r = 7, .g = 8, .b = 9 },
+        .opacity = 0.4,
+    };
+    opts.palette[3] = .{ .r = 10, .g = 11, .b = 12 };
+    var plan = colorPlan(opts);
+    try std.testing.expect(plan.has_palette);
+    try std.testing.expectEqual(@as(f32, 0.4), plan.background.?.alpha);
+    // Clearing an individual field must not retain its previous native value.
+    opts.foreground = null;
+    opts.opacity = null;
+    opts.palette[3] = null;
+    plan = colorPlan(opts);
+    try std.testing.expect(plan.foreground == null);
+    try std.testing.expect(!plan.has_palette);
+    try std.testing.expectEqual(@as(f32, 1.0), plan.background.?.alpha);
+    // Missing inheritance / inherit=false / fresh standalone session all use
+    // the identical complete reset plan, regardless of previous options.
+    for (0..3) |_| {
+        plan = colorPlan(.{});
+        try std.testing.expect(plan.foreground == null and plan.background == null);
+        try std.testing.expect(!plan.has_palette);
+    }
+    const alpha_only = colorPlan(.{ .opacity = 0.5 });
+    try std.testing.expectEqual(rgbToGdkRgba(default_palette[0], 0.5), alpha_only.background.?);
+}
+
+test "CSS replacement clears removed axes and transparency including empty reset" {
+    var buffer: [512]u8 = undefined;
+    const full = try buildCss(&buffer, .{ .padding_x = 12, .padding_y = 9, .opacity = 0.5 });
+    try std.testing.expect(std.mem.indexOf(u8, full, "padding-left: 12px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full, "padding-top: 9px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, full, "transparent") != null);
+    const x_only = try buildCss(&buffer, .{ .padding_x = 0, .opacity = 1.0 });
+    try std.testing.expect(std.mem.indexOf(u8, x_only, "padding-left: 0px") != null);
+    try std.testing.expect(std.mem.indexOf(u8, x_only, "padding-top") == null);
+    try std.testing.expect(std.mem.indexOf(u8, x_only, "transparent") == null);
+    const y_only = try buildCss(&buffer, .{ .padding_y = 3 });
+    try std.testing.expect(std.mem.indexOf(u8, y_only, "padding-left") == null);
+    try std.testing.expect(std.mem.indexOf(u8, y_only, "padding-top: 3px") != null);
+    const empty = try buildCss(&buffer, .{});
+    try std.testing.expectEqualStrings("", empty);
+    try std.testing.expectEqual(@as(u8, 0), empty.ptr[0]);
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectError(error.NoSpaceLeft, buildCss(&tiny, .{ .padding_x = 8 }));
 }
 
 test "rgbToGdkRgba: channel mapping" {

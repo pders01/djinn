@@ -15,6 +15,8 @@ pub const Spawn = struct {
     command: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
     audible_bell: bool = true,
+    /// null restores the VTE property default; zero retains no scrollback.
+    scrollback_lines: ?u32 = null,
 };
 
 pub const Handler = struct {
@@ -37,6 +39,12 @@ extern "c" fn vte_terminal_reset(*VteTerminal, c_int, c_int) void;
 extern "c" fn vte_terminal_feed_child(*VteTerminal, [*]const u8, isize) void;
 extern "c" fn vte_terminal_feed(*VteTerminal, [*]const u8, isize) void;
 extern "c" fn vte_terminal_set_audible_bell(*VteTerminal, c_int) void;
+extern "c" fn vte_terminal_get_scrollback_lines(*VteTerminal) c_long;
+extern "c" fn vte_terminal_set_scrollback_lines(*VteTerminal, c_long) void;
+
+fn scrollbackLines(lines: ?u32, native_default: c_long) c_long {
+    return if (lines) |n| @intCast(n) else native_default;
+}
 extern "c" fn vte_terminal_copy_clipboard_format(*VteTerminal, c_int) void;
 extern "c" fn vte_terminal_paste_clipboard(*VteTerminal) void;
 extern "c" fn vte_terminal_paste_text(*VteTerminal, [*:0]const u8) void;
@@ -161,6 +169,8 @@ pub const Terminal = struct {
     child_exited_handler_id: c_ulong = 0,
     bell_handler_id: c_ulong = 0,
     title_handler_id: c_ulong = 0,
+    /// Captured before the first override, never from a previously themed VTE.
+    default_scrollback_lines: c_long,
 
     pub fn open(allocator: std.mem.Allocator, opts: ThemeOptions, handler: ?Handler, spawn: ?Spawn) !Terminal {
         const options: Spawn = spawn orelse .{};
@@ -173,7 +183,8 @@ pub const Terminal = struct {
         theme.apply(widget, opts);
         vte_terminal_set_audible_bell(vte, @intFromBool(options.audible_bell));
         dragdrop.attach(widget);
-        var term = Terminal{ .widget = widget, .allocator = allocator, .launch = launch };
+        var term = Terminal{ .widget = widget, .allocator = allocator, .launch = launch, .default_scrollback_lines = vte_terminal_get_scrollback_lines(vte) };
+        term.applyScrollback(options.scrollback_lines);
         term.child_exited_handler_id = gtk.g_signal_connect_data(@ptrCast(widget), "child-exited", @ptrCast(&onChildExited), launch, null, 0);
         term.bell_handler_id = gtk.g_signal_connect_data(@ptrCast(widget), "bell", @ptrCast(&onBell), launch, null, 0);
         term.title_handler_id = gtk.g_signal_connect_data(@ptrCast(widget), "window-title-changed", @ptrCast(&onTitleChanged), launch, null, 0);
@@ -209,6 +220,12 @@ pub const Terminal = struct {
             _ = gtk.g_main_context_iteration(launch.main_context, 1);
             launch.release();
         }
+    }
+
+    /// VTE applies this live (including inactive terminals). Lowering a limit
+    /// may discard retained history; raising/removing it cannot recover history.
+    pub fn applyScrollback(self: *Terminal, lines: ?u32) void {
+        vte_terminal_set_scrollback_lines(@ptrCast(self.widget), scrollbackLines(lines, self.default_scrollback_lines));
     }
 
     pub fn applyTheme(self: *Terminal, opts: ThemeOptions) void {
@@ -297,6 +314,15 @@ test "pending spawns remain tracked independently until each completion" {
     try std.testing.expect(!second.dropLease());
     try std.testing.expect(pending_launches == null);
     try std.testing.expectEqual(@as(usize, 2), second.refs);
+}
+
+test "scrollback limits are lines and removal restores the captured VTE default" {
+    try std.testing.expectEqual(@as(c_long, 512), scrollbackLines(null, 512));
+    try std.testing.expectEqual(@as(c_long, 0), scrollbackLines(0, 512));
+    try std.testing.expectEqual(@as(c_long, 100000), scrollbackLines(100000, 512));
+    try std.testing.expectEqual(@as(c_long, 4294967295), scrollbackLines(std.math.maxInt(u32), 512));
+    // A backend with an unlimited native default must preserve that sentinel.
+    try std.testing.expectEqual(@as(c_long, -1), scrollbackLines(null, -1));
 }
 
 test "Terminal type compiles" {

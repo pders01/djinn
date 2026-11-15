@@ -123,7 +123,7 @@ fn onConfigChanged() void {
     if (app.g.menubar) |mb| mb.setEnabled(new_cfg.notifications.menubar_icon);
     syncLoginPolicy(new_cfg.system.open_at_login);
     if (!std.meta.eql(old.scrollback, new_cfg.scrollback))
-        hostWarn("config: scrollback-size change requires restart", .{});
+        hostWarn("config: scrollback-size applies to new/lazy/restarted sessions; existing history limits are unchanged", .{});
     if (!profilesEqual(old, new_cfg))
         hostWarn("config: profile launch definitions changed; restart Djinn to apply (running sessions unchanged)", .{});
 

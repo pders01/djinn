@@ -154,7 +154,10 @@ pub fn hostFromApp(handle: c.ghostty_app_t) ?*HostContext {
 /// surface init): cursor-style. The terminal's visual cursor style
 /// is a DECSCUSR runtime field, not derived from config post-init —
 /// changing `cursor-style` in the file requires opening a fresh
-/// surface for it to take effect.
+/// surface for it to take effect. Ghostty 1.4 also initializes both scrollback
+/// caps when constructing Termio: new/lazy/restarted surfaces pick up a changed
+/// line cap, but existing surfaces retain their original cap. Its independent
+/// scrollback-limit-bytes (50 MB by default) can evict history before the line cap.
 pub fn reloadConfigFromDisk() void {
     if (!host_inited) return;
     const app_handle = host_storage.app_handle orelse return;
@@ -283,7 +286,9 @@ fn writeDjinnGhosttyOverride(scrollback_limit: ?u32) ?[]const u8 {
         std.Io.Dir.deleteFileAbsolute(platform.io(), path) catch {};
         allocator.free(path);
     };
-    if (scrollback_limit) |limit| writeNumericOverride(file, "scrollback-limit", limit) catch return null;
+    var scrollback_buf: [96]u8 = undefined;
+    const scrollback_text = formatScrollbackOverride(&scrollback_buf, scrollback_limit) catch return null;
+    file.writeStreamingAll(platform.io(), scrollback_text) catch return null;
     if (config) |cfg| {
         const Entry = struct { key: []const u8, value: ?[]const u8 };
         for ([_]Entry{
@@ -337,6 +342,21 @@ fn temporaryFileNonce() u64 {
     var nonce: u64 = undefined;
     platform.io().random(std.mem.asBytes(&nonce));
     return nonce;
+}
+
+/// Ghostty 1.4's legacy scrollback-limit alias is BYTES, never lines.
+/// Omission preserves inherited/default line AND byte caps; zero disables
+/// retained scrollback. Do not override the independent byte cap here.
+fn formatScrollbackOverride(buffer: []u8, lines: ?u32) ![]const u8 {
+    const limit = lines orelse return "";
+    return std.fmt.bufPrint(buffer, "scrollback-limit-lines = {d}\n", .{limit});
+}
+
+test "scrollback override omits unset and writes zero or positive as lines only" {
+    var buffer: [96]u8 = undefined;
+    try std.testing.expectEqualStrings("", try formatScrollbackOverride(&buffer, null));
+    try std.testing.expectEqualStrings("scrollback-limit-lines = 0\n", try formatScrollbackOverride(&buffer, 0));
+    try std.testing.expectEqualStrings("scrollback-limit-lines = 100000\n", try formatScrollbackOverride(&buffer, 100000));
 }
 
 fn writeNumericOverride(file: std.Io.File, key: []const u8, value: anytype) !void {

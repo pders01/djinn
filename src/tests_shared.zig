@@ -5,4 +5,6 @@ test {
     _ = @import("session/manager.zig");
     _ = @import("state/persist.zig");
     _ = @import("io/platform.zig");
+    // Backend policy/model fixtures have their own filtered host suite:
+    // test-linux-models excludes API-body checks that require native linkage.
 }

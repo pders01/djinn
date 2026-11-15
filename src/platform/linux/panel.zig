@@ -2,7 +2,7 @@
 //!
 //! When the compositor supports `wlr-layer-shell` (KDE / Hyprland /
 //! sway / wlroots-likes), the window is initialized as a layer-shell
-//! OVERLAY surface anchored to the top of the screen — always above
+//! OVERLAY surface placed at a configured nine-grid anchor — always above
 //! other clients, present on every workspace, visible over fullscreen
 //! apps. When the protocol isn't reachable (GNOME), the same window
 //! opens as a plain undecorated toplevel the user manages manually.
@@ -29,6 +29,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 const platform = @import("../../io/platform.zig");
+const Config = @import("../../config.zig").Config;
 
 // Stable POSIX C ABI; no translate-c dependency on Zig 0.17.
 extern "c" fn dlopen(name: [*:0]const u8, flags: c_int) ?*anyopaque;
@@ -127,11 +128,29 @@ const g_signal_handler_disconnect = gtk.g_signal_handler_disconnect;
 /// it. Going below TOP defeats the Quake-drop purpose entirely.
 const LAYER_TOP: c_int = 2;
 const LAYER_OVERLAY: c_int = 3;
-/// Anchor edges. Anchoring to TOP keeps the panel pinned to the screen
-/// top regardless of resize; the host shell controls width via
-/// gtk_window_set_default_size. Edge constants: LEFT=0, RIGHT=1, TOP=2,
-/// BOTTOM=3.
-const ANCHOR_EDGE_TOP: c_int = 2;
+/// gtk4-layer-shell edge order: LEFT=0, RIGHT=1, TOP=2, BOTTOM=3.
+/// One edge per axis pins that axis; no edges centers it. Never anchor
+/// opposite edges, which would stretch rather than position the panel.
+const Placement = struct {
+    anchors: [4]bool,
+    margins: [4]c_int = @splat(0),
+    unsupported_coordinates: bool,
+};
+
+fn placement(position: Config.WindowConfig.Position, x: ?f64, y: ?f64) Placement {
+    const anchors: [4]bool = switch (position) {
+        .top_left => .{ true, false, true, false },
+        .top_center => .{ false, false, true, false },
+        .top_right => .{ false, true, true, false },
+        .center_left => .{ true, false, false, false },
+        .center => .{ false, false, false, false },
+        .center_right => .{ false, true, false, false },
+        .bottom_left => .{ true, false, false, true },
+        .bottom_center => .{ false, false, false, true },
+        .bottom_right => .{ false, true, false, true },
+    };
+    return .{ .anchors = anchors, .unsupported_coordinates = x != null or y != null };
+}
 /// Keyboard interactivity. gtk4-layer-shell enum:
 ///   NONE = 0       (events pass through to whatever's below)
 ///   EXCLUSIVE = 1  (always grab keyboard focus, blocks Alt-Tab)
@@ -141,6 +160,7 @@ const KEYBOARD_MODE_ON_DEMAND: c_int = 2;
 extern "c" fn gtk_layer_init_for_window(window: *GtkWindow) void;
 extern "c" fn gtk_layer_set_layer(window: *GtkWindow, layer: c_int) void;
 extern "c" fn gtk_layer_set_anchor(window: *GtkWindow, edge: c_int, anchor_to_edge: gboolean) void;
+extern "c" fn gtk_layer_set_margin(window: *GtkWindow, edge: c_int, margin_size: c_int) void;
 extern "c" fn gtk_layer_set_keyboard_mode(window: *GtkWindow, mode: c_int) void;
 extern "c" fn gtk_layer_set_namespace(window: *GtkWindow, name_space: [*:0]const u8) void;
 /// Runtime probe: is the compositor advertising wlr-layer-shell? GNOME
@@ -221,8 +241,8 @@ pub const Panel = struct {
     /// user-resize observers; GdkSurface.layout fires before the
     /// allocation settles), so we poll the allocated width/height on
     /// a slow tick instead. The `persist.saveDebounced` consumer
-    /// already coalesces, so a once-per-500ms cadence is cheap and
-    /// converges to a single disk write per drag.
+    /// periodically coalesces per profile. A long drag can write repeatedly;
+    /// idle wakeups/write frequency require measurement before changing it.
     resize_poll_id: c_uint = 0,
     /// Last (w, h) the poll handed to the callback. Bootstrapped to
     /// (0, 0) so the first poll-tick that sees a non-zero allocation
@@ -259,10 +279,13 @@ pub const Panel = struct {
         width: c_int = 800,
         height: c_int = 400,
         title: [*:0]const u8 = "djinn",
+        position: Config.WindowConfig.Position = .top_center,
+        position_x: ?f64 = null,
+        position_y: ?f64 = null,
     };
 
     /// Create the borderless window and (if available) layer-shell it
-    /// to the top of the screen. GTK is initialized lazily here; calling
+    /// at the requested named anchor. GTK is initialized lazily here; calling
     /// `open` twice in the same process is undefined — there's one
     /// panel per process by design.
     pub fn open(opts: OpenOptions) !Panel {
@@ -298,7 +321,6 @@ pub const Panel = struct {
             gtk_layer_init_for_window(window);
             gtk_layer_set_namespace(window, "djinn");
             gtk_layer_set_layer(window, LAYER_OVERLAY);
-            gtk_layer_set_anchor(window, ANCHOR_EDGE_TOP, 1);
             gtk_layer_set_keyboard_mode(window, KEYBOARD_MODE_ON_DEMAND);
         }
 
@@ -331,15 +353,16 @@ pub const Panel = struct {
             0,
         );
 
-        gtk_window_present(window);
-
-        return .{
+        var panel = Panel{
             .window = window,
             .loop = loop,
             .layer_shell_active = layer_shell_active,
             .close_handler_id = close_id,
             .map_handler_id = map_id,
         };
+        panel.setPosition(opts.position, opts.position_x, opts.position_y);
+        gtk_window_present(window);
+        return panel;
     }
 
     /// Block on the GLib main loop. Returns when `quit` is called or
@@ -398,6 +421,26 @@ pub const Panel = struct {
     /// restart.
     pub fn setSize(self: *Panel, width: c_int, height: c_int) void {
         gtk_window_set_default_size(self.window, width, height);
+    }
+
+    /// Apply a named nine-grid placement at startup or live reload, including
+    /// while hidden. All four anchors AND margins are reconciled each time;
+    /// margins use gtk4-layer-shell logical pixels and are intentionally zero.
+    /// macOS NSScreen coordinates cannot be translated portably into Wayland
+    /// placement/margins: report them, ignore those axes and use the named
+    /// fallback. Plain GTK4 toplevels have no portable positioning API at all.
+    pub fn setPosition(self: *Panel, position: Config.WindowConfig.Position, x: ?f64, y: ?f64) void {
+        const plan = placement(position, x, y);
+        if (!self.layer_shell_active) {
+            std.debug.print("panel: window positioning ({s}, x={any}, y={any}) unsupported on plain GTK4 toplevel; compositor controls placement\n", .{ @tagName(position), x, y });
+            return;
+        }
+        if (plan.unsupported_coordinates)
+            std.debug.print("panel: absolute window coordinates x={any}, y={any} unsupported by Wayland layer-shell; using named anchor {s} with zero margins\n", .{ x, y, @tagName(position) });
+        for (plan.anchors, plan.margins, 0..) |anchor, margin, edge| {
+            gtk_layer_set_anchor(self.window, @intCast(edge), @intFromBool(anchor));
+            gtk_layer_set_margin(self.window, @intCast(edge), margin);
+        }
     }
 
     /// Brief composition-level dim as a visual bell. Triggered by
@@ -754,6 +797,29 @@ fn canDlopen(name: [*:0]const u8) bool {
 
 test "Panel native API compiles without opening a display" {
     std.testing.refAllDecls(Panel);
+}
+
+test "nine-grid placement reconciles all anchors and margins without stretching" {
+    const positions = std.meta.tags(Config.WindowConfig.Position);
+    const expected = [_][4]bool{
+        .{ true, false, true, false },  .{ false, false, true, false },  .{ false, true, true, false },
+        .{ true, false, false, false }, .{ false, false, false, false }, .{ false, true, false, false },
+        .{ true, false, false, true },  .{ false, false, false, true },  .{ false, true, false, true },
+    };
+    for (positions, expected) |position, anchors| {
+        const plan = placement(position, null, null);
+        try std.testing.expectEqual(anchors, plan.anchors);
+        try std.testing.expectEqual([_]c_int{ 0, 0, 0, 0 }, plan.margins);
+        try std.testing.expect(!plan.unsupported_coordinates);
+        try std.testing.expect(!(plan.anchors[0] and plan.anchors[1]));
+        try std.testing.expect(!(plan.anchors[2] and plan.anchors[3]));
+        for ([_][2]?f64{ .{ 12, null }, .{ null, -8 }, .{ 0, 0 } }) |xy| {
+            const absolute = placement(position, xy[0], xy[1]);
+            try std.testing.expect(absolute.unsupported_coordinates);
+            try std.testing.expectEqual(anchors, absolute.anchors);
+            try std.testing.expectEqual(plan.margins, absolute.margins);
+        }
+    }
 }
 
 test "Capabilities require GTK4, layer-shell and Wayland for quake drop" {

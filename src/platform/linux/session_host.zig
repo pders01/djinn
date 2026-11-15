@@ -80,6 +80,7 @@ pub const SessionHost = struct {
     stack: *GtkWidget,
     entries: std.ArrayList(Entry) = .empty,
     theme_opts: ThemeOptions,
+    scrollback_lines: ?u32 = null,
     handler: ?TerminalHandler,
     find_overlay: ?*FindOverlay = null,
     on_switch: ?OnSwitch = null,
@@ -197,11 +198,7 @@ pub const SessionHost = struct {
         const source = try self.allocator.create(Source);
         errdefer self.allocator.destroy(source);
         source.* = .{ .sm = self.sm, .idx = idx, .id = session.id, .generation = session.surface_generation +% 1, .forwarded = self.handler, .title_hook = self.title_hook };
-        const fresh = try Terminal.open(self.allocator, self.theme_opts, source.handler(), .{
-            .command = choice.command(session.profile),
-            .cwd = session.profile.cwd,
-            .audible_bell = session.profile.bell_audible orelse self.bell_audible_default,
-        });
+        const fresh = try Terminal.open(self.allocator, self.theme_opts, source.handler(), self.spawnOptions(session.profile, choice));
         const entry = &self.entries.items[idx];
         // Everything fallible is done. Retire the old source before releasing
         // its callback box. Pending async spawn completion has handler=null.
@@ -231,9 +228,34 @@ pub const SessionHost = struct {
         if (source.pending_exit) childExited(source, idx);
     }
 
+    fn spawnOptions(self: *const SessionHost, profile: manager.Profile, choice: LaunchChoice) terminal.Spawn {
+        return .{
+            .command = choice.command(profile),
+            .cwd = profile.cwd,
+            .audible_bell = profile.bell_audible orelse self.bell_audible_default,
+            .scrollback_lines = self.scrollback_lines,
+        };
+    }
+
+    /// Call after init and on every accepted config reload. Updates ALL live
+    /// terminals and stores the policy for lazy, restarted and recovery shells.
+    /// null restores each VTE's captured native default, not the previous limit.
+    pub fn applyScrollback(self: *SessionHost, lines: ?u32) void {
+        self.applyScrollbackWith(lines, Terminal.applyScrollback);
+    }
+
+    fn applyScrollbackWith(self: *SessionHost, lines: ?u32, comptime apply: fn (*Terminal, ?u32) void) void {
+        self.scrollback_lines = lines;
+        for (self.entries.items) |*e| if (e.terminal) |*t| apply(t, lines);
+    }
+
     pub fn applyTheme(self: *SessionHost, opts: ThemeOptions) void {
+        self.applyThemeWith(opts, Terminal.applyTheme);
+    }
+
+    fn applyThemeWith(self: *SessionHost, opts: ThemeOptions, comptime apply: fn (*Terminal, ThemeOptions) void) void {
         self.theme_opts = opts;
-        for (self.entries.items) |*e| if (e.terminal) |*t| t.applyTheme(opts);
+        for (self.entries.items) |*e| if (e.terminal) |*t| apply(t, opts);
     }
     pub fn markExited(self: *SessionHost, idx: usize, value: bool) void {
         if (idx >= self.entries.items.len) return;
@@ -318,6 +340,86 @@ test "recovery retains explicit cwd validation and never falls back" {
     const session = manager.Session{ .id = 1, .profile = .{ .name = "tool", .command = "broken", .cwd = "relative" } };
     try std.testing.expect(@as(LaunchChoice, .default_shell).command(session.profile) == null);
     try std.testing.expectError(error.NotAbsolutePath, session.validateLaunch());
+}
+
+test "latest scrollback policy reaches lazy restart and recovery spawn options" {
+    // Pure stand-ins at the VTE setter boundary: entries 0 and 2 model active
+    // and inactive terminals, entry 1 is still lazy. Never dereference GTK.
+    const Recorder = struct {
+        limit: ?u32 = null,
+        calls: usize = 0,
+        fn apply(t: *Terminal, lines: ?u32) void {
+            const record: *@This() = @ptrCast(@alignCast(t.widget));
+            record.limit = lines;
+            record.calls += 1;
+        }
+    };
+    var records: [2]Recorder = @splat(.{});
+    var entries: [3]Entry = @splat(.{});
+    for ([_]usize{ 0, 2 }, &records) |idx, *record| {
+        entries[idx].terminal = .{ .widget = @ptrCast(record), .allocator = std.testing.allocator, .launch = undefined, .default_scrollback_lines = 512 };
+    }
+    var host = SessionHost{
+        .allocator = std.testing.allocator,
+        .sm = undefined,
+        .stack = undefined,
+        .theme_opts = .{},
+        .handler = null,
+        .bell_audible_default = true,
+    };
+    host.entries.items = &entries;
+    host.entries.capacity = entries.len;
+    const profile = manager.Profile{ .name = "test", .command = "tool" };
+    for ([_]?u32{ null, 0, 70000, null }) |limit| {
+        host.applyScrollbackWith(limit, Recorder.apply);
+        for (records) |record| try std.testing.expectEqual(limit, record.limit);
+        try std.testing.expect(entries[1].terminal == null);
+        for ([_]LaunchChoice{ .profile, .profile, .default_shell, .{ .expression = "override" } }) |choice| {
+            try std.testing.expectEqual(limit, host.spawnOptions(profile, choice).scrollback_lines);
+        }
+    }
+    for (records) |record| try std.testing.expectEqual(@as(usize, 4), record.calls);
+}
+
+test "appearance replacement covers active inactive and future session options" {
+    const Recorder = struct {
+        opts: ThemeOptions = .{},
+        calls: usize = 0,
+        fn apply(t: *Terminal, opts: ThemeOptions) void {
+            const record: *@This() = @ptrCast(@alignCast(t.widget));
+            record.opts = opts;
+            record.calls += 1;
+        }
+    };
+    var records: [2]Recorder = @splat(.{});
+    var entries: [3]Entry = @splat(.{});
+    for ([_]usize{ 0, 2 }, &records) |idx, *record| {
+        entries[idx].terminal = .{ .widget = @ptrCast(record), .allocator = std.testing.allocator, .launch = undefined, .default_scrollback_lines = 512 };
+    }
+    var host = SessionHost{ .allocator = std.testing.allocator, .sm = undefined, .stack = undefined, .theme_opts = .{}, .handler = null, .bell_audible_default = true };
+    host.entries.items = &entries;
+    host.entries.capacity = entries.len;
+    var full = ThemeOptions{
+        .font_family = "Fixture Mono",
+        .font_size = 14,
+        .background = .{ .r = 1, .g = 2, .b = 3 },
+        .foreground = .{ .r = 4, .g = 5, .b = 6 },
+        .cursor = .{ .r = 7, .g = 8, .b = 9 },
+        .padding_x = 12,
+        .padding_y = 7,
+        .opacity = 0.5,
+    };
+    full.palette[4] = .{ .r = 10, .g = 11, .b = 12 };
+    // Theme/appearance transitions and inheritance removal use the same full
+    // replacement path. replace() uses this exact retained theme_opts value
+    // when creating a lazy, restarted or recovery terminal.
+    for ([_]ThemeOptions{ full, .{ .background = .{ .r = 250, .g = 250, .b = 250 } }, .{} }) |opts| {
+        host.applyThemeWith(opts, Recorder.apply);
+        try std.testing.expectEqualDeep(opts, host.theme_opts);
+        for (records) |record| try std.testing.expectEqualDeep(opts, record.opts);
+        try std.testing.expect(entries[1].terminal == null);
+    }
+    for (records) |record| try std.testing.expectEqual(@as(usize, 3), record.calls);
 }
 
 test "SessionHost: type compiles" {
