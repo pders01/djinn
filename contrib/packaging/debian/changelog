@@ -1,3 +1,10 @@
+djinn (0.1.0~alpha.2-1) UNRELEASED; urgency=medium
+
+  * Align package metadata with the 0.1.0-alpha.2 prerelease preparation.
+    No archive upload or release publication has been performed.
+
+ -- Paul Derscheid <paulderscheid@gmail.com>  Sun, 15 Nov 2026 18:52:25 +0100
+
 djinn (0.1.0~alpha.1-1) UNRELEASED; urgency=medium
 
   * Initial Debian packaging skeleton — not yet uploaded to any
