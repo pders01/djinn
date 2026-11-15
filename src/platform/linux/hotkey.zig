@@ -1,13 +1,12 @@
 //! Portal-based global hotkey registration.
 //!
 //! Talks to `org.freedesktop.portal.GlobalShortcuts` over the session
-//! bus so the panel's toggle binding works on every Wayland compositor
-//! that ships a portal backend (KDE, Hyprland via
-//! xdg-desktop-portal-hyprland, sway via xdg-desktop-portal-wlr, GNOME).
-//! The compositor — not djinn — owns the keypress; the portal then
-//! tells us via D-Bus when our shortcut fired. No CGEventTap analogue
-//! is needed, and we don't have to be the focused window to hear about
-//! the binding the way an X11 grab would require.
+//! bus when the desktop's portal backend implements GlobalShortcuts and
+//! accepts the binding. An installed portal backend alone is insufficient:
+//! interface support and approval vary by desktop/backend version.
+//! The desktop/compositor — not Djinn — owns the keypress; the portal
+//! tells us via D-Bus when our shortcut fired. Djinn need not be focused
+//! and does not monitor raw keyboard input to implement this binding.
 //!
 //! Flow:
 //!   1. `gdbus.g_bus_get_sync(G_BUS_TYPE_SESSION)` → GDBusConnection.
@@ -19,10 +18,9 @@
 //!      first dodges a race where the Response fires before the
 //!      subscription registers.
 //!   4. Inside the CreateSession Response handler, pull `session_handle`
-//!      out of the results dict and call `BindShortcuts`. On the very
-//!      first launch KDE pops a confirmation dialog; subsequent launches
-//!      reuse the user's choice as long as the .desktop app-id stays
-//!      stable.
+//!      out of the results dict and call `BindShortcuts`. The
+//!      backend may request user confirmation. Remembered approval and
+//!      app-identity matching are backend policy, not guaranteed by Djinn.
 //!   5. Activated fires on every trigger from then on; we forward it to
 //!      the caller's handler, which currently maps it to `panel.toggle()`.
 //!

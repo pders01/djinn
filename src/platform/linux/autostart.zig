@@ -2,24 +2,18 @@
 //!
 //! Linux equivalent of `src/system/loginitem.zig`'s SMAppService
 //! wrapper. The freedesktop autostart spec
-//! (https://specifications.freedesktop.org/autostart-spec/) says every
-//! `.desktop` file in `$XDG_CONFIG_HOME/autostart/` (default
-//! `$HOME/.config/autostart/`) gets launched at session start by
-//! every spec-compliant session (KDE Plasma, GNOME, XFCE, MATE,
-//! LXDE/LXQt, sway/Hyprland via xdg-autostart-generator, …). We just
-//! drop or remove the file; no D-Bus, no daemon, no per-DE quirks.
+//! (https://specifications.freedesktop.org/autostart-spec/) defines eligible
+//! `.desktop` entries in `$XDG_CONFIG_HOME/autostart/` (default
+//! `$HOME/.config/autostart/`). Launch still depends on desktop/session
+//! policy, disabled/conditional entries, and an autostart implementation.
+//! We manage this entry only on explicit CLI/menu actions or config policy;
+//! an absent open-at-login setting leaves existing OS state alone.
 //!
-//! The file also doubles as the app-identity anchor the portal-based
-//! hotkey needs for stable BindShortcuts approvals on KDE. KDE's
-//! portal pegs its remembered consent to whatever `.desktop` id the
-//! caller can be matched against; without one, every relaunch can
-//! retrigger the consent prompt. Writing this file fixes the issue
-//! noted in TODO.md's Known Issues even when the user has
-//! `open-at-login=false` — but we only write the autostart entry
-//! when the config opts in, so the side effect only kicks in when
-//! the user has explicitly enabled autostart. A future task can
-//! split the .desktop install (always, into XDG_DATA_HOME/applications)
-//! from the autostart symlink/entry (conditional, into autostart/).
+//! The application launcher is packaged separately as
+//! `share/applications/djinn.desktop`. An autostart entry controls login
+//! launch; creating it is not a guarantee of portal app identity, stable
+//! shortcut consent, or GlobalShortcuts support. Do not enable autostart
+//! as a workaround for a missing portal implementation.
 //!
 //! Preserve the launcher's spelling (not its realpath): Nix's GTK wrapper
 //! supplies required environment and must not be bypassed by /proc/self/exe.

@@ -171,10 +171,10 @@ manual-only pending explicit release approval; it validates the **arm64 macOS
 ZIP and x86_64 Linux tarball**, each with a checksum, before replacing downloads.
 Linux aarch64 compile-only checks remain supported; there is no aarch64 Linux
 release tarball. Versioned releases resolve the requested tag to one exact commit
-for both builds. Choose a versioned tag for a pinned release. Downloads are not Developer ID signed/notarized, so Gatekeeper may
-require explicit approval. Historical versioned Intel assets are not modified;
-known Intel rolling assets are retired only after successful replacement
-publication. GitHub tag/asset updates and retirement are not atomic; a failure
+for both builds. Choose a versioned tag for a pinned release. Downloads are not
+Developer ID signed/notarized, so Gatekeeper may require explicit approval.
+Historical versioned Intel assets are not modified; known Intel rolling assets
+are retired only after successful replacement publication. GitHub tag/asset updates and retirement are not atomic; a failure
 can require manual recovery.
 
 `scripts/install-from-release.sh` requires Apple Silicon macOS and refuses
@@ -460,9 +460,11 @@ services. Remove `provider`, `provider-command`, `profile.*.provider`,
 `notify-rate-limit-ms` remains, now keyed by terminal session.
 
 Remove keybinds for `toggle_log_pane`, `palette_open`, `log_filter_open`,
-`cheatsheet_open`, `profile_duplicate`, `profile_close`, and `shell_session`.
-Use `close_session` for in-memory session closure. Move old provider launch
-choices into static `command` settings or executable scripts.
+`cheatsheet_open`, `profile_duplicate`, and `profile_close`. On macOS,
+`shell_session` is also removed; `close_session` closes a session in memory.
+Linux retains `shell_session` for a fresh default shell in the active session
+and has no `close_session` host action. See the platform controls below. Move
+old provider launch choices into static `command` settings or executable scripts.
 
 A profile's `command` is now preserved as a shell expression, not unquoted
 as a configuration scalar. Keep shell-required quotes around an executable
@@ -476,35 +478,48 @@ no automatic credential/config deletion or profile writeback.
 
 ## Controls
 
-The menubar always uses the djinn brand mark. Its menu contains the active
-session label, show/hide, Settings, OS-backed Launch at Login, and Quit.
+The macOS menubar uses the djinn brand mark and contains the active session
+label, Show/Hide, Settings, OS-backed Launch at Login, and Quit. Linux tray
+availability depends on the desktop; the CLI provides window/quit controls even
+when no tray is available.
 
-| Action | Default binding |
-|---|---|
-| Show / hide | `Ctrl+Shift+Space` (configurable) |
-| Copy / paste | `Cmd+C` / `Cmd+V` |
-| Find / next / previous | `Cmd+F` / `Cmd+G` / `Cmd+Shift+G` |
-| Increase / decrease / reset font | `Cmd+=` (also `Cmd++`) / `Cmd+-` / `Cmd+0` |
-| Scroll page up / down | `Cmd+Up` / `Cmd+Down` |
-| Clear scrollback | `Cmd+K` |
-| Select session | `Cmd+1` … `Cmd+9` |
-| Next / previous session | `Cmd+Shift+]` / `Cmd+Shift+[` |
-| Restart session | `Cmd+R` |
-| Close session | `Cmd+Shift+W` |
-| Cycle theme override | `Cmd+Shift+T` |
-| Settings | `Cmd+,` |
-| Quit | `Cmd+Q` (menubar) |
+| Action | macOS | Linux |
+|---|---|---|
+| Show / hide | `Ctrl+Shift+Space` (configurable) | `Ctrl+Shift+Space` (portal/compositor-dependent) |
+| Copy / paste | `Cmd+C` / `Cmd+V` | `Ctrl+Shift+C` / `Ctrl+Shift+V` |
+| Find / next / previous | `Cmd+F` / `Cmd+G` / `Cmd+Shift+G` | `Ctrl+Shift+F` / `Ctrl+G` / `Ctrl+Shift+G` |
+| Increase / decrease / reset font | `Cmd+=` (also `Cmd++`) / `Cmd+-` / `Cmd+0` | `Ctrl+=` (also `Ctrl+Shift+=`) / `Ctrl+-` / `Ctrl+0` |
+| Scroll page up / down | `Cmd+Up` / `Cmd+Down` | `Shift+PageUp` / `Shift+PageDown` |
+| Clear scrollback | `Cmd+K` | `Ctrl+Shift+K` |
+| Select session | `Cmd+1` … `Cmd+9` | `Alt+1` … `Alt+9` |
+| Next / previous session | `Cmd+Shift+]` / `Cmd+Shift+[` | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
+| Restart session | `Cmd+R` | `Ctrl+Alt+R` |
+| Fresh default shell in active session | — | `Ctrl+Shift+R` |
+| Close session | `Cmd+Shift+W` | — (no host action) |
+| Cycle theme override | `Cmd+Shift+T` | `Ctrl+Shift+T` |
+| Settings | `Cmd+,` | `Ctrl+,` |
+| Quit | `Cmd+Q` (menubar) | Tray Quit or `djinn --quit` |
 
 Find rejects malformed UTF-8 and control-character payloads; oversized
 search selections are truncated at a complete UTF-8 boundary. Rejected find
 text/paste never falls through to the terminal.
 
-Host overrides use `keybind = action=trigger`. The current host action table
-contains `copy`, `paste`, `find_open`, `find_next`, `find_prev`, `font_inc`,
-`font_inc_shift`, `font_dec`, `font_reset`, `scroll_page_up`,
+### Host action names
+
+Common to both platforms: `copy`, `paste`, `find_open`, `find_next`, `find_prev`,
+`font_inc`, `font_inc_shift`, `font_dec`, `font_reset`, `scroll_page_up`,
 `scroll_page_down`, `clear_scrollback`, `tab_1` … `tab_9`, `next_tab`,
-`prev_tab`, `restart_session`, `close_session`, `theme_toggle`, and
-`open_settings`. For example: `keybind = clear_scrollback=cmd+l`.
+`prev_tab`, `restart_session`, `theme_toggle`, and `open_settings`.
+
+macOS-only: `close_session` (in-memory session closure).
+
+Linux-only: `shell_session` (fresh default shell in the active session).
+
+Host overrides use `keybind = action=trigger`, for example
+`keybind = clear_scrollback=cmd+l` on macOS or
+`keybind = clear_scrollback=ctrl+shift+l` on Linux. Host action overrides apply
+live on macOS; Linux reports that keymap edits require restart. The global
+`hotkey` setting is separate and supports live replacement on both platforms.
 
 ## Manual acceptance before release
 

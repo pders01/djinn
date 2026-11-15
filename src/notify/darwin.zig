@@ -28,12 +28,11 @@ const rate_buckets: usize = 16;
 
 var audio_workers: platform.Workers = .{};
 
-/// macOS notification sender via NSUserNotification (deprecated in 10.14
-/// but functional through current macOS; UNUserNotificationCenter is the
-/// modern path but requires a code-signed bundle, entitlements, and Zig
-/// extern wrappers for block-based completion handlers — none of which
-/// we want to take on yet). This is a transport swap from osascript;
-/// behavior is identical.
+/// Legacy NSUserNotification transport (deprecated since macOS 10.14).
+/// Delivery depends on OS notification policy and needs native acceptance;
+/// automated tests do not establish support on every macOS release.
+/// UNUserNotificationCenter is not used here. A transport migration needs
+/// explicit native callback ownership, authorization handling, and testing.
 pub const Notifier = struct {
     enabled: bool = true,
     /// Minimum interval between banners from the same terminal session.

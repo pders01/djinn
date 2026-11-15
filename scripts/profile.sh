@@ -2,18 +2,17 @@
 # Profile a running djinn process for N seconds via macOS `sample`.
 # Usage: scripts/profile.sh [duration_sec]
 #
-# Captures main-thread call stacks at 1 ms intervals and writes a
-# folded text report to /tmp/djinn-sample.txt. Hot paths surface as
-# the deepest "Call graph" entries with the highest sample counts.
+# Captures process call stacks using macOS sample's default interval and
+# writes its plain-text report to /tmp/djinn-sample.txt. The summary below
+# ranks sampled frames across all threads; it is not folded flamegraph input.
 #
 # Typical workflow:
-#   1. Start djinn — IMPORTANT: build with ReleaseFast for any meaningful
-#      perf measurement. Debug builds run ghostty's verifyIntegrity sweep
-#      on every page grow, which dominates ~70% of parse time and looks
-#      like a bottleneck that doesn't exist in release.
-#        zig build -Doptimize=ReleaseFast
+#   1. Build ReleaseFast using the pinned environment, then start that binary:
+#        nix develop --command ./scripts/build.sh -Doptimize=ReleaseFast
+#      Debug safety/integrity work can distort profiles. No percentage or
+#      performance target is asserted without recording the build/workload.
 #   2. In another shell, run scripts/profile.sh 10.
-#   3. Trigger the slow operation inside djinn (e.g. CC initial paint).
+#   3. Trigger the slow operation inside djinn (e.g. scrolling terminal output).
 #   4. Open /tmp/djinn-sample.txt and look for the heaviest leaves.
 
 set -euo pipefail
@@ -34,11 +33,11 @@ echo
 echo "wrote $out"
 echo
 
-# Find the main thread's call graph and pull the heaviest frames at each
+# Scan the process call graph and pull the heaviest frames at each
 # indent depth. `sample` prefixes frames with "<count>  <indent>+ <symbol>";
 # the indent encodes call depth. Sorting by count (column 1, numeric desc)
 # and slicing the top N surfaces both leaves and hot interior nodes.
-echo "Heaviest main-thread frames:"
+echo "Heaviest sampled frames (all threads):"
 awk '
   /^Call graph:/ { in_cg = 1; next }
   /^Total number/ { in_cg = 0 }

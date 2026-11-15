@@ -375,21 +375,16 @@ pub const Panel = struct {
         g_main_loop_quit(self.loop);
     }
 
-    /// Install `child` as the window's content. GTK4 windows hold a
-    /// single child (vs GTK3's free-form container); higher-level
-    /// layout (split pane, log column, find chip) lives inside a Box
-    /// the caller passes here once those exist.
+    /// Install `child` as the window's single content widget. The caller
+    /// owns the session stack and optional tab/find layout inside it.
     pub fn attachChild(self: *Panel, child: *GtkWidget) void {
         gtk_window_set_child(self.window, child);
     }
 
-    /// Move keyboard focus to `widget`. Used to ensure the VTE child
-    /// (not the surrounding GtkPaned divider) receives keys on startup
-    /// — without this, the paned can grab initial focus and shortcuts
-    /// like Ctrl+Shift+C / Ctrl+Shift+V never reach VTE because GTK
-    /// dispatches them up the paned's focus chain instead. Returns
-    /// the GTK boolean as-is so callers can log when the focus grab
-    /// silently fails (widget not focusable / not yet realized).
+    /// Move keyboard focus to `widget` so the active VTE child, rather
+    /// than surrounding host controls, receives terminal input on startup
+    /// and session switches. Return whether GTK accepted the focus grab;
+    /// an unrealized or unfocusable widget can reject it.
     pub fn focusChild(self: *Panel, widget: *GtkWidget) bool {
         _ = self;
         return gtk_widget_grab_focus(widget) != 0;

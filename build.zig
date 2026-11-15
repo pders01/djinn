@@ -92,9 +92,10 @@ pub fn build(b: *std.Build) void {
     // ─── Djinn.app bundle ────────────────────────────────────────────
     //
     // `zig build bundle` produces zig-out/Djinn.app with the standard
-    // macOS layout. Bundle path unblocks UNUserNotificationCenter
-    // (entitlements-aware notifications), SMAppService login items,
-    // proper code signing, and dock-less behavior via LSUIElement.
+    // macOS layout. The bundle provides app identity, runtime resources,
+    // a supported home for SMAppService login items, code signing, and
+    // dock-less behavior via LSUIElement. Notification delivery still
+    // needs native acceptance; the current sender uses NSUserNotification.
     //
     // Layout:
     //   Djinn.app/
@@ -206,9 +207,9 @@ pub fn build(b: *std.Build) void {
     // Finder without sudo. /Applications would need elevated privileges
     // and isn't the right home for a single-user dev install anyway.
     //
-    // SMAppService login-items + UN notifications both require a real
-    // Application directory home (not just any path), and AppKit treats
-    // ~/Applications as a first-class Application directory on macOS 12+.
+    // The supported login-item workflow uses a signed, installed bundle.
+    // Keep the user-local destination consistent with the release installer;
+    // installation alone does not establish registration or GUI acceptance.
     //
     // The script `scripts/install-app.sh` does the actual `rsync --delete`
     // so we get clean replaces (no stale Resources/ or signature drift)

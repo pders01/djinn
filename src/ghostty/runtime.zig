@@ -142,13 +142,10 @@ pub fn hostFromApp(handle: c.ghostty_app_t) ?*HostContext {
     return &host_storage;
 }
 
-/// Re-read ~/.config/ghostty/config from disk and push the resulting
-/// config to the live app. Picks up cursor-style, font, theme, …
-/// without restarting djinn. The previous config is freed once the
-/// new one is in place — ghostty clones internally on update.
-/// Re-read ~/.config/ghostty/config + push to app + active surface.
-/// Picks up font / theme / palette / colors / many keybinding edits
-/// without restarting djinn.
+/// Re-read ~/.config/ghostty/config and push the result to the app and
+/// every live surface. Font, theme, palette, colors, and supported Ghostty
+/// keybinding edits can apply without restarting Djinn. The previous config
+/// is freed after update; Ghostty clones its retained configuration.
 ///
 /// Known not-applied at runtime (ghostty re-reads these only on
 /// surface init): cursor-style. The terminal's visual cursor style

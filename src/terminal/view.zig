@@ -1102,8 +1102,8 @@ const default_actions = [_]keymap.Action{
     .{ .name = "clear_scrollback", .mods = mod_cmd, .keycode = 40, .handler = actionClearScrollback }, // Cmd+K
     // Settings — Cmd+, opens ~/.config/djinn/config in default editor.
     .{ .name = "open_settings", .mods = mod_cmd, .keycode = 43, .handler = actionOpenSettings }, // Cmd+,
-    // Find on page — Cmd+F prompts for a query (NSAlert + text
-    // field). Cmd+G / Cmd+Shift+G cycle through matches.
+    // Find overlay — Cmd+F opens the search field;
+    // Cmd+G / Cmd+Shift+G cycle through matches.
     .{ .name = "find_open", .mods = mod_cmd, .keycode = 3, .handler = find.actionOpen }, // Cmd+F
     .{ .name = "find_next", .mods = mod_cmd, .keycode = 5, .handler = find.actionNext }, // Cmd+G
     .{ .name = "find_prev", .mods = mod_cmd | mod_shift, .keycode = 5, .handler = find.actionPrev }, // Cmd+Shift+G
@@ -1242,7 +1242,7 @@ fn actionThemeToggle() void {
     // a full reapply on each step by clearing the last_appearance
     // cache; otherwise the chrome stays on the cached variant when
     // the override resolves to the same value as the previous one.
-    // Zig 0.15 doesn't switch directly on `?Enum`, so unwrap first.
+    // Unwrap the system-following state before cycling explicit variants.
     if (app.g.theme.override) |cur| {
         app.g.theme.override = switch (cur) {
             .light => @as(?theme_mod.Appearance, .dark),

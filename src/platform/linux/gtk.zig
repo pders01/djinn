@@ -7,7 +7,7 @@
 //! types with the same spelling. This module is the single canonical
 //! home so cross-module widget passing just works.
 //!
-//! Per-feature externs (gtk_window_new, vte_terminal_*, gtk_paned_*,
+//! Per-feature externs (gtk_window_new, vte_terminal_*, gtk_stack_*,
 //! pango_*, gtk_layer_*) stay in their consumer modules. The functions
 //! exposed here are the GLib / GTK helpers that 3+ modules need:
 //! signal connect/disconnect, source add/remove, GObject ref ops,
