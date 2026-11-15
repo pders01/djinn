@@ -19,6 +19,46 @@ restart/close never writes configuration.
 See [README.md](README.md) for configuration, migration, and signing.
 Old user endpoint/token files are left untouched; cleanup is manual.
 
+## Release preparation and user-reported installation (0.1.0-alpha.2)
+
+- `e84134a` synchronized application, bundle, Zig, Nix, Arch and Debian version
+  metadata. Local tag `v0.1.0-alpha.2` was created at that commit; this record
+  does not establish remote tag, workflow, or publication state.
+- The user subsequently reported `just install-app` completing successfully at
+  `~/Applications/Djinn.app`. This supersedes the older installed-baseline note
+  below, but is not a report of native GUI, hotkey, login-item or macOS 13
+  acceptance. The toolchain's `tic` warning can appear with exit status zero;
+  Zig 0.17.1 misleadingly labels the stderr command as failed.
+- Older counts and installation statements below are historical snapshots,
+  not a live account of the current checkout or installed application.
+
+## Tooling/documentation cleanup verification (working-tree snapshot after e84134a)
+
+- Corrected repository URLs, terminal-child service policy, Debian notice
+  coverage, and Arch version-tag normalization/failure handling. Added offline
+  fixtures to macOS CI and `just test-tooling`; no package/service was installed.
+- Installer advice no longer requests Accessibility/Input Monitoring grants.
+  Controls/migration guidance distinguishes macOS from Linux; accepted legacy
+  opacity/font keys now warn without reviving terminal fallbacks. Profiling,
+  notification, portal, autostart, layout and toolchain comments were reconciled.
+- `check test test-shared test-linux-models`: **19/19 build steps**; native macOS
+  suite **148/148**, shared suite **68/68**, host Linux models **40/40**. These
+  suites overlap and must not be summed as unique coverage. Added two config
+  tests for legacy migration and order-independent modern settings.
+- Unsigned repository-local macOS bundle: **121/121 build steps**. Both Linux
+  `check test-compile` targets: **4/4 steps** each. These are not Linux link or
+  runtime checks, and no built bundle was launched or installed.
+- Offline tooling: **7 test groups**, including **16 mocked Arch version cases**
+  with pipefail on/off. Workflow fixtures: **40 shell blocks, 18 tag cases,
+  6 architecture cases, 4 installer refusals, 7 candidate gates, 7 rolling
+  retirement cases**. Installer self-tests: **24 archive + 8 replacement/recovery
+  fixtures**, confined to temporary directories. Fixture suites overlap.
+- Shell syntax, Zig formatting, diff whitespace, recipe listing and Linux Nix
+  homepage evaluation passed. Toolchain/deployment pins and the existing release
+  tag are unchanged; no signing/keychain, registration, workflow or publication
+  action was taken. Native package/service, desktop and release acceptance stay
+  open; these checks do not establish a later native Linux CI result.
+
 ## Correctness/release-safety implementation
 
 The previously unchecked source-review fixes below are now implemented by four
@@ -114,7 +154,7 @@ verification further below remains historical; current checks are separate.
       audit. Ad-hoc validation does not satisfy these release gates.
 - [ ] Run CI/workflows only with authorization; no workflow was triggered here.
 
-### Apple Silicon-only policy verification
+### Apple Silicon-only policy verification (snapshot at 0e055ea)
 
 - Flake evaluation exposes exactly `aarch64-darwin`, `x86_64-linux`, and
   `aarch64-linux`; the lockfile and all toolchain/deployment pins are unchanged.
@@ -134,7 +174,7 @@ verification further below remains historical; current checks are separate.
 - Shell syntax, Zig formatting and diff whitespace checks pass. Installed-app,
   macOS 13 runtime, native Linux desktop and release acceptance remain open.
 
-### Earlier correctness-fix verification
+### Earlier correctness-fix verification (snapshot at 013295e)
 
 - macOS arm64: **143/143 build steps succeeded** for bundle/check/test/resources/
   test-shared/test-linux-models. Native suite **146/146**, shared suite **66/66**
@@ -167,14 +207,15 @@ image handling, build/test registration and docs. Preserve source IDs/generation
 callback leases and producer-first teardown; `persist.shutdown()` remains after
 native geometry producers detach and before allocator/process IO teardown.
 
-## Recorded automated verification
+## Recorded automated verification (historical dependency-refresh snapshot)
 
 The reconciled candidate uses **Ghostty 1.4.0**, its matching zig-objc revision,
 Nix Zig **0.17.1**, and SDK **26.5** from the locked nixpkgs input. The results
 below predate the implementation above; they do not verify those review fixes
 or establish the current commit/push/promotion state. Snapshot promotion was
 provided as a manual operation; its completion has not been confirmed here.
-The last known installed app remains the earlier baseline, not this candidate.
+At that snapshot, only the earlier baseline had been installed. The newer
+user-reported alpha.2 installation is recorded above; GUI acceptance stays open.
 Recorded build host: arm64, macOS 27.2.1, Xcode 27.0 (27A266a), system Metal.
 
 ```sh

@@ -14,9 +14,9 @@ profile-editing/writeback UI. The local control socket only carries native
 window/instance commands.
 
 The reconciled source uses the shared Ghostty 1.4.0/Zig 0.17.1 baseline;
-Ghostty remains macOS-only at runtime. The checklist below is outstanding work,
-not a claim that a Linux binary or desktop session has been exercised. Current
-compile-only and host-model results are distinguished below from older records.
+Ghostty remains macOS-only at runtime. Native linking/test execution and desktop
+acceptance are separate gates. The compile-only and host-model records below
+cannot establish a successful native Linux suite or desktop acceptance.
 
 ## Source-review implementation (native acceptance still open)
 
@@ -72,8 +72,9 @@ approval. See the [root implementation record](../../../TODO.md#correctnessrelea
       successful native linking, Linux test execution, or runtime behavior.
 - [x] Host `test-linux-models` executes pure autostart/launcher/status/escaping,
       appearance/scrollback/placement/session and image fixtures without GTK.
-      Current host results: **34/34 Linux model/fixture tests** and **66/66 shared
-      tests** pass (overlapping coverage); see root current results.
+      Historical counts belong to the commit-specific root verification records;
+      the earlier 34-test integration snapshot predates the entry-point theme
+      tests added in `bf63346`. Do not treat it as a current suite count.
 - [x] Reviewed and executed new host pure/model/filesystem tests with injected
       paths/temporary fixtures; no personal config, OS registration, display, or
       desktop portal access. Native API-body tests are compile-only on this host.
@@ -140,6 +141,11 @@ approval. See the [root implementation record](../../../TODO.md#correctnessrelea
       repeated drops, normal quit, and a slow consumer. Failed drops now clean
       owned paths; accepted paths intentionally remain until a safe consumer
       lifetime policy/protocol is available.
+- [x] Tooling review removes terminal-child execution restrictions from the
+      optional user unit, includes staged notices in the Debian manifest, and
+      corrects the Arch source URL/version parser. Offline fixtures exercise
+      these contracts; real Debian/Arch/Nix packaging and service/PTY behavior
+      remain unaccepted.
 - [ ] Audit licenses for the actual linked libraries and distributed resources.
 - [ ] Measure startup/show latency, idle CPU, memory, and repeated-session
       behavior with machine/compositor/build/workload recorded. No performance
