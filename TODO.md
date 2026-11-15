@@ -18,127 +18,133 @@ restart/close never writes configuration.
 See [README.md](README.md) for configuration, migration, and signing.
 Old user endpoint/token files are left untouched; cleanup is manual.
 
-## Review backlog: correctness before publication
+## Correctness/release-safety implementation
 
-These are source-review findings, not implemented fixes or newly executed
-acceptance tests. Do not infer whether a gap was inherited or introduced without
-checking its history. Keep the terminal-first contract and native backend split;
-none of this work restores removed product scope.
+The previously unchecked source-review fixes below are now implemented by four
+parallel workers and coordinator integration. Checked implementation items are
+**not native desktop acceptance or publication approval**. The older recorded
+verification further below remains historical; current checks are separate.
 
-### P1: release safety
+### Implemented release safeguards
 
-- [ ] Normalize macOS release architecture names across CI, both release
-      workflows, and `scripts/install-from-release.sh`. GitHub `runner.arch`
-      uses `ARM64`/`X64`; the installer uses `uname -m` (`arm64`/`x86_64`).
-      Test that generated asset names match installer lookup for both supported
-      architectures; do not change cache keys merely to fix asset names.
-- [ ] Resolve the requested release tag before checkout on manual dispatch.
-      Both platform jobs must build its exact commit, not the dispatch branch
-      tip. Verify that selecting an older tag from `main` cannot publish a
-      main-tip binary under that tag. Reject invalid or missing tags safely.
-- [ ] Build, test, and verify both platform artifacts before one prerelease
-      publishing job replaces the rolling release. Linux currently starts
-      after macOS publication/deletion of the previous release; a failed Linux
-      build can remove the previous working Linux download. Preserve existing
-      downloads if either platform fails and serialize competing publishers.
-- [ ] Decide explicitly whether to gate/disable or accept automatic prerelease
-      publication on `main` before pushing. Updating these TODOs does not
-      authorize a push, workflow run, release, installation, or app launch.
+- [x] CI/release macOS assets normalize runner architecture to `arm64` and
+      `x86_64`, matching installer lookup without changing Zig cache identities.
+      Offline fixtures check both mappings.
+- [x] Manual version tags resolve (including annotated tags) to an exact commit
+      before either platform checkout. Both candidates use that SHA; missing,
+      malformed, non-commit, and moved tags fail closed. Versioned releases refuse
+      overwriting an existing release.
+- [x] One serialized publisher depends on both macOS matrix legs and Linux
+      build/test/artifact verification. No old release is deleted before validation.
+      A failed candidate preserves previous downloads. Rolling promotion uploads
+      only after validation; GitHub tag/asset updates are **not atomic**, and API
+      failure can require manual recovery. Mixed ZIP/checksum pairs fail closed,
+      but an old matching pair can briefly remain under the moved rolling tag.
+- [x] Automatic `main` rolling publication is disabled. Rolling promotion is
+      manual-only, selecting an existing version tag. This implements a safe
+      default, not authorization to trigger, push, publish, or install.
+- [x] Installer verifies checksum, bounded safe ZIP paths/types/symlinks, layout,
+      plist identity, signatures, and native architecture before replacement.
+      Same-filesystem staging/backup, cooperative lock, rollback and cleanup are
+      implemented; rollback failure retains the backup for manual recovery.
+      It never quits/launches sessions or strips quarantine; Accessibility advice
+      was removed. Python 3 is required. Temporary fixtures test extraction and
+      replacement; real installed-app/power-loss recovery remain unaccepted.
 
-### P2: terminal/configuration correctness
+### Implemented terminal/configuration fixes
 
-- [ ] Define `scrollback-size` consistently as lines: use Ghostty 1.4's
-      `scrollback-limit-lines` and VTE's scrollback-lines API. The old Ghostty
-      `scrollback-limit` alias means bytes; Linux currently ignores the value.
-      Explain Ghostty's independent byte cap, update stale default/unit docs,
-      and test unset/zero/positive values plus new/lazy/restarted sessions.
-      State accurately whether changes require new sessions or app restart.
-- [ ] Apply supported Linux window anchors/margins at startup and reload, or
-      explicitly report restart-only behavior. Position/coordinates currently
-      never reach the panel, which always anchors to the top; restart does not
-      fix this. Report unsupported coordinate placement on constrained
-      Wayland/plain-toplevel backends instead of promising macOS parity.
-- [ ] Reset removed Linux appearance overrides to intentional native defaults.
-      Reconcile font, foreground/background/palette/cursor, padding, and opacity
-      when overrides or inheritance disappear; early returns currently leave
-      old state installed. Cover active, inactive, and newly created sessions.
-- [ ] Choose one coherent launch-at-login authority across configuration,
-      CLI, menubar/tray, and OS registration. Startup's default `false` can undo
-      an earlier enable action on both platforms. Consider absent config as
-      leave-OS-state-alone; explicit policy conflicts need truthful UI/status.
-      Do not solve this by rewriting existing config or profiles.
-- [ ] Preserve exact profile identities in saved geometry. `PendingSave`
-      truncates names to 128 bytes, allowing collisions and split UTF-8/invalid
-      JSON. Keep owned names valid across config replacement and teardown;
-      fixture tests must round-trip long names and multibyte boundary cases.
-- [ ] Coalesce pending geometry per profile, not only in one global slot.
-      Queueing B before A flushes must not discard A's geometry. Retain the
-      single writer, atomic replacement, shutdown gate, and accepted-work drain;
-      test rapid profile changes and updates arriving during a flush.
+- [x] `scrollback-size` means lines: Ghostty `scrollback-limit-lines` and VTE
+      scrollback-lines. Unset/zero/positive and retained future-session policy
+      have pure/model coverage. Ghostty's independent byte cap defaults to 50 MB
+      and can evict earlier. Reloaded Ghostty caps apply to **new/lazy/restarted
+      surfaces**, not existing ones; VTE limits apply live to all terminals.
+      Reductions may discard history; larger caps cannot recover it.
+- [x] Linux startup passes positioning before initial map. Accepted reloads
+      reconcile all nine layer-shell named anchors and zero margins. Absolute
+      coordinates are reported unsupported with named-anchor fallback; plain
+      GTK4 toplevel placement is reported compositor-controlled.
+- [x] Removed Linux font/colors/palette/cursor/padding/opacity overrides reset
+      instead of retaining old state. Complete replacement reaches active,
+      inactive and future terminals; absent opacity no longer falls back to
+      the legacy 0.95 value. Pure plans/CSS/session models are tested.
+- [x] Absent `open-at-login` is leave-OS-state-alone; explicit bool is policy,
+      reconciled at startup and every accepted reload. CLI strictly reads policy
+      before actions; menus/status report actual OS state, approval/unknown and
+      conflicts. Conflicting actions are rejected; no config writeback occurs.
+      New starter files comment out policy; existing files are never rewritten.
+- [x] Linux desktop-entry Exec uses desktop escaping (including quotes,
+      backslashes, dollars, backticks and percent), not shell quoting. Launcher
+      selection preserves absolute/relative original launchers, symlinks and PATH
+      wrappers, preferring the public launcher over known Nix internal payloads.
+      Fixture path selection is tested; real packaged wrapper environment and
+      native registration remain acceptance items.
+- [x] Geometry batches own exact profile names without truncation, including
+      long/Unicode names. Latest geometry coalesces **per profile**, retaining
+      other profiles' updates and work queued during a flush. Single writer,
+      atomic replacement, acceptance gate and normal-shutdown drain are retained.
+- [x] Persistence explicitly uses **300 ms periodic coalescing**, not trailing-edge
+      debounce or one-write-per-drag. A first update starts a window; continuous
+      input may checkpoint repeatedly. Shutdown closes acceptance and drains
+      after at most an existing coalescing sleep; filesystem IO is not bounded.
+      Real-worker blocked-flush fixtures cover updates and shutdown.
 
-### Reliability and performance follow-ups
+### Partial image cleanup and remaining gates
 
-- [ ] Stage and validate installer downloads before replacing the installed
-      app: checksum, expected bundle/layout/architecture, plist, and signature.
-      Keep a same-filesystem backup/rollback path; bad archives or extraction
-      failure must preserve the working app. Clean every temporary artifact.
-      Do not auto-quit existing sessions or silently strip quarantine; document
-      ad-hoc/Gatekeeper limits and remove obsolete Accessibility-permission
-      advice. The installer remains macOS-only unless deliberately extended.
-- [ ] Escape Linux autostart desktop-entry `Exec` paths using desktop-entry
-      rules, not shell quoting. Cover spaces, quotes, backslashes, and `%`;
-      verify packaged/wrapped launchers retain their required environment.
-- [ ] Define safe cleanup for djinn-owned image-drop temporary files on both
-      platforms. Do not reap files before consumers can read them or delete
-      unrelated matching paths. Keep Linux files mode 0600.
-- [ ] Decide whether resize persistence should be true trailing-edge debounce
-      or periodic coalescing. The current worker flushes during continuous
-      updates; do not claim one write per drag without a test. Ensure pending
-      profiles still flush on normal shutdown.
-- [ ] Measure the inherited Linux 500 ms geometry observer before replacing
-      it. Record idle wakeups/CPU and drag write frequency; do not substitute a
-      faster poll or resurrect the removed macOS host polling loop.
+- [x] Failed image writes/handoffs clean only their exact owned paths. Linux
+      uses private 0700 directories and 0600 images; macOS creates 0600 images
+      exclusively. The unsafe macOS prefix/age reaper is removed.
+- [ ] Automatic reclamation of **accepted** image paths: arbitrary shells/VTE
+      provide no consumer-release acknowledgement. Accepted paths intentionally
+      survive quit/relaunch; timers or shutdown cleanup would risk premature
+      deletion. Consumer-aware protocol/product policy is still unresolved.
+- [ ] Native Linux linking/tests, compositor/VTE/portal/tray/appearance/IME/drop
+      acceptance and actual wrapped launcher environment. See Linux checklist.
+- [ ] Installed-app macOS acceptance, actual macOS 13 and Intel runtime checks,
+      login registration, and slow-consumer image acceptance.
+- [ ] Measure Linux idle wakeups/CPU and drag write frequency before changing the
+      inherited 500 ms geometry observer. No performance improvement is claimed.
+- [ ] Developer ID signing/notarization and actual linked-resource licensing
+      audit. Ad-hoc validation does not satisfy these release gates.
+- [ ] Run CI/workflows only with authorization; no workflow was triggered here.
 
-### Parallel implementation handoff
+### Current local verification
 
-The previous session hit pi's 32-job limit before any fix agents started.
-Use a fresh session for four workers with disjoint file ownership:
+- macOS arm64: **143/143 build steps succeeded** for bundle/check/test/resources/
+  test-shared/test-linux-models. Native suite **146/146**, shared suite **66/66**
+  (executed separately, cached in the final aggregate), and Linux host models
+  **34/34** pass; these suites overlap, so counts are not unique coverage.
+  Explicit ad-hoc signing and bundle verifier pass. A freshly zipped bundle also
+  passes installer `--verify-archive` for arm64 (no installation). The verifier
+  tests clean relocated CLI, not GUI behavior. Zig 0.17.1, Ghostty 1.4.0/matching objc,
+  SDK 26.5, macOS 13.0 and baseline CPU are preserved.
+- Host shared suite and filtered `test-linux-models` execute pure/model/filesystem
+  fixtures without GTK or OS registration; native Linux API bodies are covered
+  separately by compile-only `test-compile`.
+- Both x86_64/aarch64 Linux `check test-compile` pass. This is semantic analysis
+  and test compilation, **not Linux test execution or native linking**.
+- Installer `--self-test`: 24 archive and 8 replacement/recovery fixtures pass.
+  Offline `scripts/test-release-workflows.py` parses all three YAML files,
+  syntax-checks **38 shell blocks** and tests **18 tag cases, 6 architecture cases,
+  and 4 candidate-gate fixtures** with mocked API calls. No real publication occurs.
+- Formatting checks pass. No Git commands, installation, GUI launch, personal
+  configuration access, keychain helpers, real registration, containers/VMs or
+  publication were performed. Earlier denied Git/Docker routes remain manual;
+  `REDUCTION_PLAN.md` and unrelated user changes remain untouched.
 
-1. **Release/installer:** `.github/workflows/{ci,pre-release,release}.yml`
-   and `scripts/install-from-release.sh`; artifact naming, exact-tag builds,
-   publish-after-validation, and staged installation/rollback.
-2. **Terminal settings/appearance:** `src/ghostty/runtime.zig` and Linux
-   `terminal.zig`, `session_host.zig`, `panel.zig`, `theme.zig`; implement backend
-   options/reset behavior and report required entry-point wiring.
-3. **Autostart:** `src/system/loginitem.zig`, `src/cli.zig`,
-   `src/notify/menubar.zig`, Linux `autostart.zig` and `tray.zig`; agree on policy
-   with the coordinator first, then fix actions/status and desktop `Exec`.
-4. **Persistence/image cleanup:** `src/state/persist.zig` and Linux
-   `dragdrop.zig`; exact profile identity, per-profile pending updates, owned
-   image lifecycle, and fixture tests. Report any shutdown hooks still needed.
+### Parallel integration record
 
-The coordinator owns `src/config.zig`, `src/main.zig`, `src/main_linux.zig`,
-shared/root test registration, and documentation. Agree on option/API contracts
-before workers edit; integrate startup/reload/shutdown wiring centrally. Any
-additional file ownership must be reassigned explicitly, never edited by two
-workers. Preserve source identity/generation checks and async teardown leases.
-
-Validate local formatting, pure/model/fixture tests, shell/workflow syntax, both
-Linux architecture checks/test compilation, and the macOS bundle verifier as
-permitted. Execute native Linux linking/tests and desktop acceptance in CI or
-manually outside pi; cross-compilation is not runtime acceptance. Git
-preparation/promotion was sandbox-denied and remains manual outside pi: do not
-inspect, retry, diagnose, or work around that denied operation. Likewise, do not
-retry the denied Docker validation through another container/VM route. All new
-sandbox denials are final. Do not access personal config, credentials/keychain,
-install/launch the app, force-quit sessions, or publish as part of these fixes.
-Leave the pre-existing untracked `REDUCTION_PLAN.md` untouched.
+The four assigned workers completed release/installer, terminal/appearance,
+autostart, and persistence/image changes without further delegation. Coordinator
+reviewed source changes and wired config/startup/reload, facade APIs, safe macOS
+image handling, build/test registration and docs. Preserve source IDs/generations,
+callback leases and producer-first teardown; `persist.shutdown()` remains after
+native geometry producers detach and before allocator/process IO teardown.
 
 ## Recorded automated verification
 
 The reconciled candidate uses **Ghostty 1.4.0**, its matching zig-objc revision,
 Nix Zig **0.17.1**, and SDK **26.5** from the locked nixpkgs input. The results
-below predate the review backlog above; they do not verify those pending fixes
+below predate the implementation above; they do not verify those review fixes
 or establish the current commit/push/promotion state. Snapshot promotion was
 provided as a manual operation; its completion has not been confirmed here.
 The last known installed app remains the earlier baseline, not this candidate.
@@ -340,10 +346,10 @@ are not installed-app or native-interaction acceptance.
       that AppKit's normal termination path runs Zig defers.
 - [ ] Confirm image-drop temporary-file lifecycle, scoped to djinn-owned files.
 - [x] Saved-size parsing now validates JSON integer bounds. One writer drains
-      accepted debounce state using same-directory atomic replacement; tests
-      cover serialization, shutdown gating, malformed dimensions, and replacement.
-      This does not cover the pending cross-profile overwrite/name-truncation
-      fixes above. Native resize/quit timing still needs manual acceptance.
+      accepted coalesced state using same-directory atomic replacement; current
+      fixtures cover serialization, shutdown gating, malformed dimensions,
+      replacement, long/Unicode names and cross-profile/during-flush updates.
+      Native resize/quit timing still needs manual acceptance.
 
 ## Packaging follow-ups
 

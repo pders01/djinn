@@ -109,15 +109,26 @@ notifications, respecting the enable/rate-limit settings; no agent API is used.
 For a compile-only Linux check from a Mac, without GTK development libraries:
 
 ```sh
-nix develop --command ./scripts/build.sh check -Dtarget=x86_64-linux-gnu
-nix develop --command ./scripts/build.sh check -Dtarget=aarch64-linux-gnu
+nix develop --command ./scripts/build.sh check test-compile -Dtarget=x86_64-linux-gnu
+nix develop --command ./scripts/build.sh check test-compile -Dtarget=aarch64-linux-gnu
 ```
 
 The shared config/session/persistence suite can run on either host without
 linking a native UI backend:
 
 ```sh
-nix develop --command ./scripts/build.sh test-shared
+nix develop --command ./scripts/build.sh test-shared test-linux-models
+```
+
+`test-linux-models` selects host-executable backend policy/model/temporary-file
+fixtures without GTK linkage. Native Linux API-body checks remain in the
+compile-only `test-compile` target and the native Linux test suite.
+
+Release tooling can be checked without installation or publication:
+
+```sh
+bash scripts/install-from-release.sh --self-test
+python3 scripts/test-release-workflows.py  # Python 3, Ruby YAML/JSON stdlib, jq
 ```
 
 Cross-compilation is not a Linux link, runtime, or compositor test. Run the
@@ -142,10 +153,20 @@ Verify that with the installed-app acceptance checks below, not just a
 dev-tree launch.
 
 Prebuilt bundles and the rolling `pre-release` installer are available at
-[Releases](https://github.com/pders01/djinn/releases). Rolling builds follow
-`main`; choose a versioned tag when you need a pinned release. Downloads
-are not Developer ID signed/notarized, so Gatekeeper may require explicit
-approval.
+[Releases](https://github.com/pders01/djinn/releases). Rolling publication is
+manual-only pending explicit release approval; it validates both platform
+candidates before replacing downloads. Versioned releases resolve the requested
+tag to one exact commit for both builds. Choose a versioned tag for a pinned
+release. Downloads are not Developer ID signed/notarized, so Gatekeeper may
+require explicit approval.
+
+`scripts/install-from-release.sh` is macOS-only. It stages and validates the
+archive/checksum, bundle, signature, and native architecture before replacement,
+keeping a same-filesystem rollback copy until replacement succeeds. Python 3 is
+required for bounded safe ZIP validation/extraction. It
+does not quit running sessions, launch the app, or remove quarantine attributes.
+A checksum and ad-hoc signature detect corruption, not publisher identity;
+Developer ID signing/notarization and native acceptance remain release gates.
 
 The global toggle uses Carbon `RegisterEventHotKey` with exclusive
 registration. It does not monitor keyboard events and requires neither
@@ -213,8 +234,14 @@ From a signed, installed bundle:
 ```
 
 These wrap `SMAppService.mainAppService`; the raw development executable
-is not a supported login-item home. `open-at-login = true|false` controls
-the same registration at startup.
+is not a supported login-item home. Linux exposes the same CLI using an XDG
+autostart desktop entry. When `open-at-login` is **omitted**, startup and reload
+leave OS registration alone, so CLI/menu enable/disable choices survive restart.
+Explicit `open-at-login = true|false` is policy, reconciled at startup and on
+each accepted config reload; conflicting CLI/menu actions are rejected. Status
+reports actual OS registration separately from policy, including approval or
+unknown states. No action rewrites existing configuration. OS/desktop policy can
+still prevent startup; enabled registration alone is not native acceptance.
 
 ## Configuration
 
@@ -252,14 +279,29 @@ bell-sound = Tink
 system-notifications = true
 notify-rate-limit-ms = 30000
 menubar-icon = true
-open-at-login = false
+# Omit to leave OS registration under CLI/menu control.
+# open-at-login = false
 ```
 
 Booleans accept `true|yes|on|1` and `false|no|off|0`. Window positions accept
 a nine-grid anchor (`top_left`, `top_center`, …, `bottom_right`, with
 `center` for the middle) or `X,Y` in NSScreen coordinates. Optional
 `window-position-x` / `window-position-y` override individual axes.
-`window-toggle-style` is `instant` or `minimize`.
+`window-toggle-style` is `instant` or `minimize` on macOS. Linux layer-shell
+supports the nine named anchors at startup and reload; absolute screen
+coordinates are not portable and are reported as unsupported. Without
+layer-shell, the native toplevel/compositor controls placement and Djinn reports
+that limitation instead of promising coordinate parity.
+
+`scrollback-size` is a **line count**, not bytes: unset leaves backend defaults,
+zero retains no scrollback, and a positive value bounds retained lines. macOS
+uses Ghostty 1.4's `scrollback-limit-lines`; its independent byte cap may retain
+fewer lines (the old `scrollback-limit` alias controls bytes). A macOS change
+applies after config reload to **new/lazy/restarted sessions**; already-created
+surfaces retain their original caps. Restart a session (or the app for all
+sessions) to adopt changed caps. Linux applies VTE's line limit live to existing
+terminals and remembers it for lazy/restarted sessions. Reducing a limit can
+discard history; increasing/removing it cannot recover discarded history.
 
 The default is **`ctrl+shift+space`**, avoiding the usual Ctrl+Space
 input-source shortcut while keeping Space easy to reach across layouts.
@@ -318,7 +360,14 @@ literal executable paths. Keep complex invocation details in scripts. Profile de
 are static: **restart djinn after profile changes**. Restarting a session
 reuses the loaded profile; it does not reload profile definitions.
 Closing a session does not rewrite the config or delete the profile; the
-next show starts a fresh child. Exited command profiles retain Ghostty's
+next show starts a fresh child. Saved geometry owns exact profile names and
+coalesces each profile independently. Persistence uses 300 ms **periodic
+coalescing**, not trailing-edge debounce: continuous resizing can checkpoint
+repeatedly, rather than promising one write per drag. Normal shutdown drains
+accepted updates after native resize producers detach. The inherited Linux
+500 ms geometry observer remains unchanged pending measurements.
+
+Exited command profiles retain Ghostty's
 exit/error output until closed or explicitly restarted with Cmd+R. An
 explicit profile title wins over the terminal's OSC title.
 
@@ -369,6 +418,14 @@ when confirmation would be required. IME commits use a separate text path.
 Linux delegates clipboard and IME behavior to GTK/VTE; Ghostty clipboard
 permission settings are not a Linux policy layer.
 
+Raw image drops create private, exclusively created temporary PNG files. Failed
+writes/rejected handoffs clean only the exact file created by that operation.
+Once a path is handed to a terminal, arbitrary programs can read it later—even
+after Djinn quits—so there is no safe automatic completion signal. Accepted
+files are intentionally retained; no prefix/age scan or quit-time reaper deletes
+them. Consumer-aware cleanup remains open; remove a known image only after its
+consumer has finished.
+
 ### Migration from the agent-oriented build
 
 Removed keys are warned about and ignored; they do not recreate the old
@@ -394,8 +451,8 @@ no automatic credential/config deletion or profile writeback.
 
 ## Controls
 
-The menubar always uses the djinn brand mark. Its menu contains only the
-active session label, show/hide, Settings, and Quit.
+The menubar always uses the djinn brand mark. Its menu contains the active
+session label, show/hide, Settings, OS-backed Launch at Login, and Quit.
 
 | Action | Default binding |
 |---|---|

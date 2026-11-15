@@ -15,46 +15,51 @@ window/instance commands.
 
 The reconciled source uses the shared Ghostty 1.4.0/Zig 0.17.1 baseline;
 Ghostty remains macOS-only at runtime. The checklist below is outstanding work,
-not a claim that a Linux binary or desktop session has been exercised. Existing
-compile-only results predate the source-review fixes listed below.
+not a claim that a Linux binary or desktop session has been exercised. Current
+compile-only and host-model results are distinguished below from older records.
 
-## Source-review fixes before acceptance
+## Source-review implementation (native acceptance still open)
 
-These remain unimplemented. See the [root review backlog](../../../TODO.md#review-backlog-correctness-before-publication)
-for release priorities, cross-platform policy, and disjoint worker ownership.
+These fixes are implemented and centrally wired. Checked source/model items do
+not establish native Linux linking, test execution, desktop acceptance, or release
+approval. See the [root implementation record](../../../TODO.md#correctnessrelease-safety-implementation).
 
-- [ ] Apply configured `scrollback-size` to VTE as lines. Cover no override,
-      zero, positive limits, and new/lazy/restarted sessions. Align the contract
-      with Ghostty's `scrollback-limit-lines`, not its old byte-limit alias;
-      accurately report reload/new-session/restart behavior.
-- [ ] Wire configured window positioning into panel creation and supported
-      updates. The panel currently always anchors to the top; restart does not
-      apply ignored coordinates. Test supported named anchors/margins and give
-      explicit limitations for unsupported absolute placement/compositors.
-- [ ] Reset removed font/color/palette/cursor/padding/opacity overrides instead
-      of retaining previous native state through early returns. Cover clearing
-      individual fields, disabling inheritance, missing inherited config, light/
-      dark changes, inactive terminals, and sessions created after reload.
-- [ ] Unify config/CLI/tray/OS autostart policy. Startup's default `false` must
-      not silently undo a previous enable action. Agree on absent versus
-      explicit config policy and expose conflicts truthfully, without config
-      writeback. Test enable/disable/status across app restarts using fixtures.
-- [ ] Encode autostart desktop-entry `Exec` paths with desktop-entry escaping,
-      including spaces, quotes, backslashes, and `%`. Verify the chosen launcher
-      works for wrapped Nix and distro installs; do not bypass required wrapper
-      environment by blindly using the resolved internal executable.
-- [ ] Preserve exact owned profile names in shared geometry persistence; no
-      128-byte truncation, prefix collisions, split UTF-8, or invalid JSON.
-      Queue updates per profile so switching profiles before a flush cannot
-      discard another profile's size. Test updates during flush and shutdown
-      using temporary fixtures; retain one writer and atomic replacement.
-- [ ] Define and implement safe reaping for djinn-owned mode-0600 image-drop
-      files. Keep them available until the target can consume them; clean only
-      owned paths, including failure paths. Coordinate any entry-point shutdown
-      hook with the owner of `src/main_linux.zig`.
-- [ ] Test/document whether geometry persistence is trailing-edge debounce or
-      periodic coalescing. Measure writes during a drag and preserve all pending
-      profile updates on shutdown before changing the 500 ms geometry observer.
+- [x] VTE applies `scrollback-size` as lines; null restores the captured native
+      default, zero disables retained scrollback, positive sets a limit. All live
+      terminals update on reload; lazy/restarted/recovery sessions retain policy.
+      Ghostty uses its line cap too, but only new surfaces adopt reloaded caps.
+- [x] Startup placement is applied before initial mapping. Reload reconciles nine
+      named layer-shell anchors and zero margins. Absolute coordinates report
+      unsupported with named fallback; plain-toplevel placement is explicitly
+      compositor-controlled. Pure anchor/margin models pass.
+- [x] Removed font/foreground/background/palette/cursor/padding/opacity settings
+      restore intentional native defaults. Complete replacement reaches active,
+      inactive and future sessions; no legacy opacity fallback remains. Font,
+      color, CSS and session replacement models pass.
+- [x] Absent login policy leaves OS registration alone; explicit true/false
+      reconciles at startup/every accepted reload. CLI/tray reject conflicts
+      without config writeback. Status parses disabled/malformed/conditional
+      desktop entries conservatively rather than treating existence as enabled.
+- [x] Desktop Exec has correct desktop-entry escaping for spaces, quotes,
+      backslashes, percent, dollars and backticks. Launcher selection preserves
+      public wrappers/symlinks, including relative invocation and PATH lookup;
+      known Nix internal payloads prefer their adjacent wrapper. Selection is
+      fixture-tested; actual packaged environment remains native acceptance.
+- [x] Shared geometry owns exact long/Unicode profile names, coalesces per profile,
+      preserves updates during flush, and drains accepted work on normal shutdown
+      with one writer and atomic replacement. Real blocked-flush/temp fixtures pass.
+- [x] Image writes use exact private 0700 directories/0600 files and clean failed
+      pre-handoff operations only. Fixtures verify ownership/permissions/failure
+      cleanup, unrelated-path preservation, and accepted-path retention.
+- [ ] Accepted image reclamation remains unresolved: VTE's void paste API cannot
+      acknowledge arbitrary consumer completion. Files intentionally survive quit
+      and relaunch; no timer, wildcard scan, or shutdown reaper is safe without a
+      consumer-release protocol. No shutdown-reaping hook is installed.
+- [x] Geometry semantics are explicitly 300 ms **periodic coalescing**, not
+      trailing-edge debounce or one-write-per-drag. Shutdown closes acceptance,
+      drains after any current sleep, and imposes no further coalescing delay.
+- [ ] Measure writes during a drag and idle wakeups/CPU before changing the
+      inherited 500 ms geometry observer; no measured performance claim is made.
 
 ## Build and unit verification
 
@@ -62,11 +67,16 @@ for release priorities, cross-platform policy, and disjoint worker ownership.
       GLib/GIO, and pkg-config development dependencies.
 - [ ] Native Linux debug and ReleaseSafe builds; relocated `--version` and
       `--help` without a display server or unintended startup side effects.
-- [x] Linux x86_64 and aarch64 compile-only checks and full test-suite
-      compilation from macOS. Cross-checking does not establish successful
-      native library linking, Linux test execution, or runtime behavior.
-- [ ] Audit tests for real HOME/config/autostart writes and GUI/portal access;
-      persistence and filesystem tests must use temporary fixtures.
+- [x] Current-source Linux x86_64 and aarch64 `check test-compile` pass from
+      macOS without GTK/pkg-config linkage. Cross-checking does not establish
+      successful native linking, Linux test execution, or runtime behavior.
+- [x] Host `test-linux-models` executes pure autostart/launcher/status/escaping,
+      appearance/scrollback/placement/session and image fixtures without GTK.
+      Current host results: **34/34 Linux model/fixture tests** and **66/66 shared
+      tests** pass (overlapping coverage); see root current results.
+- [x] Reviewed and executed new host pure/model/filesystem tests with injected
+      paths/temporary fixtures; no personal config, OS registration, display, or
+      desktop portal access. Native API-body tests are compile-only on this host.
 - [ ] Verify packaging/install paths and required library versions on the
       Ubuntu CI image and appropriate Arch/Nix environments.
 
@@ -120,13 +130,16 @@ for release priorities, cross-platform policy, and disjoint worker ownership.
 - [ ] Native Linux CI jobs actually build/link/run tests and verify relocated
       CLI artifacts. Do not publish until both platform candidates validate;
       preserve the previous Linux prerelease download if either platform fails.
-      Manual tagged releases must build the requested tag's exact commit, not
-      the workflow-dispatch branch tip. See root P1 release tasks.
+      Exact-tag resolution, candidate gates, architecture naming and serialized
+      publishing are implemented and offline fixture-tested. Workflow execution
+      remains open; rolling publication is manual-only. GitHub asset/tag mutation
+      is not atomic and API errors can require operator recovery.
 - [ ] Desktop identity and portal permissions remain stable across upgrades.
 - [ ] Optional systemd user unit is not auto-enabled by developer builds.
 - [ ] Exercise image-temp cleanup after implementation, including failed drops,
-      repeated drops, normal quit, and a slow consumer. Current Linux drops do
-      not schedule reaping; source-review tasks above are not completed fixes.
+      repeated drops, normal quit, and a slow consumer. Failed drops now clean
+      owned paths; accepted paths intentionally remain until a safe consumer
+      lifetime policy/protocol is available.
 - [ ] Audit licenses for the actual linked libraries and distributed resources.
 - [ ] Measure startup/show latency, idle CPU, memory, and repeated-session
       behavior with machine/compositor/build/workload recorded. No performance
