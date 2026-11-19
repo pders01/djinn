@@ -481,7 +481,7 @@ pub fn main(init: std.process.Init) !void {
     // binds a CAMetalLayer to whichever NSView its `newSurface` call
     // points at, so each session gets its own host.
     const NSView_surface = objc.getClass("NSView") orelse unreachable;
-    for (session_manager.sessions.items, 0..) |*s, i| {
+    for (session_manager.sessions.items, 0..) |s, i| {
         const sh_alloc = NSView_surface.msgSend(objc.Object, "alloc", .{});
         const sh = sh_alloc.msgSend(
             objc.Object,
@@ -572,7 +572,7 @@ pub fn main(init: std.process.Init) !void {
     defer {
         if (ghostty_app_opt) |*ga| {
             _ = ga;
-            for (session_manager.sessions.items) |*sess| surface_lifecycle.destroySession(sess);
+            for (session_manager.sessions.items) |sess| surface_lifecycle.destroySession(sess);
         }
     }
 

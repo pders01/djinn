@@ -306,7 +306,7 @@ fn buildSharedTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
             "autostart",       "desktopPath",       "stripDeletedAnnotation",
             "Status.label",    "owned image",       "file list",
             "formatPayload",   "percentDecode",     "drops reject",
-            "tray login view", "buildThemeOptions",
+            "tray login view", "buildThemeOptions", "routes VTE callbacks",
         },
     });
     if (target.result.os.tag == .macos) models.setLibCFile(buildDarwinLibC(b, target));

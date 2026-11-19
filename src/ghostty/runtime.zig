@@ -115,8 +115,8 @@ const PendingConstruction = struct {
     session: *Session,
     generation: u64,
 
-    fn matches(self: PendingConstruction, sessions: []Session, userdata: ?*anyopaque) ?*Session {
-        for (sessions) |*session| {
+    fn matches(self: PendingConstruction, sessions: []const *Session, userdata: ?*anyopaque) ?*Session {
+        for (sessions) |session| {
             if (session == self.session and userdata == @as(*anyopaque, @ptrCast(session)) and
                 session.surface == null and session.surface_generation == self.generation) return session;
         }
@@ -517,8 +517,7 @@ pub const App = struct {
         // native press-any-key-to-close semantics; never force-close it here.
         // A null command inherits Ghostty's ordinary shell/config policy.
         opts.wait_after_command = command != null;
-        // The static session array never reallocates. Userdata remains valid
-        // until all its surfaces have been destroyed at shutdown.
+        // Sessions have stable heap addresses and outlive their surfaces.
         opts.userdata = session;
         // Null command delegates to Ghostty; explicit commands are unchanged.
         if (command) |cmd| opts.command = cmd;
@@ -655,13 +654,12 @@ pub fn appSetColorScheme(dark: bool) void {
     c.ghostty_app_set_color_scheme(handle, scheme);
 }
 
-/// Validate callback userdata before dereferencing it. Profile membership is
-/// fixed for the application's lifetime, including during config reload.
+/// Validate callback userdata against the current set of stable sessions.
 fn sessionFromUserdata(ud: ?*anyopaque) ?*Session {
     const raw = ud orelse return null;
     if (!host_inited) return null;
     const sm = host_storage.app_state.session_manager orelse return null;
-    for (sm.sessions.items) |*session| {
+    for (sm.sessions.items) |session| {
         if (@as(*anyopaque, @ptrCast(session)) == raw and session.surface != null) return session;
     }
     return null;
@@ -673,9 +671,9 @@ fn sessionFromTarget(host: *HostContext, target: c.ghostty_target_s) ?*Session {
     return sessionForSurface(sm.sessions.items, @ptrCast(target.target.surface));
 }
 
-fn sessionForSurface(sessions: []Session, surface: ?*anyopaque) ?*Session {
+fn sessionForSurface(sessions: []const *Session, surface: ?*anyopaque) ?*Session {
     const handle = surface orelse return null;
-    for (sessions) |*session| {
+    for (sessions) |session| {
         if (session.surface == handle) return session;
     }
     return null;
@@ -1295,21 +1293,22 @@ test "pending construction title routing requires member userdata and generation
         .{ .id = 1, .profile = .{ .name = "active" }, .surface = @ptrFromInt(16) },
         .{ .id = 2, .profile = .{ .name = "constructing" }, .surface_generation = 4 },
     };
+    const members = [_]*Session{ &sessions[0], &sessions[1] };
     const pending: PendingConstruction = .{ .session = &sessions[1], .generation = 4 };
-    try std.testing.expect(pending.matches(&sessions, null) == null);
-    try std.testing.expect(pending.matches(&sessions, &sessions[0]) == null);
-    try std.testing.expect(pending.matches(&sessions, @ptrFromInt(48)) == null);
-    try std.testing.expect(pending.matches(&sessions, &sessions[1]) == &sessions[1]);
-    setSessionTitle(pending.matches(&sessions, &sessions[1]).?, "initial title");
+    try std.testing.expect(pending.matches(&members, null) == null);
+    try std.testing.expect(pending.matches(&members, &sessions[0]) == null);
+    try std.testing.expect(pending.matches(&members, @ptrFromInt(48)) == null);
+    try std.testing.expect(pending.matches(&members, &sessions[1]) == &sessions[1]);
+    setSessionTitle(pending.matches(&members, &sessions[1]).?, "initial title");
     try std.testing.expectEqualStrings("initial title", sessions[1].label());
     try std.testing.expectEqualStrings("active", sessions[0].label());
     sessions[1].surface_generation += 1;
-    try std.testing.expect(pending.matches(&sessions, &sessions[1]) == null);
+    try std.testing.expect(pending.matches(&members, &sessions[1]) == null);
     sessions[1].surface_generation = 4;
     sessions[1].surface = @ptrFromInt(32);
-    try std.testing.expect(pending.matches(&sessions, &sessions[1]) == null);
+    try std.testing.expect(pending.matches(&members, &sessions[1]) == null);
     sessions[1].surface = null;
-    try std.testing.expect(pending.matches(sessions[0..1], &sessions[1]) == null);
+    try std.testing.expect(pending.matches(members[0..1], &sessions[1]) == null);
 }
 
 test "surface routing preserves source and rejects absent or replaced handles" {
@@ -1319,11 +1318,12 @@ test "surface routing preserves source and rejects absent or replaced handles" {
         .{ .id = 1, .profile = .{ .name = "shell" }, .surface = a },
         .{ .id = 2, .profile = .{ .name = "tools" }, .surface = b },
     };
-    try std.testing.expectEqual(@as(u64, 2), sessionForSurface(&sessions, b).?.id);
-    try std.testing.expectEqual(@as(u64, 1), sessionForSurface(&sessions, a).?.id);
-    try std.testing.expect(sessionForSurface(&sessions, null) == null);
+    const members = [_]*Session{ &sessions[0], &sessions[1] };
+    try std.testing.expectEqual(@as(u64, 2), sessionForSurface(&members, b).?.id);
+    try std.testing.expectEqual(@as(u64, 1), sessionForSurface(&members, a).?.id);
+    try std.testing.expect(sessionForSurface(&members, null) == null);
     sessions[1].surface = @ptrFromInt(0x3000);
-    try std.testing.expect(sessionForSurface(&sessions, b) == null);
+    try std.testing.expect(sessionForSurface(&members, b) == null);
 }
 
 test "terminal titles are bounded display text with intact UTF-8" {

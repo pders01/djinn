@@ -100,7 +100,7 @@ const Dispatch = struct {
     fn onBell(ctx: *anyopaque, idx: usize) void {
         const self: *Dispatch = @ptrCast(@alignCast(ctx));
         if (idx >= self.session_manager.count()) return;
-        const session = &self.session_manager.sessions.items[idx];
+        const session = self.session_manager.sessions.items[idx];
         if (session.profile.bell_visual orelse self.config.bell.visual)
             self.panel.flashBell();
         // A standard terminal BEL can request attention without an agent API.
@@ -228,9 +228,9 @@ fn shouldNotifyBell(active_idx: usize, source_idx: usize, focused: bool) bool {
     return active_idx != source_idx or !focused;
 }
 
-fn onTabActivate(ctx: *anyopaque, idx: usize) bool {
+fn onTabActivate(ctx: *anyopaque, id: u64) bool {
     const host: *platform.SessionHost = @ptrCast(@alignCast(ctx));
-    return host.activate(idx);
+    return host.activate(host.sm.indexOfId(id) orelse return false);
 }
 fn loadConfigWithRetry(allocator: std.mem.Allocator) ?Config {
     for (0..3) |attempt| {

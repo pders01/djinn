@@ -36,6 +36,10 @@ pub const Session = struct {
     terminal_title: [256]u8 = @splat(0),
     terminal_title_len: usize = 0,
     profile: Profile,
+    owned_strings: std.ArrayList([]u8) = .empty,
+    synthetic: bool = false,
+    /// Removed from config, but still owns a running child. Never relaunch it.
+    retired: bool = false,
     surface: ?*anyopaque = null,
     surface_host: ?*anyopaque = null,
     spawned: bool = false,
@@ -64,11 +68,11 @@ pub const Session = struct {
 
 pub const SessionManager = struct {
     allocator: std.mem.Allocator,
-    /// Fixed membership after init. This module never reallocates the list
-    /// after returning it; surface lifecycle is managed by the caller.
-    sessions: std.ArrayList(Session) = .empty,
+    /// Stable userdata addresses even when profile order or membership changes.
+    sessions: std.ArrayList(*Session) = .empty,
     active_idx: usize = 0,
-    owned_strings: std.ArrayList([]u8) = .empty,
+    default_idx: usize = 0,
+    next_id: u64 = 1,
 
     /// No configured profiles means one lazy, ordinary shell. Every retained
     /// config string is copied so Config.deinit/reload cannot dangle it.
@@ -77,21 +81,14 @@ pub const SessionManager = struct {
         errdefer mgr.deinit();
 
         if (cfg.profiles.entries.len == 0) {
-            try mgr.sessions.append(allocator, .{
-                .id = 1,
-                .profile = .{ .name = try own(allocator, &mgr.owned_strings, "default") },
-            });
+            try mgr.appendProfile(.{ .name = "default" }, true);
         } else {
-            for (cfg.profiles.entries, 0..) |entry, i| {
-                try mgr.sessions.append(allocator, .{
-                    .id = @as(u64, @intCast(i)) + 1,
-                    .profile = try resolveEntry(allocator, &entry, &mgr.owned_strings),
-                });
-            }
+            for (cfg.profiles.entries) |entry| try mgr.appendProfile(entry, false);
         }
 
         if (cfg.profiles.default) |name| {
             if (mgr.indexOf(name)) |idx| {
+                mgr.default_idx = idx;
                 mgr.active_idx = idx;
             } else {
                 std.debug.print("warning: default-profile '{s}' not defined; using '{s}'\n", .{ name, mgr.sessions.items[0].profile.name });
@@ -100,15 +97,109 @@ pub const SessionManager = struct {
         return mgr;
     }
 
-    pub fn deinit(self: *SessionManager) void {
-        self.sessions.deinit(self.allocator);
-        for (self.owned_strings.items) |s| self.allocator.free(s);
-        self.owned_strings.deinit(self.allocator);
+    fn appendProfile(self: *SessionManager, entry: Config.ProfileEntry, synthetic: bool) !void {
+        const session = try self.allocator.create(Session);
+        session.* = .{ .id = self.next_id, .profile = undefined, .synthetic = synthetic };
+        errdefer self.destroy(session);
+        session.profile = try resolveEntry(self.allocator, &entry, &session.owned_strings);
+        try self.sessions.append(self.allocator, session);
+        self.next_id += 1;
     }
 
-    pub fn active(self: *SessionManager) *Session {
-        return &self.sessions.items[self.active_idx];
+    fn destroy(self: *const SessionManager, session: *Session) void {
+        for (session.owned_strings.items) |s| self.allocator.free(s);
+        session.owned_strings.deinit(self.allocator);
+        self.allocator.destroy(session);
     }
+
+    pub fn deinit(self: *SessionManager) void {
+        for (self.sessions.items) |session| self.destroy(session);
+        self.sessions.deinit(self.allocator);
+    }
+
+    pub fn active(self: *const SessionManager) *Session {
+        return self.sessions.items[self.active_idx];
+    }
+
+    pub fn indexOfId(self: *const SessionManager, id: u64) ?usize {
+        for (self.sessions.items, 0..) |session, i| if (session.id == id) return i;
+        return null;
+    }
+
+    /// Call only after the platform host has detached the native terminal.
+    pub fn removeRetired(self: *SessionManager, idx: usize) void {
+        const session = self.sessions.orderedRemove(idx);
+        std.debug.assert(session.retired);
+        // Retired sessions are always after all configured sessions.
+        if (idx == self.active_idx) self.active_idx = self.default_idx else if (idx < self.active_idx) self.active_idx -= 1;
+        self.destroy(session);
+    }
+
+    /// Stage a profile reload without moving any live Session or touching a
+    /// running child. Hosts can prepare their native UI before committing.
+    pub fn prepareReload(self: *const SessionManager, cfg: *const Config) !Reload {
+        var plan = Reload{ .preview = try init(self.allocator, cfg) };
+        plan.configured_count = plan.preview.count();
+        errdefer plan.deinit();
+        plan.preview.next_id = self.next_id;
+        for (plan.preview.sessions.items) |fresh| {
+            for (self.sessions.items) |old| {
+                if (old.synthetic == fresh.synthetic and std.mem.eql(u8, old.profile.name, fresh.profile.name)) {
+                    fresh.id = old.id;
+                    fresh.terminal_title = old.terminal_title;
+                    fresh.terminal_title_len = old.terminal_title_len;
+                    fresh.exited = old.exited;
+                    break;
+                }
+            } else {
+                fresh.id = plan.preview.next_id;
+                plan.preview.next_id += 1;
+            }
+        }
+        for (self.sessions.items) |old| {
+            if (old.spawned and !old.exited and plan.preview.indexOfId(old.id) == null)
+                try plan.preview.sessions.append(self.allocator, old);
+        }
+        if (plan.preview.indexOfId(self.active().id)) |idx| plan.preview.active_idx = idx;
+        return plan;
+    }
+
+    pub const Reload = struct {
+        preview: SessionManager,
+        // Configured prefix is owned by the plan; the remaining (retiring)
+        // nodes are borrowed from the current manager until commit.
+        configured_count: usize = 0,
+
+        pub fn deinit(self: *Reload) void {
+            self.preview.sessions.items.len = self.configured_count;
+            self.preview.deinit();
+        }
+
+        /// The host must destroy resources of all omitted sessions first.
+        /// Consumes the plan and preserves native userdata, generation and PTY
+        /// state of every retained session.
+        pub fn commit(self: *Reload, manager: *SessionManager) void {
+            for (self.preview.sessions.items[0..self.configured_count]) |*slot| {
+                const fresh = slot.*;
+                if (manager.indexOfId(fresh.id)) |idx| {
+                    const old = manager.sessions.items[idx];
+                    old.profile = fresh.profile;
+                    std.mem.swap(std.ArrayList([]u8), &old.owned_strings, &fresh.owned_strings);
+                    old.retired = false;
+                    slot.* = old;
+                    manager.destroy(fresh);
+                }
+            }
+            for (self.preview.sessions.items[self.configured_count..]) |s| s.retired = true;
+            for (manager.sessions.items) |old| {
+                if (self.preview.indexOfId(old.id) == null) manager.destroy(old);
+            }
+            manager.sessions.deinit(manager.allocator);
+            manager.* = self.preview;
+            self.preview.sessions = .empty;
+            self.configured_count = 0;
+        }
+    };
 
     pub fn count(self: *const SessionManager) usize {
         return self.sessions.items.len;
@@ -548,6 +639,101 @@ test "Session: retained cwd is revalidated after load and before each launch" {
     try std.testing.expectError(error.NotDir, mgr.active().validateLaunch());
     var shell: Session = .{ .id = 2, .profile = .{ .name = "shell" } };
     try shell.validateLaunch();
+}
+
+test "profile reload retitles and reorders without moving a live session" {
+    const a = std.testing.allocator;
+    var cfg = try Config.parse(a, "profile.one.title = One\nprofile.two.command = old");
+    defer cfg.deinit();
+    var sm = try SessionManager.init(a, &cfg);
+    defer sm.deinit();
+    try std.testing.expect(sm.switchTo(1));
+    const live = sm.active();
+    live.surface = @ptrFromInt(0x1000);
+    live.spawned = true;
+    live.surface_generation = 42;
+    var edited = try Config.parse(a, "default-profile = new\nprofile.two.title = Renamed\nprofile.two.command = new-command\nprofile.new.title = New");
+    var plan = try sm.prepareReload(&edited);
+    defer plan.deinit();
+    edited.deinit();
+    try std.testing.expectEqualStrings("old", live.profile.command.?);
+    plan.commit(&sm);
+    try std.testing.expectEqual(live, sm.active());
+    try std.testing.expectEqual(@as(usize, 0), sm.active_idx);
+    try std.testing.expectEqual(@as(usize, 1), sm.default_idx);
+    try std.testing.expectEqual(@as(u64, 42), live.surface_generation);
+    try std.testing.expectEqual(@as(?*anyopaque, @ptrFromInt(0x1000)), live.surface);
+    try std.testing.expectEqualStrings("Renamed", live.label());
+    try std.testing.expectEqualStrings("new-command", live.profile.command.?);
+    try std.testing.expectEqual(@as(?usize, null), sm.indexOf("one"));
+    try std.testing.expect(!sm.sessions.items[1].spawned);
+    try std.testing.expectEqual(@as(u64, 3), sm.sessions.items[1].id);
+}
+
+test "deleting a live profile retires it until exit and uses the configured fallback" {
+    const a = std.testing.allocator;
+    const entries = [_]Config.ProfileEntry{ .{ .name = "active" }, .{ .name = "exited" } };
+    var sm = try SessionManager.init(a, &.{ .profiles = .{ .entries = &entries } });
+    defer sm.deinit();
+    const live = sm.active();
+    live.spawned = true;
+    sm.sessions.items[1].spawned = true;
+    sm.sessions.items[1].exited = true;
+    var plan = try sm.prepareReload(&.{});
+    defer plan.deinit();
+    plan.commit(&sm);
+    try std.testing.expectEqual(@as(usize, 2), sm.count());
+    try std.testing.expectEqual(@as(?usize, null), sm.indexOf("exited"));
+    try std.testing.expectEqual(live, sm.active());
+    try std.testing.expect(live.retired);
+    sm.removeRetired(sm.active_idx);
+    try std.testing.expectEqual(@as(usize, 1), sm.count());
+    try std.testing.expectEqualStrings("default", sm.active().profile.name);
+    try std.testing.expect(!sm.active().spawned);
+}
+
+test "readding a retired profile preserves the child; an invalid edit rolls back" {
+    const a = std.testing.allocator;
+    const entries = [_]Config.ProfileEntry{.{ .name = "work", .title = "Work" }};
+    const cfg: Config = .{ .profiles = .{ .entries = &entries } };
+    var sm = try SessionManager.init(a, &cfg);
+    defer sm.deinit();
+    const work = sm.active();
+    work.spawned = true;
+    var removal = try sm.prepareReload(&.{});
+    defer removal.deinit();
+    removal.commit(&sm);
+    try std.testing.expect(work.retired);
+    const invalid = [_]Config.ProfileEntry{.{ .name = "work", .command = " " }};
+    try std.testing.expectError(error.EmptyLaunchValue, sm.prepareReload(&.{ .profiles = .{ .entries = &invalid } }));
+    try std.testing.expect(work.retired);
+    var restore = try sm.prepareReload(&cfg);
+    defer restore.deinit();
+    restore.commit(&sm);
+    try std.testing.expectEqual(work, sm.active());
+    try std.testing.expect(!work.retired);
+    try std.testing.expect(work.spawned);
+    try std.testing.expectEqual(@as(usize, 1), sm.count());
+}
+
+test "profile reload allocation failures keep the prior manager usable" {
+    const Test = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const initial = [_]Config.ProfileEntry{.{ .name = "live", .title = "Original" }};
+            const edited = [_]Config.ProfileEntry{.{ .name = "new", .title = "New" }};
+            var sm = try SessionManager.init(a, &.{ .profiles = .{ .entries = &initial } });
+            defer sm.deinit();
+            sm.active().spawned = true;
+            var plan = sm.prepareReload(&.{ .profiles = .{ .entries = &edited } }) catch |err| {
+                try std.testing.expectEqualStrings("Original", sm.active().label());
+                return err;
+            };
+            defer plan.deinit();
+            plan.commit(&sm);
+            try std.testing.expect(sm.active().retired);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Test.run, .{});
 }
 
 test "SessionManager: allocation failures clean up" {

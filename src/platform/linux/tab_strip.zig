@@ -16,9 +16,9 @@ extern "c" fn gtk_widget_set_vexpand(*GtkWidget, gtk.gboolean) void;
 extern "c" fn g_object_ref_sink(*anyopaque) *anyopaque;
 extern "c" fn gtk_style_context_remove_provider_for_display(*gtk.GdkDisplay, *anyopaque) void;
 
-pub const OnActivate = struct { ctx: *anyopaque, on_invoke: *const fn (*anyopaque, usize) bool };
+pub const OnActivate = struct { ctx: *anyopaque, on_invoke: *const fn (*anyopaque, u64) bool };
 /// Copy the dispatch value, never a pointer to the init-local TabStrip.
-const Slot = struct { activate: OnActivate, idx: usize };
+const Slot = struct { activate: OnActivate, id: u64 };
 
 pub const TabStrip = struct {
     allocator: std.mem.Allocator,
@@ -104,11 +104,11 @@ pub const TabStrip = struct {
         try self.label_bufs.ensureTotalCapacity(self.allocator, n);
         // Box callbacks separately: even moving/reallocating the lists does
         // not change any GTK user_data address.
-        for (self.sm.sessions.items, 0..) |*session, i| {
+        for (self.sm.sessions.items, 0..) |session, i| {
             const label = try self.allocator.dupeSentinel(u8, session.label(), 0);
             self.label_bufs.appendAssumeCapacity(label);
             const slot = try self.allocator.create(Slot);
-            slot.* = .{ .activate = self.on_activate, .idx = i };
+            slot.* = .{ .activate = self.on_activate, .id = session.id };
             self.slots.appendAssumeCapacity(slot);
             const button = gtk_button_new_with_label(label.ptr);
             self.buttons.appendAssumeCapacity(button);
@@ -123,7 +123,7 @@ pub const TabStrip = struct {
 };
 fn onClicked(_: *gtk.GObject, data: gtk.gpointer) callconv(.c) void {
     const slot: *Slot = @ptrCast(@alignCast(data orelse return));
-    _ = slot.activate.on_invoke(slot.activate.ctx, slot.idx);
+    _ = slot.activate.on_invoke(slot.activate.ctx, slot.id);
 }
 
 fn appendPrint(a: std.mem.Allocator, buf: *std.ArrayList(u8), comptime fmt: []const u8, args: anytype) !void {

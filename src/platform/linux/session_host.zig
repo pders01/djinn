@@ -23,11 +23,10 @@ pub const OnExitChanged = struct { ctx: *anyopaque, on_invoke: *const fn (*anyop
 pub const OnTitleChanged = struct { ctx: *anyopaque, on_invoke: *const fn (*anyopaque, usize) void };
 
 /// Every C callback uses a separately allocated incarnation, never &host or an
-/// ArrayList element. Membership is immutable; id + generation also guard the
-/// source against retired widgets and future lifecycle changes.
+/// ArrayList element. Resolve its stable id against the current ordering, and
+/// check the generation so replaced widgets cannot affect the new terminal.
 const Source = struct {
     sm: *SessionManager,
-    idx: usize,
     id: u64,
     generation: u64,
     forwarded: ?TerminalHandler,
@@ -37,19 +36,14 @@ const Source = struct {
     pending_title: [256]u8 = @splat(0),
     pending_title_len: ?usize = null,
 
-    fn current(self: *const Source) bool {
-        return sourceMatches(self.sm, self.idx, self.id, self.generation);
+    fn currentIndex(self: *const Source) ?usize {
+        const idx = self.sm.indexOfId(self.id) orelse return null;
+        return if (self.sm.sessions.items[idx].surface_generation == self.generation) idx else null;
     }
     fn handler(self: *Source) TerminalHandler {
-        return .{ .ctx = self, .extra = self.idx, .on_child_exited = childExited, .on_bell = bell, .on_title_changed = titleChanged };
+        return .{ .ctx = self, .on_child_exited = childExited, .on_bell = bell, .on_title_changed = titleChanged };
     }
 };
-
-fn sourceMatches(sm: *const SessionManager, idx: usize, id: u64, generation: u64) bool {
-    if (idx >= sm.count()) return false;
-    const s = sm.sessions.items[idx];
-    return s.id == id and s.surface_generation == generation;
-}
 
 /// A direct recovery shell is not an expression interpreted by $SHELL -lc.
 /// Keep it distinct from .profile, whose null command also means a shell.
@@ -191,13 +185,13 @@ pub const SessionHost = struct {
     }
 
     fn replace(self: *SessionHost, idx: usize, choice: LaunchChoice) !void {
-        const session = &self.sm.sessions.items[idx];
+        const session = self.sm.sessions.items[idx];
         // Shared validation currently checks cwd only. Retain it for EVERY
         // launch choice: recovery must never silently change explicit cwd.
         try session.validateLaunch();
         const source = try self.allocator.create(Source);
         errdefer self.allocator.destroy(source);
-        source.* = .{ .sm = self.sm, .idx = idx, .id = session.id, .generation = session.surface_generation +% 1, .forwarded = self.handler, .title_hook = self.title_hook };
+        source.* = .{ .sm = self.sm, .id = session.id, .generation = session.surface_generation +% 1, .forwarded = self.handler, .title_hook = self.title_hook };
         const fresh = try Terminal.open(self.allocator, self.theme_opts, source.handler(), self.spawnOptions(session.profile, choice));
         const entry = &self.entries.items[idx];
         // Everything fallible is done. Retire the old source before releasing
@@ -284,14 +278,15 @@ fn childExited(ctx: *anyopaque, _: usize) void {
         s.pending_exit = true;
         return;
     }
-    if (!s.current()) return;
-    s.sm.sessions.items[s.idx].exited = true;
-    if (s.forwarded) |h| h.on_child_exited(h.ctx, s.idx);
+    const idx = s.currentIndex() orelse return;
+    s.sm.sessions.items[idx].exited = true;
+    if (s.forwarded) |h| h.on_child_exited(h.ctx, idx);
 }
 fn bell(ctx: *anyopaque, _: usize) void {
     const s: *Source = @ptrCast(@alignCast(ctx));
-    if (!s.armed or !s.current()) return;
-    if (s.forwarded) |h| if (h.on_bell) |cb| cb(h.ctx, s.idx);
+    if (!s.armed) return;
+    const idx = s.currentIndex() orelse return;
+    if (s.forwarded) |h| if (h.on_bell) |cb| cb(h.ctx, idx);
 }
 fn titleChanged(ctx: *anyopaque, _: usize, title: []const u8) void {
     const s: *Source = @ptrCast(@alignCast(ctx));
@@ -299,10 +294,9 @@ fn titleChanged(ctx: *anyopaque, _: usize, title: []const u8) void {
         s.pending_title_len = copyTitle(&s.pending_title, title);
         return;
     }
-    if (!s.current()) return;
-    const session = &s.sm.sessions.items[s.idx];
+    const idx = s.currentIndex() orelse return;
+    const session = s.sm.sessions.items[idx];
     session.terminal_title_len = copyTitle(&session.terminal_title, title);
-    const idx = s.idx;
     const hook = s.title_hook;
     const forwarded = s.forwarded;
     if (hook) |h| h.on_invoke(h.ctx, idx);
@@ -429,19 +423,40 @@ test "SessionHost: type compiles" {
 test "source attribution rejects retired generation and wrong id" {
     var sm = try SessionManager.init(std.testing.allocator, &@import("../../config.zig").Config{});
     defer sm.deinit();
-    try std.testing.expect(sourceMatches(&sm, 0, 1, 0));
+    var source: Source = .{ .sm = &sm, .id = sm.active().id, .generation = 0, .forwarded = null, .title_hook = null };
+    try std.testing.expectEqual(@as(?usize, 0), source.currentIndex());
     sm.active().surface_generation = 2;
-    try std.testing.expect(!sourceMatches(&sm, 0, 1, 0));
-    try std.testing.expect(!sourceMatches(&sm, 0, 2, 2));
-    try std.testing.expect(!sourceMatches(&sm, 1, 1, 2));
-    try std.testing.expect(sourceMatches(&sm, 0, 1, 2));
+    try std.testing.expectEqual(@as(?usize, null), source.currentIndex());
+    source.generation = 2;
+    try std.testing.expectEqual(@as(?usize, 0), source.currentIndex());
+    source.id += 1;
+    try std.testing.expectEqual(@as(?usize, null), source.currentIndex());
 }
+test "profile reload routes VTE callbacks by id after tabs reorder" {
+    const Config = @import("../../config.zig").Config;
+    const entries = [_]Config.ProfileEntry{ .{ .name = "one" }, .{ .name = "two" } };
+    var sm = try SessionManager.init(std.testing.allocator, &.{ .profiles = .{ .entries = &entries } });
+    defer sm.deinit();
+    const source_session = sm.sessions.items[1];
+    var source: Source = .{ .sm = &sm, .id = source_session.id, .generation = 0, .forwarded = null, .title_hook = null, .armed = true };
+    const reordered = [_]Config.ProfileEntry{ entries[1], entries[0] };
+    var plan = try sm.prepareReload(&.{ .profiles = .{ .entries = &reordered } });
+    defer plan.deinit();
+    plan.commit(&sm);
+    titleChanged(&source, 0, "VTE title");
+    childExited(&source, 0);
+    try std.testing.expectEqual(@as(?usize, 0), source.currentIndex());
+    try std.testing.expect(source_session.exited);
+    try std.testing.expectEqualStrings("VTE title", source_session.label());
+    try std.testing.expect(!sm.active().exited);
+}
+
 test "callbacks update emitting inactive session and ignore retired sources" {
     const entries = [_]@import("../../config.zig").Config.ProfileEntry{ .{ .name = "one" }, .{ .name = "two" } };
     const cfg = @import("../../config.zig").Config{ .profiles = .{ .entries = &entries } };
     var sm = try SessionManager.init(std.testing.allocator, &cfg);
     defer sm.deinit();
-    var source = Source{ .sm = &sm, .idx = 1, .id = sm.sessions.items[1].id, .generation = 0, .forwarded = null, .title_hook = null };
+    var source = Source{ .sm = &sm, .id = sm.sessions.items[1].id, .generation = 0, .forwarded = null, .title_hook = null };
     childExited(&source, 0);
     try std.testing.expect(source.pending_exit);
     try std.testing.expect(!sm.sessions.items[1].exited);

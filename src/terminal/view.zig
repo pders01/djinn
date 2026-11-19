@@ -55,8 +55,8 @@ const ForwardedKeys = struct {
 
 var g_forwarded_keys: ForwardedKeys = .{};
 
-fn keySourceSurface(ticket: Ticket, sessions: []const Session) ?*anyopaque {
-    for (sessions) |*session| {
+fn keySourceSurface(ticket: Ticket, sessions: []const *Session) ?*anyopaque {
+    for (sessions) |session| {
         if (ticket.matches(session)) return session.surface;
     }
     return null;
@@ -108,14 +108,14 @@ test "key release resolves the live source not the active or replacement surface
     };
     const source: Ticket = .{ .session_id = 1, .generation = 3 };
     // Source need not be the selected session or the first array entry.
-    std.mem.swap(Session, &sessions[0], &sessions[1]);
-    try std.testing.expectEqual(first, keySourceSurface(source, &sessions).?);
-    sessions[1].surface = null;
-    try std.testing.expectEqual(@as(?*anyopaque, null), keySourceSurface(source, &sessions));
-    sessions[1].surface = first; // allocator may reuse the same address
-    sessions[1].surface_generation += 1;
-    try std.testing.expectEqual(@as(?*anyopaque, null), keySourceSurface(source, &sessions));
-    try std.testing.expectEqual(@as(?*anyopaque, null), keySourceSurface(source, sessions[0..1]));
+    const ordered = [_]*Session{ &sessions[1], &sessions[0] };
+    try std.testing.expectEqual(first, keySourceSurface(source, &ordered).?);
+    sessions[0].surface = null;
+    try std.testing.expectEqual(@as(?*anyopaque, null), keySourceSurface(source, &ordered));
+    sessions[0].surface = first; // allocator may reuse the same address
+    sessions[0].surface_generation += 1;
+    try std.testing.expectEqual(@as(?*anyopaque, null), keySourceSurface(source, &ordered));
+    try std.testing.expectEqual(@as(?*anyopaque, null), keySourceSurface(source, ordered[0..1]));
 }
 
 /// Explicit paste/drop input uses Ghostty's protected paste API. IME commits

@@ -24,10 +24,7 @@ pub const Ticket = struct {
 
 fn findSession(id: u64) ?*Session {
     const sm = app.g.session_manager orelse return null;
-    for (sm.sessions.items) |*session| {
-        if (session.id == id) return session;
-    }
-    return null;
+    return sm.sessions.items[sm.indexOfId(id) orelse return null];
 }
 
 fn refresh() void {
@@ -156,7 +153,7 @@ pub fn activateSession(idx: usize) bool {
     const previous = sm.active_idx;
     if (idx != previous) {
         // Spawn before switching so a failure leaves the old session usable.
-        const target = &sm.sessions.items[idx];
+        const target = sm.sessions.items[idx];
         if (target.surface == null) {
             const ga = app.g.ghostty.app orelse return false;
             const allocator = app.g.allocator orelse return false;
