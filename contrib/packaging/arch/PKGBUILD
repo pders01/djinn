@@ -9,7 +9,7 @@
 # sha256sum.
 _pkgname=djinn
 pkgname=djinn-git
-pkgver=0.1.0_alpha.2.r0.0000000
+pkgver=0.1.0_alpha.3.r0.0000000
 pkgrel=1
 pkgdesc="Quake-style drop-down terminal (GTK4/VTE, Wayland) — git/main"
 arch=('x86_64' 'aarch64')
