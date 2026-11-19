@@ -1,19 +1,9 @@
 #!/usr/bin/env bash
-# apply-ghostty-patch.sh — patches the checkout-local upstream ghostty source
-# in-place so `dep.artifact("ghostty")` resolves on darwin.
-#
-# WHY:
-#   ghostty's build.zig gates its `install*` calls for the full
-#   libghostty behind `if (!isDarwin)`. Zig's `dep.artifact()` lookup
-#   reads the install registry, so on macOS the artifact is invisible
-#   to djinn. The patch registers the shared renderer explicitly on
-#   Darwin without changing upstream's other installation behavior.
-#
-# IDEMPOTENCY:
-#   The script (a) locates the extracted ghostty dir from
-#   build.zig.zon's pinned hash, (b) checks for a sentinel string the
-#   patch introduces (`djinn local patch`), and (c) applies via
-#   `patch -p1` only when the sentinel is absent. Re-runs are no-ops.
+# apply-ghostty-patch.sh — patches Djinn's checkout-local Ghostty source.
+# One patch exposes the full libghostty artifact on Darwin. The other keeps
+# Vaxis's uucode binding private to each Ghostty compile step so the Debug
+# executable and ReleaseFast bundle can coexist in the same build graph.
+# Each patch has its own marker; existing extractions only get missing patches.
 #
 # WHEN TO RUN:
 #   - After the first `zig build --fetch` on a fresh checkout
@@ -22,7 +12,7 @@
 #     re-extracts pristine source; sentinel will be absent again)
 #
 # scripts/build.sh applies this before invoking the project build.
-# This patch revision targets Ghostty v1.4.0.
+# These patches target Ghostty v1.4.0.
 
 set -euo pipefail
 
@@ -34,14 +24,6 @@ case "${1:-$(uname -s)}" in
 esac
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-PATCH_FILE="$REPO_ROOT/patches/ghostty-001-darwin-install.patch"
-SENTINEL="djinn local patch"
-
-if [[ ! -f "$PATCH_FILE" ]]; then
-    echo "error: patch file missing at $PATCH_FILE" >&2
-    exit 1
-fi
-
 # Pull the ghostty hash out of build.zig.zon. Zig package cache dirs
 # embed the hash from .hash so `ghostty-<version>-<hash>` is the
 # unique key per pin.
@@ -63,11 +45,22 @@ if [[ ! -d "$PKG_DIR" ]]; then
     exit 1
 fi
 
-if grep -q "$SENTINEL" "$PKG_DIR/build.zig" 2>/dev/null; then
-    echo "patch already applied to $PKG_DIR — no-op"
-    exit 0
-fi
+apply_patch() {
+    local patch_name="$1" source="$2" marker="$3"
+    local patch_file="$REPO_ROOT/patches/$patch_name"
+    if [[ ! -f "$patch_file" ]]; then
+        echo "error: patch file missing at $patch_file" >&2
+        return 1
+    fi
+    if grep -Fq -- "$marker" "$PKG_DIR/$source"; then
+        echo "$patch_name already applied — no-op"
+        return
+    fi
+    echo "applying $patch_name to $PKG_DIR"
+    patch -p1 -d "$PKG_DIR" < "$patch_file"
+}
 
-echo "applying ghostty-001-darwin-install.patch to $PKG_DIR"
-patch -p1 -d "$PKG_DIR" < "$PATCH_FILE"
-echo "done"
+apply_patch ghostty-001-darwin-install.patch build.zig \
+    'djinn local patch: expose the full renderer artifact on Darwin.'
+apply_patch ghostty-002-isolate-vaxis-uucode.patch src/build/SharedDeps.zig \
+    "djinn local patch: don't mutate the cached Vaxis dependency."

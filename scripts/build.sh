@@ -4,7 +4,7 @@
 # integration prerequisites:
 #
 #   1. `zig build --fetch` to materialize ghostty in checkout-local zig-pkg/.
-#   2. Apply patches/ghostty-001-darwin-install.patch via
+#   2. Apply the checkout-local Ghostty patches via
 #      scripts/apply-ghostty-patch.sh (idempotent).
 #   3. Invoke `zig build` with the args we got, with environment
 #      tweaks that let xcrun find the system Metal Toolchain instead

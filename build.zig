@@ -45,15 +45,7 @@ pub fn build(b: *std.Build) void {
     // scripts/apply-ghostty-patch.sh. The Nix environment uses its pinned
     // SDK for Zig discovery but system Xcode for Metal tools. Build via:
     //   nix develop --command ./scripts/build.sh
-    const ghostty_dep = b.dependency("ghostty", .{
-        .target = target,
-        .optimize = optimize,
-        .@"app-runtime" = .none,
-        .@"emit-lib-vt" = false,
-        .@"emit-exe" = false,
-        .@"emit-xcframework" = false,
-        .@"emit-macos-app" = false,
-    });
+    const ghostty_dep = ghosttyDependency(b, target, optimize);
 
     const exe_mod = buildModule(b, .{
         .target = target,
@@ -113,19 +105,16 @@ pub fn build(b: *std.Build) void {
     // verifyIntegrity sweep on every page-grow, which dominates parse
     // time. Pinning the bundle to ReleaseFast keeps `zig build install-app`
     // honest regardless of the user's -Doptimize choice for the raw exe.
-    const ghostty_dep_release = b.dependency("ghostty", .{
-        .target = target,
-        .optimize = .ReleaseFast,
-        .@"app-runtime" = .none,
-        .@"emit-lib-vt" = false,
-        .@"emit-exe" = false,
-        .@"emit-xcframework" = false,
-        .@"emit-macos-app" = false,
-    });
+    // When both products are ReleaseFast, reuse the same Ghostty graph
+    // and compile the renderer only once.
+    const ghostty_dep_release = if (optimize == .fast)
+        ghostty_dep
+    else
+        ghosttyDependency(b, target, .fast);
 
     const bundle_exe_mod = buildModule(b, .{
         .target = target,
-        .optimize = .ReleaseFast,
+        .optimize = .fast,
         .objc_mod = objc_mod,
         .ghostty_dep = ghostty_dep_release,
         .link_ghostty_full = true,
@@ -250,6 +239,18 @@ pub fn build(b: *std.Build) void {
     exe_unit_tests.setLibCFile(darwin_libc);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&b.addRunArtifact(exe_unit_tests).step);
+}
+
+fn ghosttyDependency(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Dependency {
+    return b.dependency("ghostty", .{
+        .target = target,
+        .optimize = optimize,
+        .@"app-runtime" = .none,
+        .@"emit-lib-vt" = false,
+        .@"emit-exe" = false,
+        .@"emit-xcframework" = false,
+        .@"emit-macos-app" = false,
+    });
 }
 
 /// Linux's handwritten C externs need no headers. The check module deliberately

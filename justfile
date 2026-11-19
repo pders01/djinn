@@ -67,7 +67,7 @@ uninstall-arch:
     sudo rm -f /usr/local/lib/systemd/user/djinn.service
     @echo "djinn removed from /usr/local."
 
-# Apply patches/ghostty-001-darwin-install.patch (idempotent).
+# Apply checkout-local Ghostty patches (idempotent).
 patch:
     ./scripts/apply-ghostty-patch.sh
 

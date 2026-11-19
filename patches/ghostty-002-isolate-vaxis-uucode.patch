@@ -1,0 +1,22 @@
+--- a/src/build/SharedDeps.zig
++++ b/src/build/SharedDeps.zig
+@@ -517,7 +517,17 @@
+         .external_uucode = true,
+     })) |dep| {
+-        const vaxis = dep.module("vaxis");
+-        step.root_module.addImport("vaxis", vaxis);
++        // djinn local patch: don't mutate the cached Vaxis dependency.
++        // Separate Ghostty build configurations can share this template
++        // but must bind Vaxis to their own uucode module.
++        const template = dep.module("vaxis");
++        const vaxis = b.createModule(.{
++            .root_source_file = template.root_source_file,
++            .target = template.resolved_target,
++            .optimize = template.optimize,
++        });
++        for (template.import_table.keys(), template.import_table.values()) |name, module|
++            vaxis.addImport(name, module);
+         vaxis.addImport("uucode", self.uucode_mod);
++        step.root_module.addImport("vaxis", vaxis);
+     }
+     if (b.lazyDependency("wuffs", .{
