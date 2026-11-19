@@ -28,6 +28,7 @@ extern "c" fn gtk_popover_set_has_arrow(*GtkPopover, gtk.gboolean) void;
 extern "c" fn gtk_popover_set_autohide(*GtkPopover, gtk.gboolean) void;
 extern "c" fn gtk_popover_set_pointing_to(*GtkPopover, ?*const Rectangle) void;
 extern "c" fn gtk_popover_popup(*GtkPopover) void;
+extern "c" fn gtk_popover_popdown(*GtkPopover) void;
 extern "c" fn gtk_widget_set_parent(*GtkWidget, *GtkWidget) void;
 extern "c" fn gtk_widget_unparent(*GtkWidget) void;
 extern "c" fn gtk_widget_grab_focus(*GtkWidget) gtk.gboolean;
@@ -58,7 +59,7 @@ fn canInsert(current: []const u8, inserted: []const u8) bool {
 /// or install. Disconnect all callbacks before releasing widgets or this box.
 const State = struct {
     allocator: std.mem.Allocator,
-    terminal: *VteTerminal,
+    terminal: ?*VteTerminal,
     popover: *GtkWidget,
     anchor: *GtkWidget,
     entry: *GtkWidget,
@@ -75,6 +76,7 @@ const State = struct {
     next_id: c_ulong = 0,
 
     fn refresh(self: *State) bool {
+        const terminal = self.terminal orelse return false;
         const text = std.mem.span(gtk_editable_get_text(self.editable));
         if (std.mem.eql(u8, text, self.needle[0..self.needle_len])) return false;
         self.needle_len = 0;
@@ -82,7 +84,7 @@ const State = struct {
             @memcpy(self.needle[0..text.len], text);
             self.needle_len = text.len;
         }
-        vte_terminal_search_set_regex(self.terminal, null, 0);
+        vte_terminal_search_set_regex(terminal, null, 0);
         if (self.regex) |r| _ = vte_regex_unref(r);
         self.regex = null;
         if (text.len == 0 or !validNeedle(text)) return true;
@@ -90,7 +92,7 @@ const State = struct {
         // CASELESS | MULTILINE, VTE's regex engine handles Unicode.
         self.regex = vte_regex_new_for_search(text.ptr, @intCast(text.len), 0x00000008 | 0x00000400, &err);
         if (err) |e| g_error_free(e);
-        vte_terminal_search_set_regex(self.terminal, self.regex, 0);
+        vte_terminal_search_set_regex(terminal, self.regex, 0);
         return true;
     }
 };
@@ -130,16 +132,23 @@ pub const FindOverlay = struct {
         s.prev_id = gtk.g_signal_connect_data(@ptrCast(s.prev), "clicked", @ptrCast(&onPrev), s, null, 0);
         s.next_id = gtk.g_signal_connect_data(@ptrCast(s.next), "clicked", @ptrCast(&onNext), s, null, 0);
     }
-    pub fn setTarget(self: *FindOverlay, widget: *GtkWidget) void {
+    pub fn setTarget(self: *FindOverlay, widget: ?*GtkWidget) void {
         const s = self.state;
-        const terminal: *VteTerminal = @ptrCast(widget);
-        if (terminal == s.terminal) return;
-        _ = g_object_ref(@ptrCast(terminal));
-        vte_terminal_search_set_regex(s.terminal, null, 0);
-        gtk.g_object_unref(@ptrCast(s.terminal));
-        s.terminal = terminal;
-        vte_terminal_search_set_wrap_around(terminal, 1);
-        vte_terminal_search_set_regex(terminal, s.regex, 0);
+        const target: ?*VteTerminal = @ptrCast(widget);
+        const previous = s.terminal;
+        if (target == previous) return;
+        if (target) |terminal| _ = g_object_ref(@ptrCast(terminal));
+        s.terminal = target;
+        if (previous) |old| {
+            vte_terminal_search_set_regex(old, null, 0);
+            gtk.g_object_unref(@ptrCast(old));
+        }
+        if (target) |terminal| {
+            vte_terminal_search_set_wrap_around(terminal, 1);
+            vte_terminal_search_set_regex(terminal, s.regex, 0);
+        } else {
+            gtk_popover_popdown(@ptrCast(s.popover));
+        }
     }
     pub fn deinit(self: *FindOverlay) void {
         const s = self.state;
@@ -148,15 +157,18 @@ pub const FindOverlay = struct {
         if (s.activate_id != 0) gtk.g_signal_handler_disconnect(@ptrCast(s.entry), s.activate_id);
         if (s.prev_id != 0) gtk.g_signal_handler_disconnect(@ptrCast(s.prev), s.prev_id);
         if (s.next_id != 0) gtk.g_signal_handler_disconnect(@ptrCast(s.next), s.next_id);
-        vte_terminal_search_set_regex(s.terminal, null, 0);
+        if (s.terminal) |terminal| {
+            vte_terminal_search_set_regex(terminal, null, 0);
+            gtk.g_object_unref(@ptrCast(terminal));
+        }
         if (s.regex) |r| _ = vte_regex_unref(r);
-        gtk.g_object_unref(@ptrCast(s.terminal));
         gtk_widget_unparent(s.popover);
         gtk.g_object_unref(@ptrCast(s.popover));
         s.allocator.destroy(s);
     }
     pub fn open(self: *FindOverlay) void {
         const s = self.state;
+        if (s.terminal == null) return;
         const rect = Rectangle{ .x = @divTrunc(@max(gtk_widget_get_width(s.anchor), 0), 2), .y = 12, .width = 1, .height = 1 };
         gtk_popover_set_pointing_to(@ptrCast(s.popover), &rect);
         gtk_popover_popup(@ptrCast(s.popover));
@@ -167,19 +179,16 @@ pub const FindOverlay = struct {
     }
     pub fn findNext(self: *FindOverlay) void {
         // Flush GtkSearchEntry's debounce before acting on the current query.
-        const s = self.state;
-        _ = s.refresh();
-        if (s.regex != null) _ = vte_terminal_search_find_next(s.terminal);
+        find(self.state, .next);
     }
     pub fn findPrevious(self: *FindOverlay) void {
-        const s = self.state;
-        _ = s.refresh();
-        if (s.regex != null) _ = vte_terminal_search_find_previous(s.terminal);
+        find(self.state, .previous);
     }
 };
 fn onSearchChanged(_: *gtk.GObject, data: gtk.gpointer) callconv(.c) void {
     const s: *State = @ptrCast(@alignCast(data orelse return));
-    if (s.refresh() and s.regex != null) _ = vte_terminal_search_find_next(s.terminal);
+    const terminal = s.terminal orelse return;
+    if (s.refresh() and s.regex != null) _ = vte_terminal_search_find_next(terminal);
 }
 fn onInsertText(editable: *GtkEditable, bytes: [*]const u8, length: c_int, _: *c_int, data: gtk.gpointer) callconv(.c) void {
     const s: *State = @ptrCast(@alignCast(data orelse return));
@@ -189,14 +198,20 @@ fn onInsertText(editable: *GtkEditable, bytes: [*]const u8, length: c_int, _: *c
         g_signal_stop_emission_by_name(@ptrCast(editable), "insert-text");
 }
 fn onNext(_: *gtk.GObject, data: gtk.gpointer) callconv(.c) void {
-    const s: *State = @ptrCast(@alignCast(data orelse return));
-    _ = s.refresh();
-    if (s.regex != null) _ = vte_terminal_search_find_next(s.terminal);
+    find(@ptrCast(@alignCast(data orelse return)), .next);
 }
 fn onPrev(_: *gtk.GObject, data: gtk.gpointer) callconv(.c) void {
-    const s: *State = @ptrCast(@alignCast(data orelse return));
+    find(@ptrCast(@alignCast(data orelse return)), .previous);
+}
+
+fn find(s: *State, direction: enum { next, previous }) void {
+    const terminal = s.terminal orelse return;
     _ = s.refresh();
-    if (s.regex != null) _ = vte_terminal_search_find_previous(s.terminal);
+    if (s.regex == null) return;
+    _ = switch (direction) {
+        .next => vte_terminal_search_find_next(terminal),
+        .previous => vte_terminal_search_find_previous(terminal),
+    };
 }
 
 test "FindOverlay struct compiles" {

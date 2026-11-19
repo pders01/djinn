@@ -60,12 +60,22 @@ const Dispatch = struct {
     fn onCommand(ctx: *anyopaque, command: platform.IpcCommand) void {
         const self: *Dispatch = @ptrCast(@alignCast(ctx));
         switch (command) {
-            .toggle => self.panel.toggle(),
-            .show => self.panel.show(),
+            .toggle => if (self.panel.isVisible()) self.panel.hide() else self.showPanel(),
+            .show => self.showPanel(),
             .hide => self.panel.hide(),
             .quit => self.panel.quit(),
         }
     }
+
+    fn showPanel(self: *Dispatch) void {
+        self.panel.show();
+        if (self.session_host) |host| {
+            // A transient failure after profile retirement leaves the selected
+            // profile without a VTE widget; retry without requiring a config edit.
+            if (host.currentVte() == null) host.syncProfileSelection();
+        }
+    }
+
     fn onHotkey(ctx: *anyopaque) void {
         onCommand(ctx, .toggle);
     }

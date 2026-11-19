@@ -617,20 +617,12 @@ pub const Panel = struct {
         gdk_clipboard_set_text(clipboard, text.ptr);
     }
 
-    /// One-call Quake-drop toggle. Whatever state the panel is in,
-    /// flip it. Cheap; safe to call from any GLib main-loop context
-    /// (signal callbacks, GIO source dispatches, idle handlers).
     pub fn isActive(self: *Panel) bool {
-        return gtk_widget_get_visible(@ptrCast(self.window)) != 0 and gtk_window_is_active(self.window) != 0;
+        return self.isVisible() and gtk_window_is_active(self.window) != 0;
     }
 
-    pub fn toggle(self: *Panel) void {
-        const widget: *GtkWidget = @ptrCast(self.window);
-        if (gtk_widget_get_visible(widget) != 0) {
-            self.hide();
-        } else {
-            self.show();
-        }
+    pub fn isVisible(self: *Panel) bool {
+        return gtk_widget_get_visible(@ptrCast(self.window)) != 0;
     }
 
     pub fn deinit(self: *Panel) void {

@@ -10,11 +10,17 @@ const ThemeOptions = terminal.ThemeOptions;
 const FindOverlay = @import("find_overlay.zig").FindOverlay;
 const GtkWidget = gtk.GtkWidget;
 const GtkStack = opaque {};
+const GtkLabel = opaque {};
 extern "c" fn gtk_stack_new() *GtkWidget;
 extern "c" fn gtk_stack_add_named(*GtkStack, *GtkWidget, [*:0]const u8) *anyopaque;
 extern "c" fn gtk_stack_set_visible_child_name(*GtkStack, [*:0]const u8) void;
 extern "c" fn gtk_stack_set_transition_duration(*GtkStack, c_uint) void;
 extern "c" fn gtk_stack_remove(*GtkStack, *GtkWidget) void;
+extern "c" fn gtk_label_new(?[*:0]const u8) *GtkWidget;
+extern "c" fn gtk_label_set_text(*GtkLabel, [*:0]const u8) void;
+extern "c" fn gtk_label_set_wrap(*GtkLabel, gtk.gboolean) void;
+extern "c" fn gtk_label_set_wrap_mode(*GtkLabel, c_int) void;
+extern "c" fn gtk_label_set_max_width_chars(*GtkLabel, c_int) void;
 extern "c" fn gtk_widget_grab_focus(*GtkWidget) gtk.gboolean;
 extern "c" fn g_object_ref_sink(*anyopaque) *anyopaque;
 
@@ -74,10 +80,19 @@ const Entry = struct {
     }
 };
 
+const launch_error_page = "djinn-launch-error";
+
+fn launchErrorMessage(buf: []u8, name: []const u8, err: anyerror) [:0]const u8 {
+    const profile = if (std.unicode.utf8ValidateSlice(name) and std.mem.indexOfScalar(u8, name, 0) == null) name else "(selected profile)";
+    return std.fmt.bufPrintSentinel(buf, "Could not start profile '{s}' ({s}).\nCheck its launch settings, then reopen Djinn to retry.", .{ profile, @errorName(err) }, 0) catch
+        "Could not start the selected terminal. Reopen Djinn to retry.";
+}
+
 pub const SessionHost = struct {
     allocator: std.mem.Allocator,
     sm: *SessionManager,
     stack: *GtkWidget,
+    launch_error_label: *GtkLabel,
     entries: ProfileEntries = .empty,
     theme_opts: ThemeOptions,
     scrollback_lines: ?u32 = null,
@@ -92,7 +107,21 @@ pub const SessionHost = struct {
         const stack = gtk_stack_new();
         _ = g_object_ref_sink(@ptrCast(stack));
         gtk_stack_set_transition_duration(@ptrCast(stack), 0);
-        var host = SessionHost{ .allocator = a, .sm = sm, .stack = stack, .theme_opts = opts, .handler = handler, .bell_audible_default = audible };
+        const label = gtk_label_new(null);
+        const error_label: *GtkLabel = @ptrCast(label);
+        gtk_label_set_wrap(error_label, 1);
+        gtk_label_set_wrap_mode(error_label, 2); // PANGO_WRAP_WORD_CHAR
+        gtk_label_set_max_width_chars(error_label, 48);
+        _ = gtk_stack_add_named(@ptrCast(stack), label, launch_error_page);
+        var host = SessionHost{
+            .allocator = a,
+            .sm = sm,
+            .stack = stack,
+            .launch_error_label = error_label,
+            .theme_opts = opts,
+            .handler = handler,
+            .bell_audible_default = audible,
+        };
         errdefer host.deinit();
         try host.entries.resize(a, sm.count());
         for (host.entries.items, sm.sessions.items) |*e, s| e.* = .forSession(s.id);
@@ -155,17 +184,24 @@ pub const SessionHost = struct {
     pub fn syncProfileSelection(self: *SessionHost) void {
         const idx = self.sm.active_idx;
         if (self.entries.items[idx].terminal == null) self.spawnInto(idx) catch |err| {
-            gtk.gtk_widget_set_visible(self.stack, 0);
-            std.debug.print("session_host: launch '{s}' failed: {}\n", .{ self.sm.active().profile.name, err });
+            self.showLaunchError(err);
             return;
         };
         self.revealCurrent();
         if (self.on_switch) |h| h.on_invoke(h.ctx, idx);
     }
 
+    fn showLaunchError(self: *SessionHost, err: anyerror) void {
+        const name = self.sm.active().profile.name;
+        std.debug.print("session_host: launch '{s}' failed: {}\n", .{ name, err });
+        if (self.find_overlay) |fo| fo.setTarget(null);
+        var buffer: [1024]u8 = undefined;
+        gtk_label_set_text(self.launch_error_label, launchErrorMessage(&buffer, name, err).ptr);
+        gtk_stack_set_visible_child_name(@ptrCast(self.stack), launch_error_page);
+    }
+
     fn revealCurrent(self: *SessionHost) void {
         gtk_stack_set_visible_child_name(@ptrCast(self.stack), &self.entries.items[self.sm.active_idx].name);
-        gtk.gtk_widget_set_visible(self.stack, 1);
         if (self.currentVte()) |w| {
             if (self.find_overlay) |fo| fo.setTarget(w);
             _ = gtk_widget_grab_focus(w);
@@ -193,7 +229,11 @@ pub const SessionHost = struct {
             return false;
         }
         if (self.entries.items[idx].terminal == null) self.spawnInto(idx) catch |err| {
-            std.debug.print("session_host: launch '{s}' failed: {}\n", .{ self.sm.sessions.items[idx].profile.name, err });
+            if (idx == self.sm.active_idx) {
+                self.showLaunchError(err);
+            } else {
+                std.debug.print("session_host: launch '{s}' failed: {}\n", .{ self.sm.sessions.items[idx].profile.name, err });
+            }
             return false;
         };
         _ = self.sm.switchTo(idx);
@@ -410,6 +450,7 @@ test "latest scrollback policy reaches lazy restart and recovery spawn options" 
         .allocator = std.testing.allocator,
         .sm = undefined,
         .stack = undefined,
+        .launch_error_label = undefined,
         .theme_opts = .{},
         .handler = null,
         .bell_audible_default = true,
@@ -443,7 +484,7 @@ test "appearance replacement covers active inactive and future session options" 
     for ([_]usize{ 0, 2 }, &records) |idx, *record| {
         entries[idx].terminal = .{ .widget = @ptrCast(record), .allocator = std.testing.allocator, .launch = undefined, .default_scrollback_lines = 512 };
     }
-    var host = SessionHost{ .allocator = std.testing.allocator, .sm = undefined, .stack = undefined, .theme_opts = .{}, .handler = null, .bell_audible_default = true };
+    var host = SessionHost{ .allocator = std.testing.allocator, .sm = undefined, .stack = undefined, .launch_error_label = undefined, .theme_opts = .{}, .handler = null, .bell_audible_default = true };
     host.entries.items = &entries;
     host.entries.capacity = entries.len;
     var full = ThemeOptions{
@@ -467,6 +508,17 @@ test "appearance replacement covers active inactive and future session options" 
         try std.testing.expect(entries[1].terminal == null);
     }
     for (records) |record| try std.testing.expectEqual(@as(usize, 3), record.calls);
+}
+
+test "profile launch failure explains how to retry even if the name is unusable" {
+    var buffer: [256]u8 = undefined;
+    const message = launchErrorMessage(&buffer, "remote", error.FileNotFound);
+    try std.testing.expect(std.mem.indexOf(u8, message, "'remote' (FileNotFound)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, message, "reopen Djinn to retry") != null);
+    const invalid = launchErrorMessage(&buffer, "bad\xffname", error.NotDir);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(invalid));
+    var short: [4]u8 = undefined;
+    try std.testing.expectEqualStrings("Could not start the selected terminal. Reopen Djinn to retry.", launchErrorMessage(&short, "remote", error.NotDir));
 }
 
 test "SessionHost: type compiles" {

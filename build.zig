@@ -302,12 +302,13 @@ fn buildSharedTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: s
             .link_libc = true,
         }),
         .filters = &.{
-            "scrollback",      "placement",         "font and cursor",
-            "removed colors",  "CSS replacement",   "appearance replacement",
-            "autostart",       "desktopPath",       "stripDeletedAnnotation",
-            "Status.label",    "owned image",       "file list",
-            "formatPayload",   "percentDecode",     "drops reject",
-            "tray login view", "buildThemeOptions", "routes VTE callbacks",
+            "scrollback",             "placement",         "font and cursor",
+            "removed colors",         "CSS replacement",   "appearance replacement",
+            "autostart",              "desktopPath",       "stripDeletedAnnotation",
+            "Status.label",           "owned image",       "file list",
+            "formatPayload",          "percentDecode",     "drops reject",
+            "tray login view",        "buildThemeOptions", "routes VTE callbacks",
+            "profile launch failure",
         },
     });
     if (target.result.os.tag == .macos) models.setLibCFile(buildDarwinLibC(b, target));

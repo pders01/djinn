@@ -22,7 +22,7 @@
 //!      backend may request user confirmation. Remembered approval and
 //!      app-identity matching are backend policy, not guaranteed by Djinn.
 //!   5. Activated fires on every trigger from then on; we forward it to
-//!      the caller's handler, which currently maps it to `panel.toggle()`.
+//!      the caller's handler, which toggles the panel.
 //!
 //! The IPC bridge (`ipc.zig`) is still useful as a scripted toggle and
 //! as a fallback when the portal is unavailable, so we don't remove it.

@@ -404,6 +404,8 @@ and any running terminals whenever possible.
 
 Invalid launch edits leave the previous configuration and sessions in place.
 An unchanged launch path that becomes unavailable does not block other edits.
+If a fallback session cannot start on Linux, restore its working directory or
+fix the config, then reopen the panel to retry.
 Closing a configured session does not rewrite the config or delete the profile.
 Saved geometry owns exact profile names and
 coalesces each profile independently. Persistence uses 300 ms **periodic
