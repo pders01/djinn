@@ -218,9 +218,12 @@ jobs:
           restore-keys: |
             zig-${{ runner.os }}-${{ runner.arch }}-
 
-      - name: Build signed Djinn.app (ad-hoc, no keychain lookup)
+      - name: Link Debug and ReleaseFast executables and sign Djinn.app (ad-hoc)
+        # Exercise the mixed Debug executable / ReleaseFast bundle graph,
+        # then verify the standalone ReleaseFast path used by `just release`.
         run: |
-          nix develop --command ./scripts/build.sh bundle
+          nix develop --command ./scripts/build.sh install bundle
+          nix develop --command ./scripts/build.sh -Doptimize=ReleaseFast
           codesign --force --sign - zig-out/Djinn.app/Contents/MacOS/libghostty.dylib
           codesign --force --sign - zig-out/Djinn.app
 
