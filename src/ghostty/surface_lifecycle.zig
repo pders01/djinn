@@ -1,10 +1,12 @@
-//! Static-session surface ownership. All entry points run on the main thread.
+//! Session surface ownership. All entry points run on the main thread.
 const std = @import("std");
 const objc = @import("objc");
 const app = @import("../app.zig");
 const runtime = @import("runtime.zig");
 const Session = @import("../session/manager.zig").Session;
 const tab_strip = @import("../session/tab_strip.zig");
+const layout = @import("../window/layout.zig");
+const SessionManager = @import("../session/manager.zig").SessionManager;
 const c_dispatch = @import("darwin-c");
 extern "c" fn dispatch_async_f(queue: ?*anyopaque, ctx: ?*anyopaque, work: *const fn (?*anyopaque) callconv(.c) void) void;
 const NSRect = extern struct {
@@ -16,6 +18,7 @@ const NSRect = extern struct {
 pub const Ticket = struct {
     session_id: u64,
     generation: u64,
+    retired_only: bool = false,
 
     pub fn matches(self: Ticket, session: *const Session) bool {
         return self.session_id == session.id and self.generation == session.surface_generation;
@@ -53,9 +56,16 @@ fn reportLaunchFailure(session: *const Session, err: anyerror) void {
     defer text.msgSend(void, "release", .{});
     const alert = NSAlert.msgSend(objc.Object, "alloc", .{}).msgSend(objc.Object, "init", .{});
     if (alert.value == null) return;
-    defer alert.msgSend(void, "release", .{});
     alert.msgSend(void, "setMessageText:", .{text});
-    _ = alert.msgSend(c_long, "runModal", .{});
+    // Present after the launch attempt returns. A modal run loop can deliver
+    // config events, so it must not run while callers borrow session state.
+    dispatch_async_f(@ptrCast(c_dispatch.dispatch_get_main_queue()), @ptrCast(alert.value), &showLaunchAlert);
+}
+
+fn showLaunchAlert(raw: ?*anyopaque) callconv(.c) void {
+    const alert = objc.Object.fromId(raw orelse return);
+    defer alert.msgSend(void, "release", .{});
+    if (app.g.session_manager != null) _ = alert.msgSend(c_long, "runModal", .{});
 }
 
 /// Session-owned C strings remain valid through surface destruction.
@@ -128,11 +138,57 @@ pub fn destroySession(session: *Session) void {
     session.cwd_z = null;
 }
 
+fn detachProfile(session: *Session) void {
+    destroySession(session);
+    if (session.surface_host) |id| {
+        session.surface_host = null;
+        const host = objc.Object.fromId(id);
+        if (app.g.layout.surface_host_id) |active_host| {
+            if (active_host == host.value) app.g.layout.surface_host_id = null;
+        }
+        host.msgSend(void, "removeFromSuperview", .{});
+    }
+}
+
+pub fn applyProfileReload(plan: *SessionManager.Reload) void {
+    const sm = app.g.session_manager orelse return;
+    const active_id = sm.active().id;
+    for (sm.sessions.items) |s| if (plan.preview.indexOfId(s.id) == null) detachProfile(s);
+    plan.commit(sm);
+    syncProfileLayout(active_id != sm.active().id);
+}
+
+fn syncProfileLayout(selection_changed: bool) void {
+    const sm = app.g.session_manager orelse return;
+    const current = sm.active();
+    for (sm.sessions.items) |s| layout.attachSurfaceHost(s);
+    layout.syncProfileTabs();
+    if (selection_changed) {
+        app.g.ghostty.surface = current.surface;
+        app.g.layout.surface_host_id = @ptrCast(@alignCast(current.surface_host));
+        if (app.g.window.panel) |panel| {
+            if (panel.visible and activateSession(sm.active_idx)) return;
+        }
+    }
+    @import("../terminal/view.zig").syncResize();
+    refresh();
+}
+
+fn removeRetired(sm: *SessionManager, session: *Session) void {
+    const idx = sm.indexOfId(session.id) orelse return;
+    const was_active = sm.active_idx == idx;
+    detachProfile(session);
+    sm.removeRetired(idx);
+    syncProfileLayout(was_active);
+}
+
 /// Called on show as well as selection: a closed profile is still selectable.
 pub fn ensureActiveSession() bool {
     const sm = app.g.session_manager orelse return false;
     const session = sm.active();
     if (session.surface == null) {
+        if (session.retired) return false;
+        layout.attachSurfaceHost(session);
         const ga = app.g.ghostty.app orelse return false;
         const allocator = app.g.allocator orelse return false;
         const host = objc.Object.fromId(session.surface_host orelse return false);
@@ -155,6 +211,8 @@ pub fn activateSession(idx: usize) bool {
         // Spawn before switching so a failure leaves the old session usable.
         const target = sm.sessions.items[idx];
         if (target.surface == null) {
+            if (target.retired) return false;
+            layout.attachSurfaceHost(target);
             const ga = app.g.ghostty.app orelse return false;
             const allocator = app.g.allocator orelse return false;
             const host = objc.Object.fromId(target.surface_host orelse return false);
@@ -187,7 +245,9 @@ pub fn activateSession(idx: usize) bool {
 
 pub fn closeActiveSession() void {
     const sm = app.g.session_manager orelse return;
-    destroySession(sm.active());
+    const session = sm.active();
+    if (session.retired) return removeRetired(sm, session);
+    destroySession(session);
     if (app.g.window.panel) |p| p.hide();
     refresh();
 }
@@ -195,8 +255,9 @@ pub fn closeActiveSession() void {
 pub fn restartActiveSession(_: ?[]const u8) void {
     const sm = app.g.session_manager orelse return;
     const allocator = app.g.allocator orelse return;
-    const context = allocator.create(Ticket) catch return;
     const session = sm.active();
+    if (session.retired) return;
+    const context = allocator.create(Ticket) catch return;
     destroySession(session);
     context.* = .{ .session_id = session.id, .generation = session.surface_generation };
     dispatch_async_f(@ptrCast(c_dispatch.dispatch_get_main_queue()), context, &restartCallback);
@@ -207,7 +268,7 @@ fn restartCallback(raw: ?*anyopaque) callconv(.c) void {
     const allocator = app.g.allocator orelse return;
     defer allocator.destroy(ticket);
     const session = findSession(ticket.session_id) orelse return;
-    if (!ticket.matches(session) or session.surface != null) return;
+    if (!ticket.matches(session) or session.surface != null or session.retired) return;
     const ga = app.g.ghostty.app orelse return;
     const host = objc.Object.fromId(session.surface_host orelse return);
     _ = bindGhosttySurface(allocator, ga, host, session) orelse return;
@@ -219,8 +280,9 @@ fn restartCallback(raw: ?*anyopaque) callconv(.c) void {
 /// Close callbacks are deferred to avoid freeing a surface inside its callback.
 pub fn closeRequested(ticket: Ticket) void {
     const session = findSession(ticket.session_id) orelse return;
-    if (!ticket.matches(session)) return;
+    if (!ticket.matches(session) or (ticket.retired_only and !session.retired)) return;
     const sm = app.g.session_manager orelse return;
+    if (session.retired) return removeRetired(sm, session);
     const is_active = sm.active().id == session.id;
     destroySession(session);
     if (is_active) {

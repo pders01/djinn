@@ -750,6 +750,7 @@ const c_dispatch = c;
 fn handleChildExited(host: *HostContext, _: c.ghostty_app_t, target: c.ghostty_target_s, _: c.ghostty_action_s) bool {
     const session = sessionFromTarget(host, target) orelse return false;
     session.exited = true;
+    if (session.retired) queueSurfaceClose(session, true);
     @import("../session/tab_strip.zig").refresh();
     // We did not show a native exit dialog. Let Ghostty paint its exit/error
     // message, and request close according to its command policy. The close
@@ -1143,10 +1144,14 @@ fn writeClipboardImpl(
 
 fn closeSurfaceStub(userdata: ?*anyopaque, _: bool) callconv(.c) void {
     const session = sessionFromUserdata(userdata) orelse return;
+    queueSurfaceClose(session, false);
+}
+
+fn queueSurfaceClose(session: *const Session, retired_only: bool) void {
     const lifecycle = @import("surface_lifecycle.zig");
     const allocator = host_storage.app_state.allocator orelse return;
     const ticket = allocator.create(lifecycle.Ticket) catch return;
-    ticket.* = .{ .session_id = session.id, .generation = session.surface_generation };
+    ticket.* = .{ .session_id = session.id, .generation = session.surface_generation, .retired_only = retired_only };
     dispatch_async_f(@ptrCast(c_dispatch.dispatch_get_main_queue()), ticket, &closeSessionMain);
 }
 

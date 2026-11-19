@@ -417,7 +417,7 @@ const default_config_skeleton =
     \\# Absent leaves OS login state alone; uncomment for enforced policy.
     \\# open-at-login = false
     \\
-    \\# Optional static profiles; changes require an app restart.
+    \\# Optional profiles; launch edits apply to the next session start.
     \\# Launch precedence: script > command > default shell.
     \\# Explicit invalid launch settings are errors, not shell fallbacks.
     \\# default-profile = work

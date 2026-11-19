@@ -1,4 +1,4 @@
-//! Optional fixed-profile tabs. No session creation, mutation or agent state.
+//! Optional profile tabs. No config writeback.
 const std = @import("std");
 const gtk = @import("gtk.zig");
 const SessionManager = @import("../../session/manager.zig").SessionManager;
@@ -8,6 +8,9 @@ const GtkBox = opaque {};
 const GtkButton = opaque {};
 extern "c" fn gtk_box_new(c_int, c_int) *GtkWidget;
 extern "c" fn gtk_box_append(*GtkBox, *GtkWidget) void;
+extern "c" fn gtk_box_prepend(*GtkBox, *GtkWidget) void;
+extern "c" fn gtk_box_remove(*GtkBox, *GtkWidget) void;
+extern "c" fn gtk_widget_get_parent(*GtkWidget) ?*GtkWidget;
 extern "c" fn gtk_button_new_with_label([*:0]const u8) *GtkWidget;
 extern "c" fn gtk_button_set_label(*GtkButton, [*:0]const u8) void;
 extern "c" fn gtk_widget_add_css_class(*GtkWidget, [*:0]const u8) void;
@@ -59,6 +62,28 @@ pub const TabStrip = struct {
         gtk.g_object_unref(@ptrCast(self.provider));
         gtk.g_object_unref(@ptrCast(self.container));
     }
+    /// Replace the buttons without disturbing the sibling stack or its focus.
+    pub fn replaceWith(self: *TabStrip, fresh: TabStrip) void {
+        const sm = self.sm;
+        const parent: *GtkBox = @ptrCast(gtk_widget_get_parent(self.container) orelse unreachable);
+        gtk_box_prepend(parent, fresh.container);
+        gtk_box_remove(parent, self.container);
+        self.deinit();
+        self.* = fresh;
+        self.sm = sm;
+    }
+
+    pub fn removeAt(self: *TabStrip, idx: usize) void {
+        const button = self.buttons.orderedRemove(idx);
+        const id = self.clicked_ids.orderedRemove(idx);
+        if (id != 0) gtk.g_signal_handler_disconnect(@ptrCast(button), id);
+        self.allocator.destroy(self.slots.orderedRemove(idx));
+        self.allocator.free(self.label_bufs.orderedRemove(idx));
+        gtk_box_remove(@ptrCast(self.container), button);
+        gtk.gtk_widget_set_visible(self.container, @intFromBool(self.sm.count() > 1));
+        self.markActive(self.sm.active_idx);
+    }
+
     pub fn widget(self: *TabStrip) *GtkWidget {
         return self.container;
     }

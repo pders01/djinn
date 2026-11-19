@@ -1,5 +1,4 @@
-//! Linux terminal-first GTK4/VTE shell. Membership is fixed until restart;
-//! config reload changes appearance/window/hotkey policy, never launch state.
+//! Linux terminal-first GTK4/VTE shell with live config reload.
 const std = @import("std");
 const io = @import("io/platform.zig");
 const Config = @import("config.zig").Config;
@@ -23,6 +22,7 @@ const Dispatch = struct {
     hotkey: ?*?platform.Hotkey = null,
     tray: ?*?platform.Tray = null,
     pending_reload: ?struct { config: Config, hotkey: platform.Hotkey } = null,
+    reap_source: c_uint = 0,
 
     fn discardPending(self: *Dispatch) void {
         if (self.pending_reload) |*pending| {
@@ -35,7 +35,7 @@ const Dispatch = struct {
 
     fn onRegistration(ctx: *anyopaque, attempt: u64, outcome: platform.hotkey.Outcome) void {
         const self: *Dispatch = @ptrCast(@alignCast(ctx));
-        const pending = self.pending_reload orelse return;
+        var pending = self.pending_reload orelse return;
         if (!registrationMatches(pending.hotkey.attemptId(), attempt)) return;
         if (outcome == .failed) {
             std.debug.print("config: hotkey attempt {d} failed; retaining previous config\n", .{attempt});
@@ -47,9 +47,14 @@ const Dispatch = struct {
             return;
         };
         self.pending_reload = null;
+        self.commitConfig(pending.config) catch |err| {
+            std.debug.print("config: profile reload rejected ({}); retaining previous config and binding\n", .{err});
+            pending.hotkey.deinit();
+            pending.config.deinit();
+            return;
+        };
         if (slot.*) |*old| old.deinit();
         slot.* = pending.hotkey;
-        self.commitConfig(pending.config);
     }
 
     fn onCommand(ctx: *anyopaque, command: platform.IpcCommand) void {
@@ -110,12 +115,33 @@ const Dispatch = struct {
     fn onChildExited(ctx: *anyopaque, idx: usize) void {
         const self: *Dispatch = @ptrCast(@alignCast(ctx));
         const host = self.session_host orelse return;
-        // Source generation/identity is checked by SessionHost. Route using
-        // the emitting session, never the currently selected terminal.
+        // Defer terminal destruction until after the VTE callback returns.
+        if (self.session_manager.sessions.items[idx].retired) {
+            if (self.reap_source == 0) self.reap_source = gtk.g_idle_add(reapRetired, self);
+            return;
+        }
+        // Route using the emitting session, never the selected terminal.
         if (host.terminalAt(idx)) |term|
             term.feedScreen("\r\n\x1b[2m[djinn] Process exited. Ctrl+Alt+R restarts; Ctrl+Shift+R opens a shell.\x1b[0m\r\n");
         host.markExited(idx, true);
     }
+    fn reapRetired(ctx: ?*anyopaque) callconv(.c) c_int {
+        const self: *Dispatch = @ptrCast(@alignCast(ctx orelse return 0));
+        self.reap_source = 0;
+        const host = self.session_host orelse return 0;
+        var selection_changed = false;
+        var idx = self.session_manager.count();
+        while (idx > 0) {
+            idx -= 1;
+            const s = self.session_manager.sessions.items[idx];
+            if (!s.retired or !s.exited) continue;
+            if (host.removeRetired(idx)) selection_changed = true;
+            if (self.tab_strip) |strip| strip.removeAt(idx);
+        }
+        if (selection_changed) host.syncProfileSelection();
+        return 0;
+    }
+
     fn onExitChanged(ctx: *anyopaque, idx: usize, exited: bool) void {
         const self: *Dispatch = @ptrCast(@alignCast(ctx));
         if (self.tab_strip) |strip| strip.markExited(idx, exited);
@@ -177,16 +203,32 @@ const Dispatch = struct {
             std.debug.print("config: awaiting hotkey attempt {d}; previous binding/config remain active\n", .{fresh.attemptId()});
             return;
         }
-        self.commitConfig(candidate);
+        self.commitConfig(candidate) catch |err| {
+            std.debug.print("config: profile reload rejected ({}); retaining previous config\n", .{err});
+            candidate.deinit();
+        };
     }
 
-    fn commitConfig(self: *Dispatch, candidate: Config) void {
+    fn applyProfiles(self: *Dispatch, host: *platform.SessionHost, candidate: *const Config) !void {
+        const strip = self.tab_strip orelse unreachable;
+        var plan = try self.session_manager.prepareReload(candidate);
+        defer plan.deinit();
+        var entries = try host.prepareProfileEntries(&plan.preview);
+        errdefer entries.deinit(self.allocator);
+        const fresh = try platform.TabStrip.init(self.allocator, &plan.preview, strip.on_activate, strip.theme_opts);
+        host.applyProfileReload(&plan, entries);
+        strip.replaceWith(fresh);
+    }
+
+    fn commitConfig(self: *Dispatch, candidate: Config) !void {
         const host = self.session_host orelse unreachable;
         var old = self.config.*;
+        const active_id = self.session_manager.active().id;
+        if (profilesChanged(&old, &candidate)) try self.applyProfiles(host, &candidate);
         const colors = loadColors(self.allocator, &candidate);
         const opts = buildThemeOptions(&candidate, colors);
         // Every cached borrowed theme string is moved onto candidate storage
-        // before releasing old arenas. Sessions own immutable launch copies.
+        // before releasing old arenas. Sessions own their launch data.
         host.applyTheme(opts);
         host.applyScrollback(candidate.scrollback.size);
         if (self.tab_strip) |strip| strip.applyTheme(opts);
@@ -197,8 +239,6 @@ const Dispatch = struct {
         self.panel.setHideOnBlur(candidate.window.hide_on_blur);
         self.panel.setTopmost(candidate.window.topmost);
         syncAutostart(self.allocator, candidate.system.open_at_login);
-        if (profilesChanged(&old, &candidate))
-            std.debug.print("config: profile membership/launch changes require restart; existing sessions retained\n", .{});
         if (keymapChanged(&old, &candidate))
             std.debug.print("config: keymap changes require restart\n", .{});
         self.panel.setPosition(candidate.window.position, candidate.window.position_x, candidate.window.position_y);
@@ -214,6 +254,7 @@ const Dispatch = struct {
         if (self.ghostty_colors.*) |*previous| previous.deinit(self.allocator);
         self.ghostty_colors.* = colors;
         old.deinit();
+        if (active_id != self.session_manager.active().id or host.currentVte() == null) host.syncProfileSelection();
         if (self.tray) |slot| if (slot.*) |*tray| {
             tray.notifyAppearanceChanged();
             tray.notifyMenuChanged();
@@ -374,6 +415,7 @@ pub fn main(init: std.process.Init) !void {
     host.setTitleChangedHandler(.{ .ctx = &dispatch, .on_invoke = Dispatch.onTitleChanged });
     // De-register forwarded UI callbacks before stripping widgets down.
     defer {
+        if (dispatch.reap_source != 0) _ = gtk.g_source_remove(dispatch.reap_source);
         host.on_switch = null;
         host.on_exit_changed = null;
         host.setTitleChangedHandler(null);

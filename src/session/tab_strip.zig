@@ -1,6 +1,6 @@
 //! Tab strip for multi-profile sessions.
 //!
-//! Thin row of static profile labels anchored above the terminal.
+//! Thin row of profile tabs anchored above the terminal.
 //! Reads the session manager for labels + active index, paints
 //! each tab inline (no per-tab NSView), routes mouseDown to
 //! `activateSession(idx)`. Hidden / not added when sessions.len < 2.
@@ -53,6 +53,7 @@ pub fn create(width: f64, container_h: f64) objc.Object {
     sep.msgSend(void, "setAutoresizingMask:", .{@as(c_ulong, 1 << 1)});
     app.g.layout.tab_strip_separator_id = sep.value;
     view.msgSend(void, "addSubview:", .{sep});
+    sep.msgSend(void, "release", .{});
 
     return view;
 }

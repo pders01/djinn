@@ -73,7 +73,7 @@ fn onPanelResize(w: u32, h: u32) void {
     persist.saveDebounced(allocator, w, h, active_name);
 }
 
-// Parsed Config owns its arena. Sessions independently own immutable launch data.
+// Parsed Config owns its arena. Sessions separately own launch data.
 var last_djinn_mtime: ?i128 = null;
 var last_ghostty_mtime: ?i128 = null;
 
@@ -86,6 +86,17 @@ fn onConfigChanged() void {
         hostWarn("config reload failed; keeping previous settings", .{});
         return;
     };
+
+    const sm = app.g.session_manager orelse {
+        new_cfg.deinit();
+        return;
+    };
+    var profile_reload: ?@import("session/manager.zig").SessionManager.Reload = if (profilesEqual(cfg_ptr.*, new_cfg)) null else sm.prepareReload(&new_cfg) catch |err| {
+        hostWarn("profile reload rejected ({}); keeping previous settings", .{err});
+        new_cfg.deinit();
+        return;
+    };
+    defer if (profile_reload) |*plan| plan.deinit();
 
     const keybinding = app.g.hotkey_override orelse new_cfg.hotkey.toggle;
     const kb = parseKeybinding(keybinding) catch {
@@ -122,10 +133,8 @@ fn onConfigChanged() void {
     syncLoginPolicy(new_cfg.system.open_at_login);
     if (!std.meta.eql(old.scrollback, new_cfg.scrollback))
         hostWarn("config: scrollback-size applies to new/lazy/restarted sessions; existing history limits are unchanged", .{});
-    if (!profilesEqual(old, new_cfg))
-        hostWarn("config: profile launch definitions changed; restart Djinn to apply (running sessions unchanged)", .{});
-
     cfg_ptr.* = new_cfg;
+    if (profile_reload) |*plan| surface_lifecycle.applyProfileReload(plan);
     view_mod.resetBindings();
     applyKeymapOverrides(cfg_ptr);
     view_mod.reloadTheme();
@@ -517,6 +526,8 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // The container retains its Metal hosts.
+    for (session_manager.sessions.items) |s| objc.Object.fromId(s.surface_host.?).msgSend(void, "release", .{});
     panel.setContentView(container);
     // makeFirstResponder(container) inside setContentView fails silently
     // because plain NSView returns NO from acceptsFirstResponder. Push

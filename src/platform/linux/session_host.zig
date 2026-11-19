@@ -1,4 +1,4 @@
-//! Fixed-membership, lazy GTK4/VTE session stack. No profile writeback.
+//! Lazy GTK4/VTE session stack. No profile writeback.
 const std = @import("std");
 const gtk = @import("gtk.zig");
 const manager = @import("../../session/manager.zig");
@@ -66,13 +66,19 @@ const Entry = struct {
     name: [40:0]u8 = @splat(0),
     terminal: ?Terminal = null,
     source: ?*Source = null,
+
+    fn forSession(id: u64) Entry {
+        var entry: Entry = .{};
+        _ = std.fmt.bufPrint(&entry.name, "session-{d}\x00", .{id}) catch unreachable;
+        return entry;
+    }
 };
 
 pub const SessionHost = struct {
     allocator: std.mem.Allocator,
     sm: *SessionManager,
     stack: *GtkWidget,
-    entries: std.ArrayList(Entry) = .empty,
+    entries: ProfileEntries = .empty,
     theme_opts: ThemeOptions,
     scrollback_lines: ?u32 = null,
     handler: ?TerminalHandler,
@@ -89,10 +95,7 @@ pub const SessionHost = struct {
         var host = SessionHost{ .allocator = a, .sm = sm, .stack = stack, .theme_opts = opts, .handler = handler, .bell_audible_default = audible };
         errdefer host.deinit();
         try host.entries.resize(a, sm.count());
-        for (host.entries.items) |*e| e.* = .{};
-        for (host.entries.items, sm.sessions.items) |*e, s| {
-            _ = try std.fmt.bufPrint(&e.name, "session-{d}\x00", .{s.id});
-        }
+        for (host.entries.items, sm.sessions.items) |*e, s| e.* = .forSession(s.id);
         try host.spawnInto(sm.active_idx);
         gtk_stack_set_visible_child_name(@ptrCast(stack), &host.entries.items[sm.active_idx].name);
         return host;
@@ -101,18 +104,72 @@ pub const SessionHost = struct {
     /// Run before SessionManager and the panel are destroyed. The owned stack
     /// ref and Terminal refs keep disconnect targets valid throughout teardown.
     pub fn deinit(self: *SessionHost) void {
-        for (self.entries.items, 0..) |*e, idx| {
-            if (e.terminal) |*t| {
-                t.detachExitHandler();
-                self.sm.sessions.items[idx].surface_generation +%= 1;
-                gtk_stack_remove(@ptrCast(self.stack), t.widget);
-                t.deinit();
-                self.sm.sessions.items[idx].spawned = false;
-            }
-            if (e.source) |s| self.allocator.destroy(s);
-        }
+        for (self.entries.items, 0..) |*entry, idx| self.detachEntry(entry, self.sm.sessions.items[idx]);
         self.entries.deinit(self.allocator);
         gtk.g_object_unref(@ptrCast(self.stack));
+    }
+
+    fn detachEntry(self: *SessionHost, entry: *Entry, session: *manager.Session) void {
+        if (entry.terminal) |*t| {
+            t.detachExitHandler();
+            session.surface_generation +%= 1;
+            gtk_stack_remove(@ptrCast(self.stack), t.widget);
+            t.deinit();
+            session.spawned = false;
+        }
+        if (entry.source) |s| self.allocator.destroy(s);
+    }
+
+    // Staging only owns the array; entries referring to live VTE widgets are
+    // borrowed until commit and must not be torn down on rollback.
+    pub const ProfileEntries = std.ArrayList(Entry);
+
+    pub fn prepareProfileEntries(self: *const SessionHost, preview: *const SessionManager) !ProfileEntries {
+        var entries: ProfileEntries = .empty;
+        try entries.resize(self.allocator, preview.count());
+        for (entries.items, preview.sessions.items) |*entry, s| {
+            entry.* = if (self.sm.indexOfId(s.id)) |idx| self.entries.items[idx] else .forSession(s.id);
+        }
+        return entries;
+    }
+
+    pub fn applyProfileReload(self: *SessionHost, plan: *SessionManager.Reload, entries: ProfileEntries) void {
+        for (self.sm.sessions.items, self.entries.items) |s, *entry| {
+            if (plan.preview.indexOfId(s.id) == null) self.detachEntry(entry, s);
+        }
+        plan.commit(self.sm);
+        self.entries.deinit(self.allocator);
+        self.entries = entries;
+    }
+
+    pub fn removeRetired(self: *SessionHost, idx: usize) bool {
+        const was_active = self.sm.active_idx == idx;
+        self.detachEntry(&self.entries.items[idx], self.sm.sessions.items[idx]);
+        _ = self.entries.orderedRemove(idx);
+        self.sm.removeRetired(idx);
+        return was_active;
+    }
+
+    /// Called after the UI has committed its tabs. Do not focus a different
+    /// native child if launching the selected fallback fails.
+    pub fn syncProfileSelection(self: *SessionHost) void {
+        const idx = self.sm.active_idx;
+        if (self.entries.items[idx].terminal == null) self.spawnInto(idx) catch |err| {
+            gtk.gtk_widget_set_visible(self.stack, 0);
+            std.debug.print("session_host: launch '{s}' failed: {}\n", .{ self.sm.active().profile.name, err });
+            return;
+        };
+        self.revealCurrent();
+        if (self.on_switch) |h| h.on_invoke(h.ctx, idx);
+    }
+
+    fn revealCurrent(self: *SessionHost) void {
+        gtk_stack_set_visible_child_name(@ptrCast(self.stack), &self.entries.items[self.sm.active_idx].name);
+        gtk.gtk_widget_set_visible(self.stack, 1);
+        if (self.currentVte()) |w| {
+            if (self.find_overlay) |fo| fo.setTarget(w);
+            _ = gtk_widget_grab_focus(w);
+        }
     }
     pub fn widget(self: *SessionHost) *GtkWidget {
         return self.stack;
@@ -131,7 +188,7 @@ pub const SessionHost = struct {
 
     pub fn activate(self: *SessionHost, idx: usize) bool {
         if (idx >= self.entries.items.len) return false;
-        if (idx == self.sm.active_idx) {
+        if (idx == self.sm.active_idx and self.currentVte() != null) {
             if (self.currentVte()) |w| _ = gtk_widget_grab_focus(w);
             return false;
         }
@@ -140,11 +197,7 @@ pub const SessionHost = struct {
             return false;
         };
         _ = self.sm.switchTo(idx);
-        gtk_stack_set_visible_child_name(@ptrCast(self.stack), &self.entries.items[idx].name);
-        if (self.currentVte()) |w| {
-            if (self.find_overlay) |fo| fo.setTarget(w);
-            _ = gtk_widget_grab_focus(w);
-        }
+        self.revealCurrent();
         if (self.on_switch) |h| h.on_invoke(h.ctx, idx);
         return true;
     }
@@ -170,13 +223,12 @@ pub const SessionHost = struct {
 
     fn restartWithChoice(self: *SessionHost, choice: LaunchChoice) bool {
         const idx = self.sm.active_idx;
-        if (self.terminalAt(idx) == null) return false;
+        if (self.sm.active().retired) return false;
         self.replace(idx, choice) catch |err| {
             std.debug.print("session_host: restart '{s}' failed: {}\n", .{ self.sm.sessions.items[idx].profile.name, err });
             return false;
         };
-        gtk_stack_set_visible_child_name(@ptrCast(self.stack), &self.entries.items[idx].name);
-        if (self.currentVte()) |w| _ = gtk_widget_grab_focus(w);
+        self.revealCurrent();
         return true;
     }
 
@@ -186,6 +238,7 @@ pub const SessionHost = struct {
 
     fn replace(self: *SessionHost, idx: usize, choice: LaunchChoice) !void {
         const session = self.sm.sessions.items[idx];
+        std.debug.assert(!session.retired);
         // Shared validation currently checks cwd only. Retain it for EVERY
         // launch choice: recovery must never silently change explicit cwd.
         try session.validateLaunch();

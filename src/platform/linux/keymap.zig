@@ -260,7 +260,7 @@ const settings_skeleton =
     \\open-at-login = false
     \\# profile.work.command = ssh example.org
     \\# profile.work.cwd = ~/projects
-    \\# Profile membership and launch definitions require a restart.
+    \\# Profiles reload on save; launch edits apply to the next session start.
     \\
 ;
 

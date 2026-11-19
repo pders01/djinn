@@ -117,7 +117,7 @@ pub const AppState = struct {
 
     pub const Layout = struct {
         /// Outer container NSView holding terminal, surface hosts, and
-        /// the optional static profile tab strip. Set by buildContainer.
+        /// the optional profile tab strip. Set when at least two tabs exist.
         container_id: ?objc.c.id = null,
         /// Sibling NSView of `view_id` reserved for ghostty's surface.
         /// ghostty owns this view's CAMetalLayer once a surface is
