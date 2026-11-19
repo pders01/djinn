@@ -134,10 +134,12 @@ fn onConfigChanged() void {
     if (!std.meta.eql(old.scrollback, new_cfg.scrollback))
         hostWarn("config: scrollback-size applies to new/lazy/restarted sessions; existing history limits are unchanged", .{});
     cfg_ptr.* = new_cfg;
-    if (profile_reload) |*plan| surface_lifecycle.applyProfileReload(plan);
     view_mod.resetBindings();
     applyKeymapOverrides(cfg_ptr);
+    // Rebuild Ghostty launch-time settings (e.g. scrollback caps) before
+    // reconciliation can create a newly selected fallback surface.
     view_mod.reloadTheme();
+    if (profile_reload) |*plan| surface_lifecycle.applyProfileReload(plan);
 }
 
 fn profilesEqual(a: Config, b: Config) bool {
