@@ -7,7 +7,7 @@ terminal-first contract. macOS embeds Ghostty; Linux does not emulate the
 Ghostty surface API or require its renderer at runtime.
 
 Keep native window/focus handling, portal/compositor shortcuts, ordinary shell
-sessions, optional fixed lazy profiles, find, clipboard/IME/drag-drop, themes,
+sessions, optional lazy profiles, find, clipboard/IME/drag-drop, themes,
 terminal notifications, tray settings, appearance, config watching, and optional
 autostart. No agent state, MCP/HTTP service, log pane, palette, cheatsheet, or
 profile-editing/writeback UI. The local control socket only carries native
@@ -89,8 +89,8 @@ approval. See the [root implementation record](../../../TODO.md#correctnessrelea
       quoting, including executable paths containing spaces/apostrophes.
 - [ ] Explicit invalid/missing cwd fails visibly, including lazy starts and
       restarts after a directory disappears. No inherited-directory fallback.
-- [ ] Static profile launch data remains valid after config replacement;
-      membership edits require restart and never rewrite configuration.
+- [ ] Profile reload updates labels and membership without replacing live VTE
+      widgets. Removed running tabs disappear on exit; no config writeback.
 - [ ] Stable callback source identity/generation across tab changes, child
       exits, failed async spawn, restart, and teardown; no callbacks into freed
       or moved handler contexts.

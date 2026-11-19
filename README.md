@@ -5,7 +5,7 @@ A global shortcut shows or hides a native panel. macOS embeds **Ghostty**;
 Linux uses **GTK4/VTE**, with Wayland layer-shell where the compositor
 supports it. The terminal engines own the PTY, rendering, scrollback,
 selection, and text input. Djinn adds panel/focus handling, find, optional
-static session tabs, settings, and a small menubar/tray menu.
+config-defined session tabs, settings, and a small menubar/tray menu.
 
 Run any CLI in the terminal. djinn has **no MCP server, agent adapters,
 plugin service, or agent-status model**. There is no log UI, command
@@ -351,7 +351,7 @@ config reloads. The existing `parseKeybinding` grammar and CG/NSEvent
 modifier bits are unchanged; only native registration converts modifiers
 to Carbon's representation.
 
-### Optional static profiles
+### Optional profiles
 
 Each configured profile represents one terminal session. Without any,
 djinn synthesizes a `default` shell session. Profiles do not select an
@@ -388,11 +388,21 @@ exec my-tool --interactive
 
 The pinned embedding API interprets `command` as a shell command (not a
 structured argv vector). Script paths are validated and shell-quoted as
-literal executable paths. Keep complex invocation details in scripts. Profile definitions
-are static: **restart djinn after profile changes**. Restarting a session
-reuses the loaded profile; it does not reload profile definitions.
-Closing a session does not rewrite the config or delete the profile; the
-next show starts a fresh child. Saved geometry owns exact profile names and
+literal executable paths. Keep complex invocation details in scripts.
+
+Djinn reloads profiles when you save the config. It keeps the selected tab
+and any running terminals whenever possible.
+
+| Profile change | Takes effect |
+|---|---|
+| Titles, additions, and tab order | On save. A new terminal starts when selected. |
+| Remove a profile | Idle or already-exited tabs disappear on save. A running tab stays until its process exits or, on macOS, you close the session. |
+| Script, command, or working directory | On the next start of that session, including an explicit session restart. |
+| `default-profile` | On the next app launch, or when the current tab disappears. Saving alone does not switch tabs. |
+
+Invalid launch edits leave the previous configuration and sessions in place.
+Closing a configured session does not rewrite the config or delete the profile.
+Saved geometry owns exact profile names and
 coalesces each profile independently. Persistence uses 300 ms **periodic
 coalescing**, not trailing-edge debounce: continuous resizing can checkpoint
 repeatedly, rather than promising one write per drag. Normal shutdown drains
@@ -542,9 +552,10 @@ live on macOS; Linux reports that keymap edits require restart. The global
   hyperlink opening, scrollback, find, font changes, and session switching.
 - Sleep/wake with active and hidden sessions; check rendering, input, and
   focus after waking and after screen changes.
-- Test no-profile startup, static script/command profiles, explicit launch
-  errors, restart/close behavior, and profile changes taking effect only
-  after app restart. Confirm config is not rewritten.
+- Test no-profile startup, script/command profiles, and explicit launch errors.
+  Edit titles, add/reorder/remove tabs while children run, and verify that
+  removed running tabs disappear only on exit/close. Verify that new launch
+  settings apply on session restart and that config is not rewritten.
 - Send terminal notifications from focused, background, and hidden sessions; verify suppression,
   per-session rate boundaries, text truncation, macOS Focus, and BEL settings.
 - Check settings creation/open, theme changes while hidden, login-item

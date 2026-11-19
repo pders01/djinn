@@ -6,15 +6,15 @@ Terminal-first native drop-down terminal for macOS and Linux: Ghostty/AppKit
 on Apple Silicon macOS (arm64 only; Intel support retired), GTK4/VTE with
 Wayland layer-shell on Linux. Retain native
 hotkey/focus/window handling, find, clipboard/drag-drop, IME, themes,
-static session tabs, terminal notifications, settings, and platform packaging.
+config-defined session tabs, terminal notifications, settings, and platform packaging.
 No profiles are required: an ordinary default shell is the baseline.
 
 No MCP/HTTP service, adapters, plugin service, agent state/client policy,
 log UI, command palette, cheatsheet, or profile writeback. These are removed
-scope, not deferred features. Optional static profiles and executable user
-scripts use `script > command > default shell`. Explicit invalid launch
-settings are errors. Membership changes require an app restart; session
-restart/close never writes configuration.
+scope, not deferred features. Optional profiles and executable user scripts
+use `script > command > default shell`. Explicit invalid launch settings are
+errors. Profile reloads keep running children; session restart/close never
+writes configuration.
 
 See [README.md](README.md) for configuration, migration, and signing.
 Old user endpoint/token files are left untouched; cleanup is manual.
@@ -400,8 +400,9 @@ are not installed-app or native-interaction acceptance.
       lazy/restarted cwd disappearance, quoted paths, and visible launch errors.
 - [ ] Tab/index/cycle selection, Unicode labels, initial static Ghostty titles,
       retained exited-command output, and source-attributed close/restart.
-- [ ] Profile edits report restart-required; loaded sessions survive config
-      replacement and membership changes apply only after app restart.
+- [ ] Hot profile edits preserve live children and active identity. Verify tab
+      add/reorder/retitle, retirement on exit/close, next-launch settings, and
+      rollback on an invalid config on both native hosts.
 - [ ] Repeated menubar disable/enable, theme changes while hidden, light/dark
       overrides, standalone theme defaults, and Ghostty config inheritance.
 - [ ] Terminal notifications and independent source rate limits, macOS Focus,
