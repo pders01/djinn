@@ -6,4 +6,4 @@
 /// Pre-1.0 follows semver pre-release tags: `0.1.0-alpha.N` while the
 /// surface migration cools, then `0.1.0-beta.N` once the design
 /// language stops moving.
-pub const string = "0.1.0-alpha.3";
+pub const string = "0.1.0-alpha.4";

@@ -3,7 +3,7 @@ const std = @import("std");
 /// Mirrors `src/version.zig` — kept here so the Info.plist template can
 /// interpolate at build time without `@import`. Bump together when
 /// cutting a release.
-const djinn_version = "0.1.0-alpha.3";
+const djinn_version = "0.1.0-alpha.4";
 
 pub fn build(b: *std.Build) void {
     // Follow the host on Linux; only macOS gets the deployment floor.

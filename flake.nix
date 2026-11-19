@@ -95,7 +95,7 @@
         packages = lib.optionalAttrs isLinux {
           default = pkgs.stdenv.mkDerivation {
             pname = "djinn";
-            version = "0.1.0-alpha.3";
+            version = "0.1.0-alpha.4";
             src = ./.;
             nativeBuildInputs = [ zig pkgs.pkg-config pkgs.wrapGAppsHook4 ];
             buildInputs = linuxDeps ++ [ pkgs.gsettings-desktop-schemas ];
