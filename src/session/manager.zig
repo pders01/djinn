@@ -9,6 +9,10 @@ pub const Profile = struct {
     /// ordinary default shell; it is not an empty or hardcoded command.
     command: ?[]const u8 = null,
     cwd: ?[]const u8 = null,
+    // Original settings identify unchanged paths even when the resolved
+    // directory or script is temporarily inaccessible during config reload.
+    script_setting: ?[]const u8 = null,
+    cwd_setting: ?[]const u8 = null,
     title: ?[]const u8 = null,
     /// null = inherit the current global bell setting.
     bell_audible: ?bool = null,
@@ -73,17 +77,34 @@ pub const SessionManager = struct {
     active_idx: usize = 0,
     default_idx: usize = 0,
     next_id: u64 = 1,
+    /// Relative scripts use the original startup directory, even after the
+    /// macOS host changes its own cwd to give new shells a home directory.
+    script_base: []const u8 = "",
 
     /// No configured profiles means one lazy, ordinary shell. Every retained
     /// config string is copied so Config.deinit/reload cannot dangle it.
     pub fn init(allocator: std.mem.Allocator, cfg: *const Config) !SessionManager {
-        var mgr = SessionManager{ .allocator = allocator };
+        var path_buf: [std.Io.Dir.max_path_bytes]u8 = undefined;
+        const len = std.process.currentPath(platform.io(), &path_buf) catch |err| switch (err) {
+            // A deleted startup directory only prevents relative scripts.
+            error.CurrentDirUnlinked => 0,
+            else => return err,
+        };
+        return initProfiles(allocator, cfg, path_buf[0..len], null);
+    }
+
+    fn initProfiles(allocator: std.mem.Allocator, cfg: *const Config, script_base: []const u8, previous: ?*const SessionManager) !SessionManager {
+        var mgr: SessionManager = .{
+            .allocator = allocator,
+            .script_base = try allocator.dupe(u8, script_base),
+            .next_id = if (previous) |old| old.next_id else 1,
+        };
         errdefer mgr.deinit();
 
         if (cfg.profiles.entries.len == 0) {
-            try mgr.appendProfile(.{ .name = "default" }, true);
+            try mgr.appendProfile(.{ .name = "default" }, true, previous);
         } else {
-            for (cfg.profiles.entries) |entry| try mgr.appendProfile(entry, false);
+            for (cfg.profiles.entries) |entry| try mgr.appendProfile(entry, false, previous);
         }
 
         if (cfg.profiles.default) |name| {
@@ -97,13 +118,27 @@ pub const SessionManager = struct {
         return mgr;
     }
 
-    fn appendProfile(self: *SessionManager, entry: Config.ProfileEntry, synthetic: bool) !void {
+    fn findProfile(self: *const SessionManager, name: []const u8, synthetic: bool) ?*const Session {
+        for (self.sessions.items) |session| {
+            if (session.synthetic == synthetic and std.mem.eql(u8, session.profile.name, name)) return session;
+        }
+        return null;
+    }
+
+    fn appendProfile(self: *SessionManager, entry: Config.ProfileEntry, synthetic: bool, previous: ?*const SessionManager) !void {
+        const old = if (previous) |sm| sm.findProfile(entry.name, synthetic) else null;
         const session = try self.allocator.create(Session);
         session.* = .{ .id = self.next_id, .profile = undefined, .synthetic = synthetic };
+        if (old) |s| {
+            session.id = s.id;
+            session.terminal_title = s.terminal_title;
+            session.terminal_title_len = s.terminal_title_len;
+            session.exited = s.exited;
+        }
         errdefer self.destroy(session);
-        session.profile = try resolveEntry(self.allocator, &entry, &session.owned_strings);
+        session.profile = try resolveEntry(self.allocator, &entry, self.script_base, if (old) |s| &s.profile else null, &session.owned_strings);
         try self.sessions.append(self.allocator, session);
-        self.next_id += 1;
+        if (old == null) self.next_id += 1;
     }
 
     fn destroy(self: *const SessionManager, session: *Session) void {
@@ -115,6 +150,7 @@ pub const SessionManager = struct {
     pub fn deinit(self: *SessionManager) void {
         for (self.sessions.items) |session| self.destroy(session);
         self.sessions.deinit(self.allocator);
+        self.allocator.free(self.script_base);
     }
 
     pub fn active(self: *const SessionManager) *Session {
@@ -138,24 +174,9 @@ pub const SessionManager = struct {
     /// Stage a profile reload without moving any live Session or touching a
     /// running child. Hosts can prepare their native UI before committing.
     pub fn prepareReload(self: *const SessionManager, cfg: *const Config) !Reload {
-        var plan = Reload{ .preview = try init(self.allocator, cfg) };
+        var plan = Reload{ .preview = try initProfiles(self.allocator, cfg, self.script_base, self) };
         plan.configured_count = plan.preview.count();
         errdefer plan.deinit();
-        plan.preview.next_id = self.next_id;
-        for (plan.preview.sessions.items) |fresh| {
-            for (self.sessions.items) |old| {
-                if (old.synthetic == fresh.synthetic and std.mem.eql(u8, old.profile.name, fresh.profile.name)) {
-                    fresh.id = old.id;
-                    fresh.terminal_title = old.terminal_title;
-                    fresh.terminal_title_len = old.terminal_title_len;
-                    fresh.exited = old.exited;
-                    break;
-                }
-            } else {
-                fresh.id = plan.preview.next_id;
-                plan.preview.next_id += 1;
-            }
-        }
         for (self.sessions.items) |old| {
             if (old.spawned and !old.exited and plan.preview.indexOfId(old.id) == null)
                 try plan.preview.sessions.append(self.allocator, old);
@@ -195,8 +216,10 @@ pub const SessionManager = struct {
                 if (self.preview.indexOfId(old.id) == null) manager.destroy(old);
             }
             manager.sessions.deinit(manager.allocator);
+            manager.allocator.free(manager.script_base);
             manager.* = self.preview;
             self.preview.sessions = .empty;
+            self.preview.script_base = "";
             self.configured_count = 0;
         }
     };
@@ -252,23 +275,37 @@ fn ownOptional(allocator: std.mem.Allocator, owned: *std.ArrayList([]u8), value:
     return if (value) |s| try own(allocator, owned, s) else null;
 }
 
-fn resolveEntry(allocator: std.mem.Allocator, e: *const Config.ProfileEntry, owned: *std.ArrayList([]u8)) !Profile {
+fn sameSetting(old: ?[]const u8, value: []const u8) bool {
+    return std.mem.eql(u8, old orelse return false, value);
+}
+
+fn resolveEntry(allocator: std.mem.Allocator, e: *const Config.ProfileEntry, script_base: []const u8, old: ?*const Profile, owned: *std.ArrayList([]u8)) !Profile {
     // Validate even shadowed explicit settings: a script must not hide an
     // accidentally empty command. Manually constructed Configs use this too.
     for ([_]?[]const u8{ e.command, e.script, e.cwd }) |value| {
         if (value) |s| try validateLaunchValue(s);
     }
-    const command = if (e.script) |script|
-        resolveScript(allocator, script, owned) catch |err| {
+    const command = if (e.script) |script| blk: {
+        if (old) |p| {
+            if (sameSetting(p.script_setting, script)) break :blk try ownOptional(allocator, owned, p.command);
+        }
+        break :blk resolveScript(allocator, script, script_base, owned) catch |err| {
             std.debug.print("error: profile '{s}' script '{s}' cannot launch ({}); fix the path/execute permission or remove profile.{s}.script\n", .{ e.name, script, err, e.name });
             return err;
+        };
+    } else try ownOptional(allocator, owned, e.command);
+    const cwd = if (e.cwd) |value| blk: {
+        if (old) |p| {
+            if (sameSetting(p.cwd_setting, value)) break :blk try ownOptional(allocator, owned, p.cwd);
         }
-    else
-        try ownOptional(allocator, owned, e.command);
+        break :blk try resolveCwd(allocator, value, owned);
+    } else null;
     return .{
         .name = try own(allocator, owned, e.name),
         .command = command,
-        .cwd = if (e.cwd) |cwd| try resolveCwd(allocator, cwd, owned) else null,
+        .cwd = cwd,
+        .script_setting = try ownOptional(allocator, owned, e.script),
+        .cwd_setting = try ownOptional(allocator, owned, e.cwd),
         .title = try ownOptional(allocator, owned, e.title),
         .bell_audible = e.bell_audible,
         .bell_visual = e.bell_visual,
@@ -329,10 +366,15 @@ fn checkExecuteAccess(path: []const u8) !void {
 /// An explicitly configured script is a promise, not a shell fallback.
 /// Expand ~/ and validate both file type and effective execute permission.
 /// The embedded API treats .command as a SHELL command, not argv[0]. Resolve
-/// relative paths before changing cwd, then quote the entire literal path.
-fn resolveScript(allocator: std.mem.Allocator, raw: []const u8, owned: *std.ArrayList([]u8)) ![]const u8 {
+/// relative paths against the startup directory, then quote the literal path.
+fn resolveScript(allocator: std.mem.Allocator, raw: []const u8, script_base: []const u8, owned: *std.ArrayList([]u8)) ![]const u8 {
     const expanded = try expandHome(allocator, raw, owned);
-    const resolved = try std.Io.Dir.cwd().realPathFileAlloc(platform.io(), expanded, allocator);
+    const relative = if (std.fs.path.isAbsolute(expanded)) null else blk: {
+        if (script_base.len == 0) return error.CurrentDirUnlinked;
+        break :blk try std.fs.path.join(allocator, &.{ script_base, expanded });
+    };
+    defer if (relative) |p| allocator.free(p);
+    const resolved = try std.Io.Dir.cwd().realPathFileAlloc(platform.io(), relative orelse expanded, allocator);
     defer allocator.free(resolved);
     const path = try own(allocator, owned, resolved);
     const stat = try std.Io.Dir.cwd().statFile(platform.io(), path, .{});
@@ -668,6 +710,70 @@ test "profile reload retitles and reorders without moving a live session" {
     try std.testing.expectEqual(@as(?usize, null), sm.indexOf("one"));
     try std.testing.expect(!sm.sessions.items[1].spawned);
     try std.testing.expectEqual(@as(u64, 3), sm.sessions.items[1].id);
+}
+
+test "profile reload keeps unchanged launch paths even when they go offline" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDir(platform.io(), "workdir", .default_dir);
+    const cwd = try tmp.dir.realPathFileAlloc(platform.io(), "workdir", a);
+    defer a.free(cwd);
+    const file = try tmp.dir.createFile(platform.io(), "launch.sh", .{ .permissions = .fromMode(0o755) });
+    file.close(platform.io());
+    const script = try tmp.dir.realPathFileAlloc(platform.io(), "launch.sh", a);
+    defer a.free(script);
+    var entries = [_]Config.ProfileEntry{ .{ .name = "local", .title = "Before" }, .{ .name = "remote", .script = script, .cwd = cwd } };
+    const cfg: Config = .{ .profiles = .{ .entries = &entries } };
+    var sm = try SessionManager.init(a, &cfg);
+    defer sm.deinit();
+    const remote = sm.sessions.items[1];
+    remote.spawned = true;
+    const command = try a.dupe(u8, remote.profile.command.?);
+    defer a.free(command);
+    try tmp.dir.deleteFile(platform.io(), "launch.sh");
+    try tmp.dir.deleteDir(platform.io(), "workdir");
+
+    entries[0].title = "After";
+    var plan = try sm.prepareReload(&cfg);
+    defer plan.deinit();
+    plan.commit(&sm);
+    try std.testing.expectEqualStrings("After", sm.active().label());
+    try std.testing.expectEqual(remote, sm.sessions.items[1]);
+    try std.testing.expectEqualStrings(command, remote.profile.command.?);
+    try std.testing.expectError(error.FileNotFound, remote.validateLaunch());
+
+    const changed_cwd = try std.fs.path.join(a, &.{ cwd, "missing" });
+    defer a.free(changed_cwd);
+    entries[1].cwd = changed_cwd;
+    try std.testing.expectError(error.FileNotFound, sm.prepareReload(&cfg));
+    try std.testing.expectEqualStrings(cwd, remote.profile.cwd.?);
+}
+
+test "relative script edits resolve against the original startup directory" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realPathFileAlloc(platform.io(), ".", a);
+    defer a.free(base);
+    for ([_][]const u8{ "before.sh", "after.sh" }) |name| {
+        const file = try tmp.dir.createFile(platform.io(), name, .{ .permissions = .fromMode(0o755) });
+        file.close(platform.io());
+    }
+    var entries = [_]Config.ProfileEntry{.{ .name = "tool", .script = "before.sh" }};
+    const cfg: Config = .{ .profiles = .{ .entries = &entries } };
+    // The fixture's startup directory is intentionally not this process's cwd.
+    var sm = try SessionManager.initProfiles(a, &cfg, base, null);
+    defer sm.deinit();
+    entries[0].script = "after.sh";
+    var plan = try sm.prepareReload(&cfg);
+    defer plan.deinit();
+    plan.commit(&sm);
+    const path = try tmp.dir.realPathFileAlloc(platform.io(), "after.sh", a);
+    defer a.free(path);
+    const expected = try std.fmt.allocPrint(a, "'{s}'", .{path});
+    defer a.free(expected);
+    try std.testing.expectEqualStrings(expected, sm.active().profile.command.?);
 }
 
 test "deleting a live profile retires it until exit and uses the configured fallback" {

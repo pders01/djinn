@@ -388,7 +388,9 @@ exec my-tool --interactive
 
 The pinned embedding API interprets `command` as a shell command (not a
 structured argv vector). Script paths are validated and shell-quoted as
-literal executable paths. Keep complex invocation details in scripts.
+literal executable paths. Relative scripts are resolved from Djinn’s startup
+working directory, including on reload. Keep complex invocation details
+in scripts.
 
 Djinn reloads profiles when you save the config. It keeps the selected tab
 and any running terminals whenever possible.
@@ -401,6 +403,7 @@ and any running terminals whenever possible.
 | `default-profile` | On the next app launch, or when the current tab disappears. Saving alone does not switch tabs. |
 
 Invalid launch edits leave the previous configuration and sessions in place.
+An unchanged launch path that becomes unavailable does not block other edits.
 Closing a configured session does not rewrite the config or delete the profile.
 Saved geometry owns exact profile names and
 coalesces each profile independently. Persistence uses 300 ms **periodic
